@@ -28,7 +28,6 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/gateway"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
 const (
@@ -234,15 +233,16 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("nats auth", "err", err)
 		return err
 	}
-	client, err := lib.Connect(ctx, cfg.NATSURL,
+	// The profile supervisor gate (#5301): the cutoff and the profile names,
+	// both unset until the operator renders them from the latched profile
+	// supervisor form. A malformed cutoff reads as latched at this start.
+	gate := lib.ProfileSupervisorGateFromEnv(ctx, os.Getenv, log)
+	client, err := lib.Connect(ctx, cfg.NATSURL, append([]lib.ClientOption{
 		lib.WithName("a2a-gateway"),
 		lib.WithLogger(log),
 		lib.WithAgreementPolicy(gateway.SupervisorAgreement(cfg)),
 		lib.WithNATSOptions(natsOpts...),
-		// Unset until the operator renders it from the latched profile
-		// supervisor form (#5301); a malformed value reads as unset.
-		lib.WithProfileSupervisorCutoff(lib.ProfileSupervisorCutoffFromEnv(os.Getenv, log)),
-	)
+	}, gate.ClientOptions()...)...)
 	if err != nil {
 		log.Error("nats connect", "err", err)
 		return err
@@ -258,6 +258,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// relays, the Chat adapter counts its pulls, the Slack adapter reports its
 	// connection, and the metrics listener serves them all (gateway/metrics.go).
 	metrics := gateway.NewMetrics()
+	metrics.SetProfileSupervisorGate(gate, client.ProfileSupervisorDrops)
 	backendAdapters, err := buildBackendAdapters(cfg, metrics, log)
 	if err != nil {
 		log.Error("adapter", "backends", cfg.Backends(), "err", err)
@@ -362,6 +363,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String(),
+		"dmIdleTTL", cfg.DMIdleTTL.String(),
 		"elected", cfg.Elected())
 	if !cfg.Elected() {
 		return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {
@@ -412,7 +414,7 @@ func standbyListens(cfg *gateway.Config) []string {
 // gatewayElection is the campaign for the gateway's Lease, through the pod's
 // own ServiceAccount.
 func gatewayElection(cfg *gateway.Config, log *slog.Logger) (gateway.Election, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := gateway.InClusterRESTConfig()
 	if err != nil {
 		return gateway.Election{}, fmt.Errorf("the election is configured (lease %s) but there is no in-cluster config: %w", cfg.GatewayLease, err)
 	}
@@ -550,7 +552,7 @@ func armResolvedScope(cfg *gateway.Config, gw *gateway.Gateway, log *slog.Logger
 	if cfg.ResolvedScopeConfigMap == "" {
 		return
 	}
-	rc, err := rest.InClusterConfig()
+	rc, err := gateway.InClusterRESTConfig()
 	if err != nil {
 		log.Error("resolved scope not armed: no in-cluster config", "err", err)
 		return
@@ -576,7 +578,7 @@ func armHomeLearn(cfg *gateway.Config, name string, backend gateway.Adapter, not
 	if !ok || !cfg.HomeLearnArmedFor(name) {
 		return
 	}
-	rc, err := rest.InClusterConfig()
+	rc, err := gateway.InClusterRESTConfig()
 	if err != nil {
 		log.Error("home channel learn not armed: no in-cluster config", "backend", name, "err", err)
 		return

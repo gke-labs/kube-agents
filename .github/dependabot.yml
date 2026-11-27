@@ -37,6 +37,7 @@ updates:
       - "/k8s-operator"
       - "/a2a"
       - "/k8s-api-proxy"
+      - "/kube-proxy"
     schedule:
       interval: "weekly"
     cooldown:

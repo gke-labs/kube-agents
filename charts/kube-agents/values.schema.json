@@ -1445,6 +1445,16 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "sessionIdleMinutes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10080
+                },
+                "dmSessionIdleMinutes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10080
+                },
                 "sessionResources": {
                   "type": "object",
                   "additionalProperties": false,
@@ -1954,6 +1964,9 @@
           }
         },
         "networkPolicy": {
+          "type": "object"
+        },
+        "schedules": {
           "type": "object"
         },
         "integration": {

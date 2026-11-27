@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -49,11 +51,13 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive. Such a turn ends at its acknowledgement
-	// (only a console, MCP or A2A door turn waits on its cards,
-	// waitsForCardsInTurn),
-	// and most file no card, hence "if".
-	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
+	// answer that cannot arrive. A chat turn ends at its acknowledgement and
+	// most file no card, hence "any"; a console turn waits on its cards
+	// (waitsForCardsInTurn), so only one still running is lost, hence "still
+	// running". It is user text (.agents/rules/chat_ux.md): it names no card
+	// or route, and its next step needs no route, since a later turn answers
+	// a question about the work from the board, and files no second card.
+	routeLostNote = "\n\nI couldn't save this conversation's details, so the result of any work I started that's still running won't be posted here on its own. If you need it, ask me about it later."
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
@@ -391,25 +395,131 @@ func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) er
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, routeTimeout)
-	defer cancel()
 	target := strings.TrimRight(b.cfg.RouteURL, "/") + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(raw))
+	resp, cancel, err := b.storeDo(ctx, routeTimeout, func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+b.cfg.RouteKey)
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.cfg.RouteKey)
-	resp, err := b.routeClient.Do(req)
-	if err != nil {
-		return err
-	}
+	defer cancel()
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		tail, _ := io.ReadAll(io.LimitReader(resp.Body, routeErrorTailBytes))
 		return &storeStatusError{status: resp.StatusCode, detail: strings.TrimSpace(string(tail))}
 	}
 	return nil
+}
+
+// storeDo sends a session-kv request that build makes for each attempt,
+// each under its own timeout, and retries a refused connection every
+// apiConnectRetryInterval for up to Config.APIConnectRetry while ctx lasts
+// (#7226). The store runs in the platform-agent container: a task the bridge
+// takes before it listens (one queued while the pod rolled, or one taken
+// while that container restarts) would otherwise lose its route, origin and
+// pushed report at the first refusal, while the turn itself waits for the
+// API server under the same rule (sendAPI). A refused connection never
+// reached the store, so retrying it writes nothing twice; any other error,
+// a timeout included, is returned at once. A store refused for a whole
+// window is marked down (Bridge.storeDown), and requests then try once until
+// one reaches it, so a store that has died while the container runs on
+// costs one window rather than one per task; while the API server refuses
+// as well, the container is restarting and the retry goes on as before
+// (apiServerRefusing). The caller closes the body and
+// then calls the returned cancel.
+func (b *Bridge) storeDo(ctx context.Context, timeout time.Duration, build func(context.Context) (*http.Request, error)) (*http.Response, context.CancelFunc, error) {
+	giveUp := time.Now().Add(b.cfg.APIConnectRetry)
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		req, err := build(attemptCtx)
+		if err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		resp, err := b.routeClient.Do(req)
+		if err == nil {
+			if b.storeDown.Swap(false) {
+				b.cfg.Logger.Info("the session store is answering again")
+			}
+			return resp, cancel, nil
+		}
+		cancel()
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			return nil, nil, err
+		}
+		if b.storeDown.Load() {
+			if !b.apiServerRefusing() {
+				return nil, nil, err
+			}
+			// The API server, which starts after the store in the same
+			// container, refuses too: the container is restarting, so the
+			// store is coming back, not dead.
+			b.storeDown.Store(false)
+			b.cfg.Logger.Info("the agent container is restarting; retrying the session store")
+		}
+		if time.Now().After(giveUp) {
+			// Marked down only with the API server up: a container still
+			// restarting gets the full retry on its next request too.
+			if b.apiServerRefusing() {
+				b.cfg.Logger.Info("the session store refused connections for the whole retry window while the agent container restarts; the next request retries in full",
+					"window", b.cfg.APIConnectRetry, "err", err)
+			} else {
+				b.storeDown.Store(true)
+				b.cfg.Logger.Warn("the session store refused connections for the whole retry window; later requests try once until it answers",
+					"window", b.cfg.APIConnectRetry, "err", err)
+			}
+			return nil, nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, err
+		case <-time.After(apiConnectRetryInterval):
+		}
+	}
+}
+
+// apiDefaultPorts are the ports an API URL without one names, by scheme.
+var apiDefaultPorts = map[string]string{apiURLSchemeHTTP: "80", apiURLSchemeHTTPS: "443"}
+
+// apiDialAddr is the host:port an API URL is served on, its scheme's
+// default port when it names none.
+func apiDialAddr(apiURL string) (string, bool) {
+	u, err := url.Parse(apiURL)
+	if err != nil || u.Hostname() == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = apiDefaultPorts[u.Scheme]
+	}
+	if port == "" {
+		return "", false
+	}
+	return net.JoinHostPort(u.Hostname(), port), true
+}
+
+// apiServerRefusing reports whether a connection to the API server is
+// refused, which tells a restarting agent container (the store and the API
+// server both down) from a session-kv process that died while the container
+// runs on (the API server up). Anything else, an unparsable URL included,
+// reads as not refusing.
+func (b *Bridge) apiServerRefusing() bool {
+	addr, ok := apiDialAddr(b.cfg.APIURL)
+	if !ok {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", addr, apiConnectRetryInterval)
+	if err == nil {
+		_ = conn.Close()
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // The session's origin (docs/designs/proposal-origin.md §2.1): before a task's

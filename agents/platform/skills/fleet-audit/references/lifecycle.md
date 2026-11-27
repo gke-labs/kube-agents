@@ -78,7 +78,9 @@ Before inspecting anything, claim the workspace:
 
 This resolves the target repository (see [Which repository](#which-repository) below), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
-the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
+the stream's open ledger issue, and clears any findings document a crashed run left behind. It also
+writes the run's run-start record to the report store, which `finish` marks done, so a reader can say
+that the last run did not finish. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
 administrator to add it to `$GITOPS_STATE_CONFIGMAP`. A refusal of the repository from the
 credential proxy or the broker is the same answer, and you stop there: see the skill's rule on
@@ -296,7 +298,7 @@ else to reject. A second `draft` refuses to replace a document you have changed 
 runs after the collector command and before the drafting by hand, where the SOP puts it (two
 SOPs' collector command writes the `draft` itself; the step still follows it). It digests what the
 manifest says about the fleet (every cluster's outcome, its checks and their exit codes, its
-candidates by identity and severity, its limitations, `checks_not_applicable`,
+candidates by identity and severity, its limitations, `notes` and `noted_objects` (with each object's read command, a string that does not change from run to run), `checks_not_applicable`,
 `checks_unevaluated` and the collector's `checks_revision`; not its timestamps, durations, output
 hashes, command strings, or a candidate's excerpt and impact text, which carry ages and counts and
 which `finish` takes from the fresh manifest on a close, except an impact the collector marks
@@ -319,7 +321,10 @@ document to `findings_path`, with each remediation's note as the worker wrote it
 notes, without the previous run's search record and with each `declared[]` entry's declaration as
 this run's `start` filed it, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
 the ledger comparison and `silent_ok` are `finish`'s own: the line is then `finish`'s, plus
-`precheck: unchanged`, and the run is over. In every other case the line says `closed: false` and
+`precheck: unchanged`, and the run is over. Copy its `report_notes` lines, when it has them,
+verbatim directly before the closing ledger line (or as the report's last lines when the run has
+no ledger line), as [`finish`](finish.md) says; a precheck-closed
+line with `silent_ok: true` answers `[SILENT]` and prints nothing else. In every other case the line says `closed: false` and
 why, the findings file is as it was, and the SOP continues; a close that dies puts the file back
 too, and the run's in-flight note stays until the SOP's own `finish`. Without the flag it never
 closes a run: an on-demand run is answered by the person who asked for it, in full.

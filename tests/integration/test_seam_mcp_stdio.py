@@ -302,7 +302,7 @@ class McpStdioSeamTest(unittest.TestCase):
         # a real hermes on PATH, an unpatched broadcast would post an actual
         # chat message from a unit-test run.
         with mock.patch.object(
-            module.urllib.request, "urlopen", side_effect=OSError("kv down")
+            module.urllib.request.OpenerDirector, "open", side_effect=OSError("kv down")
         ), mock.patch.object(
             module.subprocess, "run", side_effect=FileNotFoundError("hermes")
         ):

@@ -32,6 +32,8 @@ sys.path.insert(0, str(_REPO_ROOT / "agents" / "platform" / "scripts"))
 _SCRAPE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_counters_scrape.go"
 _DISPATCHER_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_kanban_dispatcher.go"
 _WATCHER_METRICS_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "metrics.go"
+_WATCHER_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "watcher.go"
+_CLUSTERPROFILES_DISCOVER_GO = _REPO_ROOT / "k8s-operator" / "internal" / "clusterprofiles" / "discover.go"
 _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
 _READINGS_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "vcs_readings.py"
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
@@ -117,6 +119,33 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
                 self.assertTrue(families[0].endswith("_total"))
                 self.assertEqual(families[0], families[1] + "_total")
 
+    def test_the_brokers_forge_series_are_the_ones_the_poller_reads_into_forge_connected(self):
+        for py, go in (
+            ("VCS_FORGE_CONNECTED_METRIC", "vcsForgeConnectedSeries"),
+            ("VCS_FORGE_REPOSITORIES_METRIC", "vcsForgeRepositoriesSeries"),
+            ("VCS_FORGE_CHECKED_AGE_METRIC", "vcsForgeCheckedAgeSeries"),
+        ):
+            with self.subTest(series=go):
+                self.assertEqual(_py_const(py, _READINGS_PY), _go_const(_SCRAPE_GO, go))
+        self.assertEqual(_py_const("VCS_PROVIDER_LABEL"), _go_const(_SCRAPE_GO, "vcsProviderLabel"))
+        self.assertEqual(_py_const("VCS_READINGS_STATE_LABEL"), _go_const(_SCRAPE_GO, "vcsReadingsStateLabel"))
+        connected = re.search(r"^VCS_FORGE_CONNECTED\s*=\s*(\d+)$", _BROKER_PY.read_text(), re.M)
+        operator = re.search(r"^\s*vcsForgeConnectedValue\s*=\s*(\d+)$", _SCRAPE_GO.read_text(), re.M)
+        self.assertIsNotNone(connected, "VCS_FORGE_CONNECTED not found")
+        self.assertIsNotNone(operator, "vcsForgeConnectedValue not found")
+        self.assertEqual(connected.group(1), operator.group(1))
+
+    def test_the_brokers_connection_states_are_the_ones_the_poller_reads_worst_first(self):
+        # The order is the severity: the operator's reason is the first state
+        # with a repository in it, as the broker's own order has it.
+        body = re.search(r"^CONNECTION_STATES\s*=\s*\(([^)]*)\)", _READINGS_PY.read_text(), re.M | re.S)
+        self.assertIsNotNone(body, "CONNECTION_STATES not found")
+        broker = [_py_const(name, _READINGS_PY) for name in re.findall(r"\bCONNECTION_[A-Z_]+\b", body.group(1))]
+        literal = re.search(r"vcsConnectionStates\s*=\s*\[\]string\{([^}]*)\}", _SCRAPE_GO.read_text())
+        self.assertIsNotNone(literal, "vcsConnectionStates not found")
+        self.assertEqual(broker, _go_words(_SCRAPE_GO, literal.group(1)))
+        self.assertEqual(len(broker), len(set(broker)))
+
     def test_the_brokers_vcs_counter_is_the_one_the_poller_sums_for_proposals(self):
         self.assertEqual(_py_const("VCS_REQUESTS_METRIC"), _go_const(_SCRAPE_GO, "vcsRequestsSeries"))
         self.assertEqual(_py_const("VCS_VERB_LABEL"), _go_const(_SCRAPE_GO, "vcsVerbLabel"))
@@ -193,6 +222,12 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowLongLabel"), "30d")
         self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowLongLabel"), _go_const(_SCRAPE_GO, "a2aPeopleWindowLong"))
 
+    def test_the_a2a_gateways_slack_connected_gauge_keeps_its_name(self):
+        """The gateway's Slack Socket Mode gauge and the operator's scrape constant agree."""
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "slackConnectedName"))
+        self.assertEqual(name, "kubeagents_a2a_gateway_slack_connected")
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aSlackConnectedSeries"))
+
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()
         self.assertEqual(_py_const("CHAT_INBOUND_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatInboundSeries"))
@@ -235,9 +270,34 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
+        self.assertEqual(_watcher_gauge_family("clusterUp"), _py_const("AGENT_API_CLUSTER_UP_METRIC", _BROKER_PY))
+        self.assertEqual(_watcher_family("clusterDiscoveryErrors"), _py_const("AGENT_API_DISCOVERY_ERRORS_METRIC", _BROKER_PY))
+        match = re.search(
+            r'clusterDiscoveryErrors:\s*prometheus\.NewCounterVec\(prometheus\.CounterOpts\{.*?\},\s*\[\]string\{([^}]*)\}\)',
+            _WATCHER_METRICS_GO.read_text(),
+            re.S,
+        )
+        assert match, f"clusterDiscoveryErrors has no label slice in {_WATCHER_METRICS_GO}"
+        self.assertEqual(
+            {_py_const("AGENT_API_METRIC_PROFILE_LABEL", _BROKER_PY)},
+            set(_go_words(_WATCHER_METRICS_GO, match.group(1))),
+        )
+        self.assertEqual(
+            _go_const(_CLUSTERPROFILES_DISCOVER_GO, "NoProfile"),
+            _py_const("AGENT_API_METRIC_NO_PROFILE_VALUE", _BROKER_PY),
+        )
+        self.assertEqual(
+            _go_const(_WATCHER_GO, "directProfile"),
+            _py_const("AGENT_API_EVENT_WATCHER_DIRECT_PROFILE", _BROKER_PY),
+        )
 
     def test_the_watchers_watch_set_ready_gauge_is_the_one_the_poller_reads(self):
         self.assertEqual(_go_const(_WATCHER_METRICS_GO, "watchSetReadyMetric"), _go_const(_SCRAPE_GO, "watchSetReadySeries"))
+        self.assertEqual(_go_const(_WATCHER_METRICS_GO, "watchSetReadyMetric"), _py_const("AGENT_API_WATCH_SET_READY_METRIC", _BROKER_PY))
+        self.assertEqual(_go_const(_MANIFESTS_GO, "eventWatcherMetricsPortEnv"), _py_const("AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV", _BROKER_PY))
+        go_port = int(re.search(r"^\s*eventWatcherMetricsPort\s+int32\s*=\s*(\d+)", _MANIFESTS_GO.read_text(), re.M).group(1))
+        py_port = int(re.search(r"^AGENT_API_EVENT_WATCHER_DEFAULT_METRICS_PORT\s*=\s*(\d+)", _BROKER_PY.read_text(), re.M).group(1))
+        self.assertEqual(go_port, py_port)
 
     def test_the_cluster_gauges_labels_are_the_ones_the_poller_reads_into_the_scope_condition(self):
         # The watcher's GaugeVec declares its label names in order; the poller reads
@@ -247,6 +307,10 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         labels = set(_go_words(_WATCHER_METRICS_GO, match.group(1)))
         self.assertEqual(
             {_go_const(_SCRAPE_GO, "clusterUpClusterLabel"), _go_const(_SCRAPE_GO, "clusterUpProjectLabel"), _go_const(_SCRAPE_GO, "clusterUpLocationLabel")},
+            labels,
+        )
+        self.assertEqual(
+            {_py_const("AGENT_API_METRIC_CLUSTER_LABEL", _BROKER_PY), _py_const("AGENT_API_METRIC_PROJECT_LABEL", _BROKER_PY), _py_const("AGENT_API_METRIC_LOCATION_LABEL", _BROKER_PY)},
             labels,
         )
 

@@ -211,8 +211,23 @@ func TestDelegateTargetsHoldEveryoneInTheSession(t *testing.T) {
 	}
 }
 
-// A wake runs without the delegate tool, so its submission carries no list.
+// A wake runs without the delegate tool, so its submission carries no list,
+// unless the gateway let it delegate again (#6861): then it carries the list
+// a human turn by the same requester gets.
 func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		wakeDelegate bool
+		overflow     bool
+	}{{"a wake", false, false}, {"a wake the gateway let delegate", true, false},
+		// Its child's steer authors overflowed, so the delegation refuses
+		// every target (delegateEntryCheck): the list offers none.
+		{"a wake the gateway let delegate whose child's steers overflowed", true, true}} {
+		t.Run(tc.name, func(t *testing.T) { wakeDelegateTargets(t, tc.wakeDelegate, tc.overflow) })
+	}
+}
+
+func wakeDelegateTargets(t *testing.T, wakeDelegate, overflow bool) {
 	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	rec := &SessionRecord{Key: "discord:g1/t-wk", ContextID: "ctx-wk", Kind: "group"}
@@ -222,7 +237,7 @@ func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
 	r.awaitTask(t, session)
 	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
 	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
-		Requester: TaskRequester{Backend: "discord", Subject: "u1"}})
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, WakeDelegate: wakeDelegate, SteerAuthorsOverflow: overflow})
 	if !ok {
 		t.Fatal("the wake wasn't submitted")
 	}
@@ -233,8 +248,85 @@ func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
 		}
 		return wake != nil
 	})
-	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, wake)); found {
-		t.Fatal("a wake carried delegate targets")
+	targets, found, _ := lib.DelegateTargetsOf(messageParts(t, wake))
+	if found != wakeDelegate {
+		t.Fatalf("wake (delegate=%v) carried delegate targets: %v", wakeDelegate, found)
+	}
+	if overflow {
+		if len(targets.Targets) != 0 {
+			t.Fatalf("a wake whose child's steers overflowed offered %v, want none", targetNames(targets))
+		}
+		return
+	}
+	if wakeDelegate && !slices.Contains(targetNames(targets), targetPlatform) {
+		t.Fatalf("a wake that may delegate carried %v, want platform listed", targetNames(targets))
+	}
+}
+
+// TestAGrantedWakesTargetsCountItsChildsSteerAuthors: a wake carries its
+// child's steer authors (startWake), which the delegation checks, so the list
+// a granted wake is offered leaves out a target whose list doesn't admit
+// them, here u3, who steered the child, off platform's list.
+func TestAGrantedWakesTargetsCountItsChildsSteerAuthors(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	rec := &SessionRecord{Key: "discord:g1/t-wk-steer", ContextID: "ctx-wk-steer", Kind: "group"}
+	r.adapter.inbox <- InboundMessage{Conversation: rec.Key, Kind: "group", AuthorID: "1001", MessageID: "wks-1", Text: "hello"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	r.awaitTask(t, session)
+	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
+	// platform admits everyone already in the session and the requester,
+	// so only u3, the child's steerer, can take it out.
+	listed := map[string]bool{}
+	present, _, _ := delegateAuthors(got, TaskRequester{Backend: "discord", Subject: "u1"})
+	for _, a := range present {
+		listed[a.Subject] = true
+	}
+	r.g.targetAllowed = map[string]map[string]map[string]bool{targetPlatform: {"discord": listed}}
+	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, WakeDelegate: true,
+		SteerAuthors: []TaskRequester{{Backend: "discord", Subject: "u3"}}})
+	if !ok {
+		t.Fatal("the wake wasn't submitted")
+	}
+	var wake *lib.Envelope
+	waitFor(t, "the wake on the bus", func() bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject(session, taskID)) {
+			wake = e.env
+		}
+		return wake != nil
+	})
+	targets, found, _ := lib.DelegateTargetsOf(messageParts(t, wake))
+	if !found || slices.Contains(targetNames(targets), targetPlatform) {
+		t.Fatalf("a granted wake whose child u3 steered was offered %v (found %v), want platform left out", targetNames(targets), found)
+	}
+}
+
+// TestAWakeBelowAScheduleKeepsTheMark: a wake has no route, and the schedule
+// mark still goes on its entry, so the gateway reads it as below a schedule
+// and refuses a delegation from it (delegateEntryCheck).
+func TestAWakeBelowAScheduleKeepsTheMark(t *testing.T) {
+	t.Parallel()
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	rec := &SessionRecord{Key: "discord:g1/t-wk-sched", ContextID: "ctx-wk-sched", Kind: "group"}
+	r.adapter.inbox <- InboundMessage{Conversation: rec.Key, Kind: "group", AuthorID: "1001", MessageID: "wks-1", Text: "hello"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	r.awaitTask(t, session)
+	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
+	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}, Scheduled: true})
+	if !ok {
+		t.Fatal("the wake wasn't submitted")
+	}
+	ref, found := got.TaskRefFor(taskID)
+	if !found || !ref.Scheduled || !ref.belowSchedule() {
+		t.Fatalf("the wake's entry = %+v (found %v), want the schedule mark", ref, found)
+	}
+	_, no := r.g.delegateEntryCheck(got, ref, false, lib.DelegateTask{Addressee: targetPlatform}, true)
+	if no == nil || no.rule != ruleDelegationUnattendedChild {
+		t.Fatalf("a delegation from the wake = %+v, want %s", no, ruleDelegationUnattendedChild)
 	}
 }
 

@@ -637,6 +637,74 @@ resource "google_container_node_pool" "missing_reservation_pool" {
   }
 }
 
+# Defect (capacity, reservations): the same missing reservation on a pool
+# that the autoscaler tries to grow. The pool autoscales from 0 to 1 node,
+# and deployment/reserved-batch in seeded-reservation (defects-a.tf) has
+# one pod that only this pool can hold. The autoscaler asks for a node, GKE
+# refuses it because the reservation is not found, and the pod stays Pending
+# with the pool at zero nodes; the autoscaler's visibility log repeats
+# scale.up.error.reservation.not.found. Zero nodes cost nothing. The stack
+# plants no reservation: a reservation with the name below would heal the
+# defect and start one node. "dev" in the name makes the pool non-production
+# for the stockout collector, so its reservation check (3.10) does not name
+# this pool and missing-reservation-pool stays that check's only pool; do
+# not rename it to a name without such a token. The collector's 3.9 names
+# the pool, as it names each autoscaled pool in one zone. n2-standard-2 and
+# the 20 GB disk as on missing-reservation-pool. Catalogue role:
+# missing-reservation-autoscaled.
+resource "google_container_node_pool" "dev_reserved_pool" {
+  name       = "dev-reserved-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 1
+  }
+
+  node_config {
+    machine_type    = "n2-standard-2"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, as on the pools above.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "missing-reservation-autoscaled"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "missing-reservation-autoscaled"
+      effect = "NO_SCHEDULE"
+    }
+
+    reservation_affinity {
+      consume_reservation_type = "SPECIFIC_RESERVATION"
+      key                      = "compute.googleapis.com/reservation-name"
+      values                   = ["seeded-absent-reservation"]
+    }
+  }
+
+  # The autoscaler owns the size of this pool, and it asks for one node again
+  # and again. The provider reads node_count from the instance group's target
+  # size, so a plan in the minutes of such a try can see 1 and plan a resize
+  # to 0: a change that means nothing, on a random reconcile pass. The role's
+  # state assertion holds the pool at zero nodes, not this field.
+  lifecycle {
+    ignore_changes = [node_count]
+  }
+}
+
 # Defect (upgrades): held one minor behind the REGULAR channel default --
 # and ENROLLED in REGULAR, which is what makes the lag visible at all. The
 # upgrade SOP's master-behind check grades (b) and (c) off the cluster's
@@ -922,14 +990,25 @@ resource "google_container_node_pool" "seeded_c_default" {
   }
 
   node_config {
-    # e2-medium since the ComputeClass fixtures (defects-c.tf): GKE's system
-    # pods request about 99 percent of an e2-small's allocatable memory
-    # (1,420 of 1,424 MiB, read 11-10 on a dev fleet at 1.36), so three of the
-    # five fixture pods sat Pending on it at 8Mi each. Memory, not CPU, is the
-    # binding constraint here, the same wall seeded-a hit (#1278, #3607). The
-    # provider updates machine_type in place and GKE re-creates the one node
-    # under the pool's surge settings; no reconcile-allow.json entry.
-    machine_type    = "e2-medium"
+    # e2-standard-2, the size seeded-a's default pool took for the same wall
+    # (#3607). An e2-small could not hold the ComputeClass fixtures
+    # (defects-c.tf) for memory: GKE's system pods request about 99 percent
+    # of its allocatable (1,420 of 1,424 MiB, read 11-10 on a dev fleet at
+    # 1.36). The e2-medium that followed held them with about 60m of its 940m
+    # CPU to spare, and that did not survive a node replacement: the pool
+    # surges to two nodes, kube-dns-autoscaler (preventSinglePointFailure)
+    # takes kube-dns to two replicas of 270m, the old node drains, and the one
+    # node left is fully requested, so the autoscaler's own pod,
+    # metrics-server and the five fixture pods stay Pending and nothing brings
+    # kube-dns back to one. A node replacement on 2026-11-24 left 19 of 50
+    # pool projects that way. Every shared-core E2 size allocates the same
+    # 940m; a dedicated-core size allocates 1930m, and two kube-dns replicas
+    # with everything else request about 1150m of it. Not a no-surge pool
+    # instead: with autoscaling held at one node the upgrade-readiness rule
+    # would read it as a blocker on a slot meant to carry none. The provider
+    # updates machine_type in place and GKE re-creates the one node under the
+    # pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-standard-2"
     disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
@@ -939,11 +1018,11 @@ resource "google_container_node_pool" "seeded_c_default" {
     # (defects-c.tf) by this label and carries no matching
     # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, so the
     # scheduler places untargeted pods on it until it is full and the
-    # autoscaler's pre-filter then drops them. With this the cluster has no
-    # untainted pool without a class label, which is what lets the
-    # obtainability audit's 3.24 file the untargeted workloads in
-    # defects-c.tf. A label change is an in-place pool update on provider 8.x
-    # (GKE relabels the node without re-creating it); the disk and kubelet
+    # autoscaler's pre-filter (GKE 1.35.6 and later) then drops them. With
+    # this the cluster has no untainted pool without a class label, which is
+    # what lets the obtainability audit's 3.24 file the untargeted workloads
+    # in defects-c.tf. A label change is an in-place pool update on provider
+    # 8.x (GKE relabels the node without re-creating it); the disk and kubelet
     # settings around it stay the drift-pool-outlier fixture.
     # Addressed by the untainted-compute-class-pool role.
     labels = {

@@ -136,7 +136,7 @@ func batchChildName(ref TaskRef) string {
 // that failed, timed out or was stopped is listed with that outcome, never
 // left out. Then the cards note when a child handed work to cards, the
 // question guide when one asked, and the reply guide, as wakeText closes.
-func batchWakeText(ask string, kids []TaskRef, fullAnswer, cards bool) string {
+func batchWakeText(ask string, kids []TaskRef, fullAnswer, cards, mayDelegate bool) string {
 	slices.SortStableFunc(kids, func(a, b TaskRef) int { return a.BatchIndex - b.BatchIndex })
 	var lines []string
 	if ask = strings.TrimSpace(ask); ask != "" {
@@ -167,11 +167,7 @@ func batchWakeText(ask string, kids []TaskRef, fullAnswer, cards bool) string {
 	if asked {
 		lines = append(lines, wakeBatchQuestionGuide)
 	}
-	if fullAnswer {
-		lines = append(lines, wakeReplyGuideFull)
-	} else {
-		lines = append(lines, wakeReplyGuide)
-	}
+	lines = append(lines, wakeReplyGuideFor(fullAnswer, mayDelegate))
 	return strings.Join(lines, "\n")
 }
 
@@ -289,8 +285,9 @@ func (g *Gateway) wakeBatch(ctx context.Context, rec *SessionRecord, parent, las
 			cards = cards || k.BatchEnd.Cards
 		}
 	}
-	text := batchWakeText(parentRef.Request, kids, full, cards)
-	woken, why = g.startWake(ctx, rec, last, parentRef, authority, steered, text, log)
+	mayDelegate := g.wakeMayDelegate(parentRef, last, cards)
+	text := batchWakeText(parentRef.Request, kids, full, cards, mayDelegate)
+	woken, why = g.startWake(ctx, rec, last, parentRef, authority, steered, text, mayDelegate, log)
 	if woken {
 		// The wake carries the results now, and the record outlives the
 		// stream copy of each (SessionTTL past the TASKS retention), so the
@@ -394,7 +391,7 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 		return
 	}
 	if active.StatusMsgID != "" {
-		if probe, err := g.probeTask(ctx, stream, rec.AddresseeFor(parent.ID), parent.ID, g.profileRead(rec, parent.ID, rec.AddresseeFor(parent.ID))); err == nil && probe.final {
+		if probe, err := g.probeTask(ctx, stream, rec.AddresseeFor(parent.ID), parent.ID); err == nil && probe.final {
 			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(probe.state, ""), active.LineNote), "")
 			active.StatusMsgID = ""
 			changed = true
@@ -407,7 +404,7 @@ func (g *Gateway) healFanOut(ctx context.Context, rec *SessionRecord, active *Ac
 		if fresh, _ := rec.TaskRefFor(kid.ID); fresh.BatchEnd != nil {
 			continue
 		}
-		probe, err := g.probeTask(ctx, stream, kid.Addressee, kid.ID, g.profileRead(rec, kid.ID, kid.Addressee))
+		probe, err := g.probeTask(ctx, stream, kid.Addressee, kid.ID)
 		if err != nil {
 			g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", kid.ID, "err", err)
 			continue
@@ -457,7 +454,7 @@ func (g *Gateway) healProfileBatch(ctx context.Context, rec *SessionRecord, pare
 			if streamErr != nil {
 				continue
 			}
-			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID, g.profileRead(rec, fresh.ID, fresh.Addressee))
+			probe, err := g.probeTask(ctx, stream, fresh.Addressee, fresh.ID)
 			if err != nil {
 				g.log.Warn("heal: a fan-out child's state could not be read", "conversation", rec.Key, "taskId", fresh.ID, "err", err)
 				continue
@@ -512,7 +509,7 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 	var terminalSubject string
 	var err error
 	if probe.final || spotCheck {
-		if task, terminalSubject, err = g.fanOutReplay(ctx, kid.Addressee, kid.ID, g.profileRead(rec, kid.ID, kid.Addressee)); err != nil {
+		if task, terminalSubject, err = g.fanOutReplay(ctx, kid.Addressee, kid.ID); err != nil {
 			g.log.Warn("heal: a fan-out child's stream could not be replayed", "conversation", rec.Key, "taskId", kid.ID, "err", err)
 		}
 	}
@@ -652,7 +649,7 @@ func (g *Gateway) answerFanOutStatus(ctx context.Context, rec *SessionRecord, pa
 		var probe taskProbe
 		err := streamErr
 		if err == nil {
-			probe, err = g.probeTask(ctx, stream, k.Addressee, k.ID, g.profileRead(rec, k.ID, k.Addressee))
+			probe, err = g.probeTask(ctx, stream, k.Addressee, k.ID)
 		}
 		switch {
 		case err != nil:
@@ -682,13 +679,13 @@ func (g *Gateway) refuseFanOutSteer(rec *SessionRecord, parent TaskRef) {
 // fanOutReplay replays a task's stream in full on an ordered consumer, the
 // one read a fan-out path makes that spends a TASKS consumer slot: its
 // folded state and the subject its terminal came on.
-func (g *Gateway) fanOutReplay(ctx context.Context, addressee, taskID string, opts ...lib.ReadOption) (*lib.Task, string, error) {
+func (g *Gateway) fanOutReplay(ctx context.Context, addressee, taskID string) (*lib.Task, string, error) {
 	g.mu.Lock()
 	hook := g.fanOutReplayHook
 	g.mu.Unlock()
 	if hook != nil {
 		hook(taskID)
 	}
-	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, taskID, opts...)
+	task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, taskID)
 	return task, terminalSubject, err
 }

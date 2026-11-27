@@ -2844,12 +2844,12 @@ func startSlackGateRig(t *testing.T, allowed []string, allowAll bool) *rig {
 	if err := os.WriteFile(mapFile, []byte("U1 test:one\nU2 test:two\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
-	bus, err := lib.Connect(ctx, url, lib.WithName("executor-test"))
+	bus, err := connectClientTest(ctx, url, lib.WithName("executor-test"))
 	if err != nil {
 		t.Fatalf("executor client: %v", err)
 	}

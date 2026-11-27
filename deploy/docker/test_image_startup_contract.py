@@ -460,6 +460,80 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
         )
 
 
+PEER_HEADER_VALUE = "%DOWNSTREAM_DIRECT_REMOTE_ADDRESS_WITHOUT_PORT%"
+
+
+def envoy_peer_header_gaps(config, header):
+    """Every place an Envoy config can reach a Unix-socket cluster without stamping ``header``.
+
+    A cluster is a socket cluster if any endpoint is a pipe. A listener reaches
+    one through a tcp_proxy (never allowed: no header can be set) or through an
+    HTTP connection manager whose inline route table has a route to it. Such a
+    route table must set ``header`` to the downstream direct address with
+    OVERWRITE_IF_EXISTS_OR_ADD at the route-table level, and no virtual host or
+    route beneath it may add or remove the same header. Returns the gaps found,
+    empty when there are none.
+    """
+    header = header.lower()
+    resources = config.get("static_resources") or {}
+    socket_clusters = set()
+    for cluster in resources.get("clusters") or []:
+        for locality in (cluster.get("load_assignment") or {}).get("endpoints") or []:
+            for endpoint in locality.get("lb_endpoints") or []:
+                if "pipe" in ((endpoint.get("endpoint") or {}).get("address") or {}):
+                    socket_clusters.add(cluster["name"])
+    gaps = []
+    if not socket_clusters:
+        gaps.append("no cluster reaches a Unix socket; the check would prove nothing")
+
+    def names_header(options):
+        return [o for o in options or [] if str((o.get("header") or {}).get("key", "")).lower() == header]
+
+    def removes_header(level):
+        return header in [str(h).lower() for h in level.get("request_headers_to_remove") or []]
+
+    for listener in resources.get("listeners") or []:
+        lname = listener.get("name", "?")
+        for chain in listener.get("filter_chains") or []:
+            for flt in chain.get("filters") or []:
+                cfg = flt.get("typed_config") or {}
+                kind = cfg.get("@type", "")
+                if kind.endswith("TcpProxy"):
+                    if cfg.get("cluster") in socket_clusters or "weighted_clusters" in cfg:
+                        gaps.append(f"{lname}: a tcp_proxy reaches the socket, where no header can be set")
+                    continue
+                if not kind.endswith("HttpConnectionManager"):
+                    continue
+                if "rds" in cfg or "scoped_routes" in cfg:
+                    gaps.append(f"{lname}: routes not inline, so the header cannot be checked")
+                    continue
+                table = cfg.get("route_config") or {}
+                forwards = False
+                for vhost in table.get("virtual_hosts") or []:
+                    if names_header(vhost.get("request_headers_to_add")) or removes_header(vhost):
+                        gaps.append(f"{lname}/{vhost.get('name')}: a virtual host changes {header}")
+                    for route in vhost.get("routes") or []:
+                        action = route.get("route") or {}
+                        target = action.get("cluster")
+                        if target in socket_clusters or "weighted_clusters" in action or "cluster_header" in action:
+                            forwards = True
+                        if names_header(route.get("request_headers_to_add")) or removes_header(route):
+                            gaps.append(f"{lname}/{vhost.get('name')}: a route changes {header}")
+                if not forwards:
+                    continue
+                stamped = names_header(table.get("request_headers_to_add"))
+                good = [
+                    o for o in stamped
+                    if o["header"].get("value") == PEER_HEADER_VALUE
+                    and o.get("append_action") == "OVERWRITE_IF_EXISTS_OR_ADD"
+                ]
+                if len(stamped) != 1 or len(good) != 1:
+                    gaps.append(f"{lname}: forwards to the socket without overwriting {header} with the direct peer")
+                if removes_header(table):
+                    gaps.append(f"{lname}: the route table removes {header}")
+    return gaps
+
+
 class EnvoyListenerRewriteContractTest(unittest.TestCase):
     """Every Envoy listener moves off loopback, or Envoy does not start.
 
@@ -525,6 +599,15 @@ class EnvoyListenerRewriteContractTest(unittest.TestCase):
         for listener in listeners:
             with self.subTest(listener=listener["name"]):
                 self.assertEqual(listener["address"]["socket_address"]["address"], self.ADDRESS)
+
+    def test_the_rendered_config_stamps_the_peer_on_every_path_to_the_socket(self):
+        # The config Envoy actually runs in the broker Pod is the render, so
+        # the peer header the broker binds callers by is checked on it, per
+        # listener and per route (envoy_peer_header_gaps).
+        code, log = self.render(ENVOY_CONFIG, self.ADDRESS)
+        self.assertEqual(code, 0, log)
+        rendered = yaml.safe_load(self.rendered.read_text())
+        self.assertEqual([], envoy_peer_header_gaps(rendered, "X-Kube-Agents-Peer-Address"))
 
     def test_loopback_as_the_address_is_a_render_that_changes_nothing(self):
         code, log = self.render(ENVOY_CONFIG, "127.0.0.1")

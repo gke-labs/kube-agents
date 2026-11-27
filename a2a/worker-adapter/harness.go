@@ -23,6 +23,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/answerscrub"
+	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
 // DefaultHarnessPath is where the worker image carries the harness: the
@@ -35,6 +39,11 @@ const (
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
 	stderrTailBytes = 2048
+	// stderrScanBytes is how much stderr is held before the scrub, which
+	// runs on the whole window before the tail is cut to stderrTailBytes,
+	// as the bridge scrubs its tails: a value the cut would split is still
+	// whole when it's redacted.
+	stderrScanBytes = 64 << 10
 	// harnessEventDepth buffers events between the scanner goroutine and the
 	// adapter loop, so a slow publish does not stall the read that keeps the
 	// harness's stdout pipe draining.
@@ -100,6 +109,13 @@ type harnessProc struct {
 	// run before it, or the pipe teardown races the last buffered events
 	// (the result line, typically) out of existence.
 	scanDone chan struct{}
+	// reapDone closes once supervise's reap has finished: the harness
+	// waited on, its escalation timers stopped and its leftovers killed.
+	reapDone chan struct{}
+	// decodePanicked is set the moment the scanner recovers a panic in the
+	// driver's decoder, before it kills the harness and drains the rest of
+	// its stdout; the adapter fails the task closed from then on.
+	decodePanicked atomic.Bool
 	// scanErr surfaces a stdout read/parse failure after events closes.
 	scanErr func() error
 	stderr  *tailBuffer
@@ -123,7 +139,6 @@ type harnessProc struct {
 	killTimers []*time.Timer
 }
 
-// startHarness is startHarnessWith for Claude Code.
 // oneTurnPerProcess is implemented by a driver whose harness process runs a
 // single turn and reads stdin once (core-agent). A later user message would
 // sit in the pipe unread: the write succeeds, the adapter counts a turn that
@@ -151,6 +166,7 @@ func processEncoder(d Driver) func(string) ([]byte, error) {
 	}
 }
 
+// startHarness is startHarnessWith for Claude Code.
 func startHarness(argv []string, env []string, prompt string, reapBound time.Duration, log *slog.Logger) (*harnessProc, error) {
 	return startHarnessWith(claudeDriver{}, argv, env, prompt, reapBound, log)
 }
@@ -178,8 +194,10 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 	if err != nil {
 		return nil, fmt.Errorf("harness stdout: %w", err)
 	}
-	stderr := &tailBuffer{max: stderrTailBytes}
-	cmd.Stderr = stderr
+	stderr := &tailBuffer{max: stderrScanBytes}
+	// The tail is kept for a failed turn's reason; refused tool calls the
+	// harness reports go to the worker's log as well (refusalLines).
+	cmd.Stderr = io.MultiWriter(stderr, &refusalLines{log: log})
 	// WaitDelay bounds every reap. A descendant that left the process group
 	// survives the group kill and can hold stderr open, and Wait reads stderr
 	// to EOF, so without a bound Wait blocks until that descendant exits.
@@ -193,6 +211,18 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn harness: %w", err)
 	}
+	// A panic from here to the return (the driver's decoder or encoder, the
+	// opening prompt's write) happens before supervise holds the harness,
+	// where the task's recovery can't see it: stop and reap it here, then
+	// let the panic go on to that recovery (taskguard in execute).
+	// scanning is the scanner's events once it runs, for that drain.
+	var scanning chan []Event
+	defer func() {
+		if r := recover(); r != nil {
+			abandonStartedHarness(cmd, scanning)
+			panic(r)
+		}
+	}()
 
 	events := make(chan []Event, harnessEventDepth)
 	dec := d.NewDecoder()
@@ -205,6 +235,7 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		events:   events,
 		encode:   processEncoder(d),
 		scanDone: scanDone,
+		reapDone: make(chan struct{}),
 		scanErr: func() error {
 			scanMu.Lock()
 			defer scanMu.Unlock()
@@ -232,12 +263,31 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		sc := bufio.NewScanner(stdout)
 		// Result lines carry a whole turn's text; give them room.
 		sc.Buffer(make([]byte, 0, scannerInitialBytes), scannerMaxBytes)
+		// A panic while the driver decodes a line ends the read as a read
+		// error does, carrying a *taskguard.PanicError: the line is not
+		// logged, and supervise fails the task closed on it.
+		var decodePanic error
 		for sc.Scan() {
 			line := sc.Bytes()
 			if len(line) == 0 {
 				continue
 			}
-			evs, err := dec.Decode(line)
+			var evs []Event
+			var err error
+			if decodePanic = taskguard.Guard(log, "harness output decode", nil, func() {
+				// The mark is set before Guard logs the panic, so the task
+				// fails closed (adapter.failClosed) from the moment the
+				// recovery is visible.
+				defer func() {
+					if r := recover(); r != nil {
+						p.decodePanicked.Store(true)
+						panic(r)
+					}
+				}()
+				evs, err = dec.Decode(line)
+			}); decodePanic != nil {
+				break
+			}
 			if err != nil {
 				// A line the driver can't read (for Claude, non-JSON chatter)
 				// is logged, never fatal - the harness owns its stdout and
@@ -245,11 +295,28 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 				log.Warn("harness emitted non-JSON stdout line", "line", truncate(string(line), chatterEchoCap))
 				continue
 			}
+			// Each event carries when its line was read: taken here, not in
+			// the adapter's loop, which a slow publish can hold (Event.At).
+			at := time.Now()
+			for i := range evs {
+				evs[i].At = at
+			}
 			// A line with no events still goes through: the adapter checks
 			// for an abandon on every stdout line, as it always has.
 			events <- evs
 		}
-		if err := sc.Err(); err != nil {
+		if decodePanic != nil {
+			// decodePanicked is already set (above), so the adapter fails
+			// the task closed now, not after the drain. The harness is
+			// stopped rather than left to run its turn out: closing stdin
+			// alone ends it only at its next read.
+			p.kill(0)
+		}
+		err := decodePanic
+		if err == nil {
+			err = sc.Err()
+		}
+		if err != nil {
 			scanMu.Lock()
 			scanFailed = err
 			scanMu.Unlock()
@@ -274,6 +341,8 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 			_, _ = io.Copy(io.Discard, stdout)
 		}
 	}()
+
+	scanning = events
 
 	if err := p.writeUser(prompt); err != nil {
 		// The usual cause is a harness that exited before reading its
@@ -306,9 +375,24 @@ func startHarnessWith(d Driver, argv []string, env []string, prompt string, reap
 		if errors.Is(serr, os.ErrClosed) {
 			serr = nil
 		}
-		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence())
+		return nil, fmt.Errorf("write opening prompt: %w%s%s%s", err, reapEvidence(waitErr, reapTook, reapBound), scanEvidence(serr), p.stderrEvidence(answerscrub.ScrubInline))
 	}
 	return p, nil
+}
+
+// abandonStartedHarness stops a harness that startHarnessWith started and
+// then panicked over: SIGKILL to its group, its stdout's events drained so
+// the scanner can't park on a full channel, and the reap, which WaitDelay
+// bounds as it does every reap.
+func abandonStartedHarness(cmd *exec.Cmd, events chan []Event) {
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if events != nil {
+		go func() {
+			for range events {
+			}
+		}()
+	}
+	_ = cmd.Wait()
 }
 
 // scanEvidence is a stdout read failure as a failure reason carries it, or
@@ -373,14 +457,27 @@ func exitEvidence(waitErr error) string {
 }
 
 // stderrEvidence is the harness's stderr tail as a failure reason carries
-// it, or nothing when the harness wrote none. Call it after Wait, which is
-// what guarantees the tail holds everything the harness wrote.
-func (p *harnessProc) stderrEvidence() string {
-	tail := strings.TrimSpace(p.stderr.String())
+// it: the held window scrubbed whole, then cut to its last stderrTailBytes;
+// nothing when the harness wrote none. Call it after Wait, which is what
+// guarantees the window holds everything the harness wrote.
+func (p *harnessProc) stderrEvidence(scrub func(string) string) string {
+	tail := strings.TrimSpace(scrub(p.stderr.String()))
 	if tail == "" {
 		return ""
 	}
-	return stderrTailHeading + tail
+	return stderrTailHeading + lastBytes(tail, stderrTailBytes)
+}
+
+// lastBytes is s cut to its last max bytes, on a rune boundary.
+func lastBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	i := len(s) - max
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // writeUser writes one user message line onto the harness stdin. Steers

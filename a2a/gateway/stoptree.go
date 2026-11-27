@@ -28,7 +28,10 @@ const noticeTreeTaskStopped = "🛑 stopped"
 
 // stopTree cancels every live task in the tree of stoppedID, the task the
 // stop just canceled, other than stoppedID itself: from the chain's root
-// down each task's Children. Each live task is sent a cancel on its own
+// down each task's Children, and from each child to the wake its end started
+// (wakeOf), since a wake isn't on its child's Children and, since #6861, may
+// delegate again. The walk also starts at stoppedID, so a chain whose root
+// the history cap dropped still reaches the stopped task's own subtree. Each live task is sent a cancel on its own
 // addressee's .in under the stop's authority, marked canceled (whether or
 // not the cancel went out, so the heal and the batch can still end it),
 // marked quiet when the stop was, and given its stop record for a profile
@@ -49,7 +52,7 @@ func (g *Gateway) stopTree(ctx context.Context, rec *SessionRecord, stoppedID st
 		root = stopped
 	}
 	seen := map[string]bool{}
-	queue := []string{root.ID}
+	queue := []string{root.ID, stoppedID}
 	var batches []string
 	for len(queue) > 0 && len(seen) <= len(rec.Tasks) {
 		id := queue[0]
@@ -62,7 +65,10 @@ func (g *Gateway) stopTree(ctx context.Context, rec *SessionRecord, stoppedID st
 		if !held {
 			continue
 		}
-		queue = append(queue, ref.Children...)
+		queue = append(queue, ref.taskChildren()...)
+		if wake, woke := rec.wakeOf(id); woke {
+			queue = append(queue, wake.ID)
+		}
 		if ref.fanOut() {
 			batches = append(batches, id)
 		}
@@ -158,7 +164,7 @@ func (g *Gateway) releaseEndedTask(ctx context.Context, rec *SessionRecord, acti
 // session lock; the caller writes the record.
 func (g *Gateway) cancelOrphanedChildren(ctx context.Context, rec *SessionRecord, parentID string) {
 	parent, ok := rec.TaskRefFor(parentID)
-	if !ok || parent.Tier == "" || len(parent.Children) == 0 {
+	if !ok || parent.Tier == "" || len(parent.taskChildren()) == 0 {
 		return
 	}
 	authority, ok := delegationAuthority(parent)
@@ -167,7 +173,7 @@ func (g *Gateway) cancelOrphanedChildren(ctx context.Context, rec *SessionRecord
 			"parent", parentID, "conversation", rec.Key)
 	}
 	seen := map[string]bool{parentID: true}
-	queue := slices.Clone(parent.Children)
+	queue := slices.Clone(parent.taskChildren())
 	cancelled := 0
 	for len(queue) > 0 && len(seen) <= len(rec.Tasks) {
 		id := queue[0]
@@ -180,7 +186,7 @@ func (g *Gateway) cancelOrphanedChildren(ctx context.Context, rec *SessionRecord
 		if !held {
 			continue
 		}
-		queue = append(queue, ref.Children...)
+		queue = append(queue, ref.taskChildren()...)
 		if g.liveNode(ctx, rec, ref) {
 			g.cancelTreeNode(ctx, rec, ref, authority, true)
 			cancelled++
@@ -289,7 +295,7 @@ func (g *Gateway) healStoppedTasks(ctx context.Context, rec *SessionRecord) bool
 			continue
 		}
 		addressee := rec.AddresseeFor(ref.ID)
-		task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, ref.ID, g.profileRead(rec, ref.ID, addressee))
+		task, terminalSubject, _, err := g.client.TasksGetTerminal(ctx, addressee, ref.ID)
 		// The source each end is booked under, the same way the relay and
 		// healBatchChild read it (terminalSourceOf), so one terminal is
 		// attributed alike on every path.

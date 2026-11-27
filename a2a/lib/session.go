@@ -92,6 +92,13 @@ const (
 	// spec.harness.type.
 	EnvHarnessUnisolated   = "A2A_HARNESS_UNISOLATED"
 	HarnessUnisolatedAllow = "allow"
+
+	// EnvToolWithheld lists, comma-separated, the worker container's
+	// variables sourced from a Secret (an env entry's secretKeyRef). The
+	// worker withholds each one from the processes a turn's tools start. It
+	// names variables, not values. The operator renders the same name for
+	// profile workers (k8s-operator's envToolWithheld).
+	EnvToolWithheld = "A2A_TOOL_WITHHELD_ENV"
 	// EnvPersonaIntegrity sets whether a profile worker requires its persona
 	// to carry a build-time content manifest (persona.IntegrityManifestFile).
 	// PersonaIntegrityRequired refuses a persona without one; unset loads it
@@ -109,12 +116,13 @@ const (
 	EnvPrimerFile = "A2A_PRIMER_FILE"
 	// EnvDelegateTool turns the session's delegate tool off when it is
 	// "off". The spawner sets it off on a one-task pod started for a wake
-	// turn: the wake exists to report a delegation's outcome, and a wake that
-	// delegates again on an interim answer ("still running, results will post
-	// here") loops until the depth bound refuses, with nothing answered. A
-	// reused pod runs wakes and human turns alike, so it is started with the
-	// tool on, and its adapter turns the tool off for each task that is a
-	// wake, from the submission's authority block.
+	// the gateway didn't let delegate again (#6861): at the depth bound, or
+	// with a card report still to come, a wake that delegates again on an
+	// interim answer ("still running, results will post here") loops until
+	// the depth bound refuses, with nothing answered. A wake the gateway let
+	// delegate is started with it on. A reused pod runs wakes and human turns
+	// alike, so it is started with the tool on, and its adapter turns the
+	// tool off for each wake whose authority block's via lacks the grant.
 	EnvDelegateTool = "A2A_DELEGATE_TOOL"
 	// EnvSessionReuse is "true" on a session pod that serves every turn of
 	// its conversation rather than one task: after the task named by

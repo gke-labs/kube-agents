@@ -625,6 +625,35 @@ get_registry_prefix() {
   fi
 }
 
+# Resolves the registry a release reads a commit's built images from:
+# CANDIDATE_REGISTRY_PREFIX when set, else the registry prefix itself, so one
+# registry holds both the commit images and the release, as before the variable
+# existed. Only the release's own reads take it (the eligibility check, the
+# source-commit resolution and the promotion); every other caller of
+# check_commit_images_exist installs from get_registry_prefix and checks there.
+get_candidate_registry_prefix() {
+  if [ -n "${CANDIDATE_REGISTRY_PREFIX:-}" ]; then
+    echo "${CANDIDATE_REGISTRY_PREFIX%/}"
+  else
+    get_registry_prefix
+  fi
+}
+
+# Lists the registries a release is published to, one per line: the registry
+# prefix, then ADDITIONAL_RELEASE_REGISTRY_PREFIX when it is set and names
+# another registry. The promotion, the image signing and the chart publication
+# each walk this list, so a release is the same set of artifacts in each.
+release_registry_prefixes() {
+  local registry_prefix additional_prefix
+  registry_prefix="$(get_registry_prefix)"
+  additional_prefix="${ADDITIONAL_RELEASE_REGISTRY_PREFIX:-}"
+  additional_prefix="${additional_prefix%/}"
+  echo "${registry_prefix}"
+  if [ -n "${additional_prefix}" ] && [ "${additional_prefix}" != "${registry_prefix}" ]; then
+    echo "${additional_prefix}"
+  fi
+}
+
 # Whether a registry host is an Artifact Registry Docker host
 # (AR_REGISTRY_HOST_PATTERN).
 # Arguments: $1 = registry host
@@ -634,17 +663,33 @@ is_artifact_registry_host() {
 
 # Checks whether one fully-qualified image reference exists in its registry.
 #
-# `docker manifest inspect` is the preferred probe and the only one here that
-# works against every registry. It is guarded because not every caller has
-# docker: the Prow job image has none — hack/ci-deploy.sh builds through
-# `gcloud builds submit` for exactly that reason — and an unguarded call there
-# fails for every image, so the caller reports a publish outage when the real
-# problem is a missing binary. The fallbacks are the two registry APIs this
-# file speaks with curl alone: GHCR, which answers anonymously for a public
-# package, and Artifact Registry (ar_image_status), asked as the caller's
-# Google identity.
+# `docker manifest inspect` is the only probe here that works against every
+# registry, and the preferred one for all but Artifact Registry, which is
+# asked over its API first (the body says why). It is guarded because not
+# every caller has docker: the Prow job image has none — hack/ci-deploy.sh
+# builds through `gcloud builds submit` for exactly that reason — and an
+# unguarded call there fails for every image, so the caller reports a publish
+# outage when the real problem is a missing binary. The docker-free probes are
+# the two registry APIs this file speaks with curl alone: GHCR, which answers
+# anonymously for a public package, and Artifact Registry (ar_image_status),
+# asked as the caller's Google identity.
 registry_image_exists() {
   local img="$1"
+
+  # Artifact Registry is asked over its API first, docker or not: a runner's
+  # docker reads a private repository only after a `docker login`, while the
+  # job's Google credential is what `gcloud` already holds. Either definite
+  # answer ends it; a probe that could not ask falls through to docker.
+  local ar_status=""
+  if is_artifact_registry_host "${img%%/*}"; then
+    ar_status="$(ar_image_status "${img}")"
+    if [ "${ar_status}" = "present" ]; then
+      return 0
+    fi
+    if [ "${ar_status}" = "absent" ]; then
+      return 1
+    fi
+  fi
 
   if command -v docker >/dev/null 2>&1; then
     # Spelled out rather than `docker manifest inspect ...; return`, which
@@ -655,18 +700,17 @@ registry_image_exists() {
     if docker manifest inspect "${img}" >/dev/null 2>&1; then
       return 0
     fi
+    # docker's "no" for an image the API could not be asked about is as
+    # likely a missing login as a missing image, so the caller's "not found"
+    # gets its other possible cause named.
+    if [ -n "${ar_status}" ]; then
+      echo "⚠️ Warning: ${img} may not be missing: Artifact Registry could not be asked (no gcloud, no access token, or it refused the request), and docker reads a private repository only after a login to it." >&2
+    fi
     return 1
   fi
 
-  if is_artifact_registry_host "${img%%/*}"; then
-    local ar_status
-    ar_status="$(ar_image_status "${img}")"
-    if [ "${ar_status}" = "present" ]; then
-      return 0
-    fi
-    if [ "${ar_status}" != "absent" ]; then
-      echo "⚠️ Warning: cannot probe ${img}: no docker on PATH, and Artifact Registry could not be asked (no gcloud, no access token, or it refused the request)." >&2
-    fi
+  if [ -n "${ar_status}" ]; then
+    echo "⚠️ Warning: cannot probe ${img}: no docker on PATH, and Artifact Registry could not be asked (no gcloud, no access token, or it refused the request)." >&2
     return 1
   fi
 
@@ -951,12 +995,14 @@ required_release_images_for_release() {
 }
 
 # Checks if all required candidate container images exist in the registry
-# (get_registry_prefix) for a specific commit SHA: the images the commit's own scripts/release/common.sh lists
+# (the second argument, else get_registry_prefix) for a specific commit SHA: the images the commit's own scripts/release/common.sh lists
 # (required_release_images_at), since those are what its publish run built.
 check_commit_images_exist() {
   local sha="$1"
-  local registry_prefix
-  registry_prefix="$(get_registry_prefix)"
+  local registry_prefix="${2:-}"
+  if [ -z "${registry_prefix}" ]; then
+    registry_prefix="$(get_registry_prefix)"
+  fi
 
   local images=() img
   while IFS= read -r img; do images+=("${img}"); done < <(required_release_images_at "${sha}")
@@ -2374,11 +2420,13 @@ resolve_source_image_commit() {
     local parent_commit=""
     if parent_commit="$(git rev-parse --verify "${tag_commit}^" 2>/dev/null)"; then
       if is_ci_pipeline && command -v docker >/dev/null 2>&1; then
-        if check_commit_images_exist "${tag_commit}" 2>/dev/null; then
+        local candidate_prefix
+        candidate_prefix="$(get_candidate_registry_prefix)"
+        if check_commit_images_exist "${tag_commit}" "${candidate_prefix}" 2>/dev/null; then
           echo "${tag_commit}"
           return 0
         fi
-        if check_commit_images_exist "${parent_commit}" 2>/dev/null; then
+        if check_commit_images_exist "${parent_commit}" "${candidate_prefix}" 2>/dev/null; then
           echo "${parent_commit}"
           return 0
         fi
@@ -2399,7 +2447,48 @@ resolve_source_image_commit() {
   return 1
 }
 
-# Clean Promotion: Tags verified container images in GHCR without rebuilding
+# Gives one image a second tag without rebuilding: target_image names what
+# source_image names, in the same registry or another. A target that already
+# names the source is left alone, so a re-run resumes; one that names anything
+# else is refused.
+promote_image_tag() {
+  local source_image="${1:-}"
+  local target_image="${2:-}"
+  local commit_sha="${3:-}"
+
+  # Safety Guard: Check if target image tag already exists in registry
+  local target_digest=""
+  if target_digest="$(get_image_manifest_digest "${target_image}")"; then
+    local source_digest=""
+    if ! source_digest="$(get_image_manifest_digest "${source_image}")"; then
+      echo "❌ ERROR: Target image '${target_image}' already exists in registry, but failed to inspect source image '${source_image}'!" >&2
+      return 1
+    fi
+
+    local raw_target=""
+    if [ "${target_digest}" = "${source_digest}" ] || \
+       ( [ -n "${source_digest}" ] && raw_target="$(docker buildx imagetools inspect --raw "${target_image}" 2>/dev/null)" && grep -q "${source_digest}" <<<"${raw_target}" ); then
+      echo "    ℹ️ Target image '${target_image}' already exists in registry and matches source image (${commit_sha:0:7}). Skipping duplicate promotion."
+      return 0
+    fi
+    echo "❌ ERROR: Target image '${target_image}' already exists in registry (digest: ${target_digest}) but does NOT match source image '${source_image}' (digest: ${source_digest})!" >&2
+    echo "Release promotion blocked to prevent artifact mismatch across commits." >&2
+    return 1
+  fi
+
+  docker buildx imagetools create --prefer-index=false --tag "${target_image}" "${source_image}"
+}
+
+# Clean Promotion: tags a commit's verified container images with the release
+# version without rebuilding. The images are read from the candidate registry
+# (get_candidate_registry_prefix) and published to each release registry
+# (release_registry_prefixes), all from the one source, one registry after
+# another: every image is in the registry prefix before the first is written
+# to an additional registry, so a failure there leaves the registry prefix
+# whole. When the candidate registry is not the registry prefix it gets the
+# version tag too, before the registry prefix does: rollback_environment.sh
+# looks for the previous release's version in the registry an environment is
+# installed from.
 promote_release_images() {
   local commit_sha="${1:-}"
   local release_version="${2:-}"
@@ -2426,8 +2515,9 @@ promote_release_images() {
   local resolved_commit
   resolved_commit="$(git rev-parse --verify "${commit_sha}^{commit}" 2>/dev/null || echo "${commit_sha}")"
 
-  local registry_prefix
+  local registry_prefix candidate_prefix
   registry_prefix="$(get_registry_prefix)"
+  candidate_prefix="$(get_candidate_registry_prefix)"
 
   echo "🚀 Promoting verified container images (${resolved_commit:0:7}) -> (${release_version})..."
 
@@ -2446,33 +2536,25 @@ promote_release_images() {
     return 1
   fi
 
-  for img in "${images[@]}"; do
-    local source_image="${registry_prefix}/${img}:${resolved_commit}"
-    local target_image="${registry_prefix}/${img}:${release_version}"
-    echo "  • Promoting ${img}..."
+  local release_prefixes=() release_prefix release_prefix_lines
+  release_prefix_lines="$(release_registry_prefixes)" || return 1
+  while IFS= read -r release_prefix; do release_prefixes+=("${release_prefix}"); done <<<"${release_prefix_lines}"
 
-    # Safety Guard: Check if target image tag already exists in registry
-    local target_digest=""
-    if target_digest="$(get_image_manifest_digest "${target_image}")"; then
-      local source_digest=""
-      if ! source_digest="$(get_image_manifest_digest "${source_image}")"; then
-        echo "❌ ERROR: Target image '${target_image}' already exists in registry, but failed to inspect source image '${source_image}'!" >&2
-        return 1
-      fi
-
-      local raw_target=""
-      if [ "${target_digest}" = "${source_digest}" ] || \
-         ( [ -n "${source_digest}" ] && raw_target="$(docker buildx imagetools inspect --raw "${target_image}" 2>/dev/null)" && grep -q "${source_digest}" <<<"${raw_target}" ); then
-        echo "    ℹ️ Target image '${target_image}' already exists in registry and matches source image (${resolved_commit:0:7}). Skipping duplicate promotion."
-        continue
+  for release_prefix in "${release_prefixes[@]}"; do
+    for img in "${images[@]}"; do
+      local source_image="${candidate_prefix}/${img}:${resolved_commit}"
+      if [ "${release_prefix}" = "${registry_prefix}" ]; then
+        echo "  • Promoting ${img}..."
       else
-        echo "❌ ERROR: Target image '${target_image}' already exists in registry (digest: ${target_digest}) but does NOT match source image '${source_image}' (digest: ${source_digest})!" >&2
-        echo "Release promotion blocked to prevent artifact mismatch across commits." >&2
-        return 1
+        echo "  • Publishing ${img} to ${release_prefix}..."
       fi
-    fi
-
-    docker buildx imagetools create --prefer-index=false --tag "${target_image}" "${source_image}"
-    echo "    ✅ Promoted ${img} to ${release_version}"
+      if [ "${release_prefix}" = "${registry_prefix}" ] && [ "${candidate_prefix}" != "${registry_prefix}" ]; then
+        promote_image_tag "${source_image}" "${candidate_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
+      fi
+      promote_image_tag "${source_image}" "${release_prefix}/${img}:${release_version}" "${resolved_commit}" || return 1
+      if [ "${release_prefix}" = "${registry_prefix}" ]; then
+        echo "    ✅ Promoted ${img} to ${release_version}"
+      fi
+    done
   done
 }

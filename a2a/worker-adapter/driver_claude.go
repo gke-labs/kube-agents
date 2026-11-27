@@ -20,6 +20,11 @@ const (
 	// the agent SDK passes it alongside --input-format stream-json, the
 	// shape harnessCommand builds.
 	harnessResumeFlag = "--resume"
+	// claudeSkillTool is the tool Claude Code loads a skill with (the
+	// skillTool of lib/persona/claudecode), and claudeSkillInputKey the key
+	// of its input that names the skill.
+	claudeSkillTool     = "Skill"
+	claudeSkillInputKey = "skill"
 )
 
 func (claudeDriver) Harness() persona.Harness { return persona.ClaudeCode }
@@ -90,20 +95,30 @@ func (claudeDecoder) Decode(line []byte) ([]Event, error) {
 	return nil, nil
 }
 
-// toolResultEvents is one EventToolResult per tool_result block on a user
-// line: a line carries one block per tool call it answers, and parallel calls
-// share a line. Nothing of the result is carried.
-func (ev harnessEvent) toolResultEvents() []Event {
-	if ev.Message == nil {
-		return nil
+// rawString is raw as a JSON string, or "" when it is absent or another
+// shape.
+func rawString(raw json.RawMessage) string {
+	var s string
+	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
+		return ""
 	}
-	var out []Event
-	for _, b := range ev.Message.Content {
-		if b.Type == toolResultBlockType {
-			out = append(out, Event{Kind: EventToolResult})
-		}
+	return s
+}
+
+// rawTrue reports whether raw is the JSON value true.
+func rawTrue(raw json.RawMessage) bool {
+	var b bool
+	return len(raw) > 0 && json.Unmarshal(raw, &b) == nil && b
+}
+
+// claudeSkillName is the skill a Skill call's input names, or "" when the
+// input names none as a string.
+func claudeSkillName(input json.RawMessage) string {
+	var fields map[string]json.RawMessage
+	if len(input) == 0 || json.Unmarshal(input, &fields) != nil {
+		return ""
 	}
-	return out
+	return rawString(fields[claudeSkillInputKey])
 }
 
 // toolResultBlockType is a user line's content block that answers a tool call.
@@ -128,10 +143,63 @@ func (ev harnessEvent) assistantEvents() []Event {
 				out = append(out, Event{Kind: EventProgress, Text: block.Text})
 			}
 		case "tool_use":
-			out = append(out, Event{Kind: EventActivity, Tool: block.Name, Input: block.Input})
+			e := Event{Kind: EventActivity, Tool: block.Name, Input: block.Input, CallID: rawString(block.ID)}
+			if block.Name == claudeSkillTool {
+				e.SkillCall, e.Skill = true, claudeSkillName(block.Input)
+			}
+			out = append(out, e)
 		}
 	}
 	return out
+}
+
+// toolResultEvents is one EventToolResult per tool_result block on a user
+// line: a line carries one block per tool call it answers, and parallel calls
+// share a line. It carries the id of the call the block answers and the
+// block's error flag. A block's content goes on the event as the answer's
+// scrub reads it (toolResultRaw): a JSON string as it is, a list of content
+// blocks as one JSON list of its text blocks' texts (an image's data is not
+// read). A block with no content is still an event, with none.
+func (ev harnessEvent) toolResultEvents() []Event {
+	if ev.Message == nil {
+		return nil
+	}
+	var out []Event
+	for _, block := range ev.Message.Content {
+		if block.Type != toolResultBlockType {
+			continue
+		}
+		e := Event{Kind: EventToolResult, CallID: rawString(block.ToolUseID), Failed: rawTrue(block.IsError)}
+		if len(block.Content) > 0 {
+			e.ToolResult = toolResultRaw(block.Content)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// toolResultRaw is the raw JSON CollectToolResult reads for one tool_result
+// block's content: a string as it is; a list of blocks as the list of its
+// text blocks' texts; anything else as it is.
+func toolResultRaw(content json.RawMessage) json.RawMessage {
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return content
+	}
+	texts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Type == "text" && b.Text != "" {
+			texts = append(texts, b.Text)
+		}
+	}
+	raw, err := json.Marshal(texts)
+	if err != nil {
+		return content
+	}
+	return raw
 }
 
 // harnessEvent is one stream-json line from the harness stdout. Only the
@@ -142,7 +210,8 @@ type harnessEvent struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype"`
 	// type:"assistant" carries an API Message; content blocks are inspected
-	// for text / thinking / tool_use.
+	// for text / thinking / tool_use. type:"user" carries the tool_result
+	// blocks the harness fed back to the model.
 	Message *harnessMessage `json:"message,omitempty"`
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
@@ -251,7 +320,27 @@ func (ev harnessEvent) telemetry(model string) resultTelemetry {
 }
 
 type harnessMessage struct {
-	Content []harnessBlock `json:"content"`
+	Content harnessContent `json:"content"`
+}
+
+// harnessContent is a message's content blocks. A user message's content may
+// be a plain string (a prompt the harness echoes) rather than a list; it
+// carries no block the adapter reads, so it decodes as none rather than
+// failing the whole line.
+type harnessContent []harnessBlock
+
+func (c *harnessContent) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil {
+		*c = nil
+		return nil
+	}
+	var blocks []harnessBlock
+	if err := json.Unmarshal(b, &blocks); err != nil {
+		return err
+	}
+	*c = blocks
+	return nil
 }
 
 type harnessBlock struct {
@@ -260,6 +349,17 @@ type harnessBlock struct {
 	Thinking string          `json:"thinking,omitempty"`
 	Name     string          `json:"name,omitempty"`  // tool_use
 	Input    json.RawMessage `json:"input,omitempty"` // tool_use
+	// Content is a tool_result block's result, as the harness reported it
+	// on a user message: a JSON string, or a list of content blocks (text,
+	// image). Read only for the answer's scrub (toolResultEvents).
+	Content json.RawMessage `json:"content,omitempty"`
+	// ID is a tool_use block's id, ToolUseID the same id on the tool_result
+	// block that answers it, and IsError that block's error flag. Each is
+	// held raw and read on its own (rawString, rawTrue): an off-shape one is
+	// that field dropped, never the line with the tool call.
+	ID        json.RawMessage `json:"id,omitempty"`
+	ToolUseID json.RawMessage `json:"tool_use_id,omitempty"`
+	IsError   json.RawMessage `json:"is_error,omitempty"`
 }
 
 // userMessage is the stream-json stdin shape for both the opening prompt and

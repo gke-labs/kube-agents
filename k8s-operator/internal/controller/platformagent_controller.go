@@ -22,6 +22,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"net"
+	"net/http"
 	"reflect"
 	"regexp"
 	"slices"
@@ -615,7 +616,10 @@ type PlatformAgentReconciler struct {
 	// operator rolled ahead of its CRD writes and logs the tier once per
 	// interval rather than on every pass. Keyed by ObjectKey, value time.Time;
 	// cleared by an echo that carries the field, and when the CR is deleted.
-	prunedSizingTier sync.Map
+	prunedSizingTier   sync.Map
+	prunedSizingStatus sync.Map
+	sizingUtilState    sync.Map
+	sizingNextRequeue  sync.Map
 
 	// steppedBackAt records, per CR, when resolveSizingTier last stepped the
 	// sizing latch back from a pod admission refused on a quota
@@ -754,6 +758,17 @@ type PlatformAgentReconciler struct {
 	// reconciler renders (builtinSchedules), whatever A2A_AGENT_SCHEDULES
 	// says. Tests set it.
 	BuiltinSchedules func(*agentv1alpha1.PlatformAgent) []builtinSchedule
+
+	// BrokerControlClient overrides the HTTP client used to query
+	// credential-proxy /control/* and /metrics listeners in tests.
+	BrokerControlClient *http.Client
+
+	// UtilizationReader overrides live PodMetrics + broker /metrics collection
+	// for proactive auto-sizing in tests.
+	UtilizationReader func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (SizingUtilizationSample, error)
+
+	// nowFn overrides wall-clock time for deterministic soak/cooldown tests.
+	nowFn func() time.Time
 
 	// busConfigLoadTime stands in for reading a bus server's config_load_time
 	// from its /varz (a2aBusReadVarz), in tests. Nil reads it.
@@ -1293,6 +1308,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 5b. Which callers send their inference gateway key on this pass, read
+	// once, before the first render that depends on it (the managed config
+	// below), so every render of the pass agrees (inference_key_callers.go).
+	inferenceKeyCallers, err := r.servedInferenceKeyCallers(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	ctx = withInferenceKeyCallers(ctx, inferenceKeyCallers)
+
 	// 6. Reconcile ConfigMap (config.yaml content)
 	configMapHash, err := r.reconcileConfigMap(ctx, instance, agentPlugins)
 	if err != nil {
@@ -1450,6 +1474,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, renderAgent); err != nil {
 		return ctrl.Result{}, err
 	}
+	// And the pod read that holds each caller to its own pod, before the
+	// broker that refuses every pod-token request without it.
+	if err := r.reconcileCredentialBrokerPodReadRBAC(ctx, renderAgent); err != nil {
+		return ctrl.Result{}, err
+	}
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, renderAgent)
 	otlpDisabled := otlpSource == otlpSourceNone
 	if err := r.reconcileKubeProxy(ctx, renderAgent, otlpEndpoint, otlpDisabled); err != nil {
@@ -1480,8 +1509,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 	owned := brokerCallerOwnership{mcp: mcpIdentityOwned, scope: scopeIdentityOwned}
-	if err := r.reconcileCredentialProxy(ctx, renderAgent, proxyPolicyHash, agentPlugins, owned); err != nil {
+	handoffRequeue, err := r.reconcileCredentialProxy(ctx, renderAgent, proxyPolicyHash, agentPlugins, owned)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	earlyRequeue := func(base time.Duration) time.Duration {
+		d := minPositive(base, handoffRequeue)
+		d = minPositive(d, r.sizingStepBackRequeue(instance))
+		return minPositive(d, r.sizingAutoRequeue(instance))
 	}
 
 	// 11e. Refuse an allowlist destination the policy will not render.
@@ -1518,7 +1553,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if guardrailErr != nil {
 			return ctrl.Result{}, guardrailErr
 		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: earlyRequeue(30 * time.Second)}, nil
 	}
 
 	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
@@ -1645,7 +1680,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if statusErr := r.updateStatusDegraded(ctx, instance, "A2AProvisionFailed", a2aState.message, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: earlyRequeue(30 * time.Second)}, nil
 	}
 
 	// 13. Report an install whose sandbox keypair was never generated.
@@ -1670,7 +1705,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadRendered); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: earlyRequeue(30 * time.Second)}, nil
 	}
 
 	phase, tasksWaitRequeue, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
@@ -1683,7 +1718,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
 		// The TASKS wait's threshold pass may be due sooner (below).
-		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, 30*time.Second)}, nil
+		return ctrl.Result{RequeueAfter: earlyRequeue(minPositive(tasksWaitRequeue, 30*time.Second))}, nil
 	}
 
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
@@ -1733,7 +1768,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			requeue = min(requeue, a2aState.builtinSchedulesRequeue)
 		}
 		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
-		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
+		return ctrl.Result{RequeueAfter: earlyRequeue(minPositive(tasksWaitRequeue, requeue))}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
@@ -1771,7 +1806,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			requeue = min(requeue, a2aState.drainEndRequeue)
 		}
 		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
-		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
+		return ctrl.Result{RequeueAfter: earlyRequeue(minPositive(tasksWaitRequeue, requeue))}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1806,6 +1841,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// and the settled lower row sends no event for it, so the pass that
 	// measures the step again is scheduled for the hold's end.
 	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
+	requeueAfter = min(requeueAfter, r.sizingAutoRequeue(instance))
+	if handoffRequeue > 0 {
+		requeueAfter = min(requeueAfter, handoffRequeue)
+	}
 	// An A2A gateway waiting for TASKS on a provisioned bus turns Degraded at
 	// a threshold, and pods are not watched, so the pass that writes it is
 	// scheduled, from the status pass's own read (a2aGatewayTasksWaitMessage).
@@ -1858,13 +1897,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
 // pruned-status probe: the interval while a record is held for this CR, the
 // whole usage block's, status.busReplicas', status.inference's,
-// status.observedVersion's, status.universeDomain's, or, on the session route,
-// status.effectiveSessionCap's (sessionCapStatusPruned) or
-// status.effectiveWarmSessions' (sessionWarmStatusPruned). With no record it returns the secret re-read's
-// interval, the ceiling the caller already applies, so the min it feeds leaves
-// the caller's value alone.
+// status.observedVersion's, status.universeDomain's, status.sizing's, or, on
+// the session route, status.effectiveSessionCap's (sessionCapStatusPruned) or
+// status.effectiveWarmSessions' (sessionWarmStatusPruned). With no record it
+// returns the secret re-read's interval, the ceiling the caller already
+// applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) || r.sessionCapStatusPruned(agent) || r.sessionWarmStatusPruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) || r.universeDomainPruned(agent) || r.sizingStatusPruned(agent) || r.sessionCapStatusPruned(agent) || r.sessionWarmStatusPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -1947,6 +1986,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// holds the finalizer, under the profile-namespace rule.
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
+		}
+		// The broker's pod-read Role and binding there, for the same reason.
+		if err := r.deleteCredentialBrokerProfilePodRead(ctx, agent); err != nil {
+			r.profileNamespaceFailure(ctx, agent, "delete the credential broker's pod-read Role on deletion", err)
 		}
 		// The profile tiers' inference gateway keys there go too: nothing
 		// else reclaims them. The ones in the agent's namespace go with
@@ -2143,7 +2186,13 @@ func (r *PlatformAgentReconciler) reconcileConfigMap(ctx context.Context, agent 
 		r.kanbanAdmissionWarningsLogged.Delete(key)
 	}
 
-	cm := buildConfigMap(agent, agentPlugins)
+	// The agent's model.api_key reads its inference gateway key from the env
+	// the pod template carries in the same pass (inference_key_callers.go).
+	apiKey := agentPlaceholderAPIKey
+	if inferenceKeyCallersFrom(ctx).sends(inferenceKeyClassAgent) {
+		apiKey = agentInferenceKeyConfigRef
+	}
+	cm := buildConfigMapWith(agent, agentPlugins, apiKey)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return "", err
 	}
@@ -3134,7 +3183,8 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
-	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled,
+		inferenceKeys: inferenceKeyCallersFrom(ctx)}
 	held, err := r.heldGitHubOrg(ctx, agent)
 	if err != nil {
 		return err
@@ -3819,7 +3869,12 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // and the sandbox's wrapped CLIs both dial the Service, and neither has any
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
-func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership) (time.Duration, error) {
+	if credentialProxyActiveStandby(agent) && r.canControlBroker() {
+		if err := r.ensureCredentialProxyControlSecret(ctx, agent); err != nil {
+			return 0, fmt.Errorf("failed to ensure credential proxy control Secret: %w", err)
+		}
+	}
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, an override under the
@@ -3868,11 +3923,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// task-signing public key, or nothing on an install without profiles.
 	profiles, err := r.credentialProxyProfileConfigFor(ctx, agent)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	autopilot, recorded, err := r.credentialProxyAutopilot(ctx, agent)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
 	// The annotation records a cluster type, so only a definite answer, or the
@@ -3882,9 +3937,23 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if !recorded {
 		delete(proxy.Annotations, credentialProxyClusterTypeAnnotation)
 	}
-	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
-		return err
+	if !r.canControlBroker() {
+		disableCredentialProxyStandby(proxy)
+	} else if credentialProxyActiveStandby(agent) {
+		hasLegacy, err := r.hasLegacyCredentialProxyPod(ctx, agent)
+		if err != nil {
+			return 0, err
+		}
+		if hasLegacy {
+			// Keep Recreate (with standby env on template) until pre-standby pods
+			// are gone so the old ReplicaSet scales to 0 instead of recreating an active peer.
+			keepCredentialProxyStrategyRecreate(proxy)
+		}
 	}
+	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
+		return 0, err
+	}
+	stampCredentialProxyTemplateHash(&proxy.Spec.Template)
 	objs = append(objs, proxy)
 	// The exec tier is derived from this render, copied before the apply: the
 	// apply decodes the server's merged object into proxy, which carries
@@ -3897,7 +3966,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	objs = append(objs, withCredentialProxyProfilePeer(credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace), agent, profiles))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+			return 0, fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 		apply := r.applyManaged
 		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment {
@@ -3908,14 +3977,21 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		// NetworkPolicy after it on every pass; the clear is the callout's.
 		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
 			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		if err := apply(ctx, agent, obj); err != nil {
-			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+			return 0, fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
-	return r.reconcileCredentialProxyExecTier(ctx, agent, execBase, profiles)
+	handoffRequeue, err := r.reconcileCredentialProxyHandoff(ctx, agent, proxy)
+	if err != nil {
+		return 0, err
+	}
+	if err := r.reconcileCredentialProxyExecTier(ctx, agent, execBase, profiles); err != nil {
+		return 0, err
+	}
+	return handoffRequeue, nil
 }
 
 // applyCredentialProxyDeployment applies the broker's Deployment, recreating it
@@ -4473,8 +4549,12 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	}
 	for i := range existingRoleBindings.Items {
 		rb := &existingRoleBindings.Items[i]
-		// Preserve local and leader bindings during reconciliation
-		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName) {
+		// Preserve local and leader bindings during reconciliation.
+		// The broker's and kube-proxy's pod-read bindings are bound to saName too,
+		// and an agent named with the kubeagents prefix would give them the prefix
+		// this sweep reaps; reconcileCredentialBrokerPodReadRBAC and
+		// reconcileKubeProxy apply them every pass.
+		if !deleteAll && (rb.Name == localBindingName || rb.Name == leaderBindingName || rb.Name == credentialBrokerPodReadName(agent) || rb.Name == kubeProxyPodReadName(agent)) {
 			continue
 		}
 		isTargetSA := false
@@ -5465,6 +5545,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
+	} else if slackFailed := slackConnectionFailedCondition(agent); slackFailed != nil {
+		// Degraded only, as A2ABusStreamsMissing and A2AGatewayWaitingForTasks
+		// above: Ready and the phase keep what the workloads say so an
+		// external Slack outage does not drop the console, A2A doors, or
+		// gateway PodDisruptionBudget, while broken Slack auth.test / Socket
+		// Mode connectivity surfaces clearly on Degraded.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonSlackConnectionFailed
+		degradedMsg = slackFailed.Message
 	} else if reason, msg := specResourceDegraded(agent); reason != "" {
 		// The spec's resource, exec-tier, and admission refusals, last: the
 		// resource and exec checks leave workloads at the operator's defaults,
@@ -5898,6 +5987,9 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 	r.singleServerBusWarned.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedSizingStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.sizingUtilState.Delete(client.ObjectKeyFromObject(agent))
+	r.sizingNextRequeue.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.heldBusMigrationWarned.Delete(client.ObjectKeyFromObject(agent))
 	r.busReshapeRefused.Delete(client.ObjectKeyFromObject(agent))
@@ -6851,8 +6943,9 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
-	// Degraded following BusStreamsPresent on a park (#5707): read from the
-	// agent itself, so the live re-check below judges the live object.
+	// Degraded following poller-owned conditions (BusStreamsPresent and
+	// SlackConnected) on a park (#5707): read from the agent itself, so the
+	// live re-check below judges the live object.
 	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
 		return false
 	}
@@ -6986,8 +7079,9 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	// Degraded is updateStatusReady's to rank, and a park returns before it
-	// runs; the bus streams' reason alone follows the poller here, which keeps
-	// writing BusStreamsPresent through a park (parkBusStreamsDegraded).
+	// runs; the poller-owned reasons (BusStreamsPresent / A2ABusStreamsMissing
+	// and SlackConnected / SlackConnectionFailed) follow their pollers here
+	// through a park (parkBusStreamsDegraded).
 	edit, busStreams := parkBusStreamsDegraded(agent)
 	applyParkBusStreamsDegraded(agent, edit, busStreams, now)
 	return r.Status().Update(ctx, agent)

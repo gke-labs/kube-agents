@@ -3,7 +3,7 @@ title: Manual install
 description: Install the Platform Agent workspace into an existing Hermes-compatible harness by hand.
 ---
 
-If you're not using GKE or the shipping automated installation flow, you can install the Platform Agent workspace into an existing Hermes-compatible harness by hand. This page covers the harness-side setup only; you still need to arrange cluster access, chat ingress, an inference gateway, and (for GitOps flows) a token minter separately.
+If you're not using GKE or the shipping automated installation flow, you can install the Platform Agent workspace into an existing Hermes-compatible harness by hand. This page covers the harness-side setup only; you still need to arrange cluster access, chat ingress, an inference gateway, and (for GitOps flows) a token minter separately. To deploy the official operator and Helm chart on GKE through Flux or Argo CD without running `install.sh`, see [Enterprise Helm & GitOps](/kube-agents/install/enterprise-gitops/).
 
 For a token minter on a GitHub Enterprise Server, see [GitHub Enterprise Server](/kube-agents/deploy/token-minter/#github-enterprise-server) in the token minter guide, and the install steps in [INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
 
@@ -32,7 +32,7 @@ platform/
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
 ├── cron/jobs.json           # the governance watchdog roster (see below)
-├── plugins/                 # in-tree Hermes plugins (incident_context, pr_opened, memory)
+├── plugins/                 # in-tree Hermes plugins (eval_run_tag, incident_context, model_identity, pr_opened)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```

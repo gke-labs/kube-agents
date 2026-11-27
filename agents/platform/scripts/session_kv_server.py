@@ -24,8 +24,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
 from contextlib import ExitStack, asynccontextmanager, closing, nullcontext
 from pathlib import Path
@@ -295,7 +295,7 @@ PRE_KANBAN_STATUS_COMPLETED = "completed"
 PRE_KANBAN_STATUS_FAILED = "failed"
 # Upper bound for an unclosed front-door routing turn before it is treated as
 # stale rather than permanently `in_progress`. `_start_agent_turn` uses a 300s
-# client-side `urlopen` read timeout, but the Hermes gateway turn can continue
+# client-side read timeout, but the Hermes gateway turn can continue
 # running server-side (and a single MCP call in `agents/platform/config.yaml`
 # allows up to 420s: `connect_timeout: 120` + `timeout: 300`), so 900s (15m)
 # gives slow multi-step routing turns headroom before marking them stale.
@@ -381,6 +381,10 @@ TRIAGE_RETRY_MAX_DELAY_S = 60.0
 TRIAGE_RETRY_JITTER = (0.5, 1.0)
 # The gateway's loopback address, when PLATFORM_API_URL does not name one.
 PLATFORM_API_URL_DEFAULT = "http://127.0.0.1:8642"
+# The gateway API is on the pod's loopback address by default: a proxy from the
+# environment must not get a turn's prompt, and urllib does not leave out a
+# loopback host by itself.
+_GATEWAY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # A start queued longer than this still gets one attempt, then no retry, whatever
 # the budget says: the wait bounds the retries, never the first try.
 TRIAGE_QUEUE_WAIT_LIMIT_S = 1200.0
@@ -1337,9 +1341,10 @@ DRIFT_NO_GITOPS_LINE = (
 
 # The `join` value the detector sends when it actually read the live object's
 # `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
-# Any other value means ownership is absent because the lookup did not happen,
-# which is a different fact from an object that has no other owners — and the
-# card has to say which.
+# Any other value the detector sends means ownership is absent because the
+# lookup did not happen, which is a different fact from an object that has no
+# other owners — and the card has to say which. One more value is the
+# daemon's own: DRIFT_JOIN_NOT_STORED, on a row stored without the list.
 DRIFT_JOIN_ENRICHED = "enriched"
 
 # What a card or chat line says where the detector sent a field empty. The
@@ -1441,7 +1446,9 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # principal with few of them are carded instead (DRIFT_BACKLOG_CARD_BELOW). An install queues such a
 # burst under the installer's own account, and triaging it one card at a time
 # spent the day's drift budget on kube-agents' own objects. A pod roll queues
-# whatever was published while it restarted.
+# whatever was published while it restarted. The route also takes live writes
+# to kube-agents' own objects (DRIFT_OWN_RELEASE_FEATURE and the comment above
+# DRIFT_OWN_RELEASE_KEY).
 #
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
@@ -1450,7 +1457,11 @@ DRIFT_BACKLOG_FEATURE = "drift-backlog"
 # POST /v1/excluded-events, for the daily recap's count, only when it reads this
 # feature: an older daemon has no such route.
 ALERT_EXCLUDED_FEATURE = "alert-excluded"
-DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP, ALERT_EXCLUDED_FEATURE]
+# The detector marks a write to kube-agents' own objects, and sends a live one
+# to the digest route, only when it reads this feature: a daemon without it
+# digests by count alone and would word such a row as late.
+DRIFT_OWN_RELEASE_FEATURE = "drift-own-release"
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP, ALERT_EXCLUDED_FEATURE, DRIFT_OWN_RELEASE_FEATURE]
 # How far back POST /v1/excluded-events looks for the object's row to add to.
 # An hour, not a day: the daily recap selects rows by `created_at`, so a row
 # that kept collecting for a day after it was created would carry sightings
@@ -1473,14 +1484,17 @@ DRIFT_BACKLOG_HEADLESS = 3
 # Carded instead of digested (DRIFT_BACKLOG_CARD_BELOW). Its `notified` and
 # `session_id` then say what a live drift row's would.
 DRIFT_BACKLOG_CARDED = 4
-# A principal with fewer late rows than this in one digest gets a card for each
-# instead. The burst the digest exists for is one principal's install, tens of
+# A principal with fewer rows than this in one digest gets a card for each
+# late row and each CRD row instead. The burst the digest exists for is one principal's install, tens of
 # rows; one or two late rows are far more likely a person's edit made just
 # before a detector restart, which on main gets its triage.
 DRIFT_BACKLOG_CARD_BELOW = 3
-# The stored payload a carded row is rebuilt from. A backlog payload carries no
-# field ownership (the join is skipped), so it is small; one past this is
-# stored empty and its card is built from the row's columns.
+# The stored payload a carded row is rebuilt from. A late record carries no
+# field ownership (its join is skipped), so it is small. A live own-release
+# record is joined, and a CRD's ownership alone can pass this: such a payload
+# is stored without its ownership list, and one still past this is stored as
+# its decision keys (DRIFT_BACKLOG_DECISION_KEYS), with its card built from
+# the row's columns.
 DRIFT_BACKLOG_PAYLOAD_MAX_CHARS = 16384
 # The digest waits for the burst to stop (no new pending row for the quiet
 # period) so one install is one message, but no longer than the max wait after
@@ -1551,6 +1565,137 @@ SECONDS_PER_DAY = 86400.0
 # The max wait as the digest words it. The detector owns the number
 # (`backlogMaxWait` in subscriber.go); this text has to change with it.
 DRIFT_BACKLOG_MAX_WAIT_TEXT = "30 minutes"
+# Why a row is in the digest and not on a card of its own. A late row is the
+# route's first reason. The detector also sends here a live write to
+# kube-agents' own objects, which an upgrade makes under the installer's
+# account while the detector is pulling (`ownRelease.wrote` in the detector's
+# ownrelease.go); "late" would be a false statement about those. It marks the
+# payload with DRIFT_OWN_RELEASE_KEY: `crd` for one of the product's CRDs,
+# `release` for anything else of the release.
+#
+# Where a write lands does not show that an upgrade made it, so a `release`
+# row is digested only inside an upgrade window of its own principal. Helm
+# creates its record Secret for a new revision first in every upgrade and
+# rollback, and updates that Secret when the upgrade ends; the detector marks
+# the create with DRIFT_OWN_RELEASE_REVISION_KEY and the update with
+# DRIFT_OWN_RELEASE_REVISION_END_KEY. The window runs between the two, by the
+# audit time each record carries, because Pub/Sub delivers in no order. With
+# no end seen it runs DRIFT_UPGRADE_WINDOW_SECONDS, above the ten minutes the
+# installer gives Helm. Outside a window a live `release` row is carded
+# whatever its principal's count. A `crd` row needs no window: the installer
+# applies the CRDs before Helm starts, by a gap with no bound.
+DRIFT_OWN_RELEASE_KEY = "own_release"
+DRIFT_OWN_RELEASE_CRD = "crd"
+DRIFT_OWN_RELEASE_OBJECT = "release"
+DRIFT_OWN_RELEASE_REVISION_KEY = "own_release_revision"
+DRIFT_OWN_RELEASE_REVISION_END_KEY = "own_release_revision_end"
+# Set by the detector on a record that reached it late.
+DRIFT_LATE_KEY = "backlog"
+# When the change was made, RFC 3339 to the second.
+DRIFT_TIMESTAMP_KEY = "timestamp"
+DRIFT_UPGRADE_WINDOW_SECONDS = 900
+# Two records of one second cannot be put in order, and the audit time is cut
+# to the second on the way here.
+DRIFT_UPGRADE_SKEW_SECONDS = 2
+# How far back the ledger is read for the start and end of an upgrade: a row
+# decided now was made at most the digest's longest wait ago, and its upgrade
+# started at most a window before that.
+DRIFT_UPGRADE_LOOKBACK_SECONDS = DRIFT_UPGRADE_WINDOW_SECONDS + DRIFT_BACKLOG_MAX_WAIT_SECONDS
+# The payload keys a stored row keeps when the whole payload is over the cap:
+# what the digest decides on.
+DRIFT_BACKLOG_DECISION_KEYS = (
+    DRIFT_OWN_RELEASE_KEY,
+    DRIFT_OWN_RELEASE_REVISION_KEY,
+    DRIFT_OWN_RELEASE_REVISION_END_KEY,
+    DRIFT_LATE_KEY,
+    DRIFT_TIMESTAMP_KEY,
+)
+# What `_mark_drift_backlog_causes` writes on a claimed row: why it is here,
+# and for an upgrade row the upgrade it was made in.
+DRIFT_CAUSE_FIELD = "_cause"
+DRIFT_UPGRADE_FIELD = "_upgrade"
+DRIFT_CAUSE_LATE = "late"
+DRIFT_CAUSE_CRD = "crd"
+DRIFT_CAUSE_UPGRADE = "upgrade"
+# A live `release` row with no window that could not be carded (the ceiling
+# refused it, or its session could not be written), so the digest names it.
+DRIFT_CAUSE_NO_UPGRADE = "no-upgrade"
+# What the digest says of the rows of one cause, as (for one row, for several).
+# The late wording is the one the digest had before the other causes existed.
+DRIFT_BACKLOG_CAUSE_TEXT = {
+    DRIFT_CAUSE_NO_UPGRADE: (
+        "touched kube-agents' own objects with no Helm upgrade by the same principal seen under way and got no "
+        "drift alert (today's limit is spent, or the alert could not be recorded)",
+        "touched kube-agents' own objects with no Helm upgrade by the same principal seen under way and got no "
+        "drift alert (today's limit is spent, or the alert could not be recorded)",
+    ),
+    DRIFT_CAUSE_LATE: (
+        f"reached drift detection late (it queued before the detector started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT})",
+        f"reached drift detection late (they queued before it started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT})",
+    ),
+    DRIFT_CAUSE_CRD: (
+        "was made to kube-agents' own CRDs, as its installer makes them before an upgrade",
+        "were made to kube-agents' own CRDs, as its installer makes them before an upgrade",
+    ),
+    DRIFT_CAUSE_UPGRADE: (
+        "touched only kube-agents' own objects while a Helm upgrade by the same principal was under way",
+        "touched only kube-agents' own objects while a Helm upgrade by the same principal was under way",
+    ),
+}
+# The order the causes are listed in when a digest holds more than one: the
+# cause that needs a person first.
+DRIFT_BACKLOG_CAUSE_ORDER = (DRIFT_CAUSE_NO_UPGRADE, DRIFT_CAUSE_LATE, DRIFT_CAUSE_CRD, DRIFT_CAUSE_UPGRADE)
+# Why the rows have no card each, for one row and for several.
+DRIFT_BACKLOG_OUTCOME_TEXT = (
+    "it is listed here instead of triaged on a card of its own",
+    "they are listed here instead of triaged one card each",
+)
+# Said on the first line of a digest of several causes when some of its rows
+# are of DRIFT_CAUSE_NO_UPGRADE, for one such row and for several: the other
+# causes need nothing from a person.
+DRIFT_BACKLOG_REVIEW_TEXT = ("{count} needs review", "{count} need review")
+# The line that names the DRIFT_CAUSE_NO_UPGRADE rows: the ledger does not
+# record a row's cause, so the full list cannot say which rows they are.
+DRIFT_BACKLOG_REVIEW_LINE = "Review: {objects}"
+DRIFT_BACKLOG_REVIEW_OBJECT = "{principal} changed {object}"
+# One line, so that tests/test_drift_own_release_contract.py can read it and hold the eval fixture's copy to it.
+DRIFT_UPGRADE_LINE = "Helm upgrade: {principal} started revision {revision} of release {namespace}/{release} at {started} UTC."
+# How Helm names the Secret that records one revision of a release:
+# sh.helm.release.v1.<release>.v<revision>. The upgrade line names the release.
+DRIFT_HELM_RECORD_PREFIX = "sh.helm.release.v1."
+DRIFT_HELM_RECORD_REVISION_INFIX = ".v"
+# The audit time on a payload ends in the UTC designator, which
+# datetime.fromisoformat reads only as an offset.
+DRIFT_TIMESTAMP_UTC_DESIGNATOR = "Z"
+DRIFT_TIMESTAMP_UTC_OFFSET = "+00:00"
+# How the upgrade line shows a time: the form the ledger's own times have.
+DRIFT_UPGRADE_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+# How long the read of recent ledger rows waits on a locked database.
+DRIFT_UPGRADE_LEDGER_TIMEOUT_SECONDS = 5.0
+# The key of a payload's field ownership list, the part that grows with the object.
+DRIFT_OWNERS_KEY = "owners"
+# What a payload stored without that list says of its join, and what a card
+# made from it says of ownership: the join read it and the row does not hold
+# it, which is neither "not read" nor "read, and empty".
+# No longer than DRIFT_JOIN_ENRICHED, which it replaces, so the mark cannot
+# put a payload that the trim brought under the cap back over it.
+DRIFT_JOIN_KEY = "join"
+DRIFT_JOIN_NOT_STORED = "trimmed"
+DRIFT_OWNERS_NOT_STORED_LINE = (
+    "- **Field ownership: read, but too large to keep with this record.** Read the live object's "
+    "`managedFields` for it — do not treat its absence here as evidence that no other manager owns these fields."
+)
+# What the board card says after the count: why it is a card, and who acts on it.
+# Not named CARD_NOTE: CodeQL's clear-text queries read `card` followed by `no` as a card number.
+DRIFT_BACKLOG_BOARD_REMARK = (
+    "This install has no chat platform enabled, so this card is the digest. No agent acts on it: a person "
+    "reads it and archives it."
+)
+# The board card's title when its rows are not all late, for one row and for several.
+DRIFT_BACKLOG_MIXED_CARD_TITLE = (
+    "Drift backlog: {count} change listed here, not triaged on a card of its own",
+    "Drift backlog: {count} changes listed here, not triaged one card each",
+)
 
 # A stall's ledger row is graded Warning, on the watcher's scale, and claims no
 # alert quota: the producer's own per-tick cap is the only bound, by decision
@@ -3566,7 +3711,7 @@ def _gateway_failure(exc: Exception, turn_sent: bool) -> _GatewayAttempt:
     if isinstance(reason, ConnectionRefusedError):
         return _GatewayAttempt(START_RETRY, "refused", answered=False)
     detail = "timeout" if isinstance(reason, TimeoutError) else type(reason).__name__
-    # urlopen wraps an error raised while connecting or sending the request in
+    # urllib wraps an error raised while connecting or sending the request in
     # URLError; an error while waiting for the response (a read timeout) comes
     # out unwrapped. Only the unwrapped one may hide a turn that is running.
     if turn_sent and not isinstance(exc, urllib.error.URLError):
@@ -3591,7 +3736,7 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
+        with _GATEWAY_OPENER.open(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
             return _GatewayAttempt(START_OK)
     except urllib.error.HTTPError as exc:
         # It already exists: a retry after a create that timed out and still committed.
@@ -4428,8 +4573,13 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     join happened and these managers own these fields. Only the second is a
     fact about the object. Presenting the first as the second is how an agent
     concludes nothing else manages a field that a GitOps controller owns.
+
+    A drift backlog row stored without its ownership list is a fourth: the
+    join happened and the list was not kept (DRIFT_JOIN_NOT_STORED).
     """
     join = _defang_drift_field(payload.get("join")) or DRIFT_UNKNOWN_FIELD
+    if join == DRIFT_JOIN_NOT_STORED:
+        return DRIFT_OWNERS_NOT_STORED_LINE
     if join != DRIFT_JOIN_ENRICHED:
         lookup_error = _defang_drift_field(payload.get("lookup_error"))
         detail = f" The lookup reported: {lookup_error}" if lookup_error else ""
@@ -4997,7 +5147,7 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
+        with _GATEWAY_OPENER.open(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
             if resp.status != 200:
                 logger.error(f"Gateway API chat execution failed (status {resp.status})")
             return _GatewayAttempt(START_OK)
@@ -7047,7 +7197,8 @@ def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
     """Record one drift backlog record and owe it the next digest or a card.
 
     The detector posts here, with no session, a record it marked as having
-    reached it late (DRIFT_BACKLOG_FEATURE). Nothing here spends quota or starts
+    reached it late (DRIFT_BACKLOG_FEATURE), or a live write to kube-agents' own
+    objects (DRIFT_OWN_RELEASE_FEATURE). Nothing here spends quota or starts
     a turn: the burst this exists for is an install's or a pod roll's own
     writes, and one card each is what spent the drift budget on them.
 
@@ -7066,7 +7217,14 @@ def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
     cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
     stored_payload = json.dumps(payload)
     if len(stored_payload) > DRIFT_BACKLOG_PAYLOAD_MAX_CHARS:
-        stored_payload = ""
+        # A card made from this row still has to say who changed what and when.
+        trimmed = {key: value for key, value in payload.items() if key != DRIFT_OWNERS_KEY}
+        if trimmed.get(DRIFT_JOIN_KEY) == DRIFT_JOIN_ENRICHED:
+            trimmed[DRIFT_JOIN_KEY] = DRIFT_JOIN_NOT_STORED
+        stored_payload = json.dumps(trimmed)
+    if len(stored_payload) > DRIFT_BACKLOG_PAYLOAD_MAX_CHARS:
+        marks = {key: payload[key] for key in DRIFT_BACKLOG_DECISION_KEYS if payload.get(key)}
+        stored_payload = json.dumps(marks) if marks else ""
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             with conn:
@@ -7319,6 +7477,232 @@ def _finish_drift_backlog(holder: str, max_id: Optional[int], outcome: Optional[
             )
 
 
+def _drift_row_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The payload a backlog row stores, or {} when it stores none that parses."""
+    try:
+        payload = json.loads(row.get("payload") or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _drift_row_time(row: Dict[str, Any]) -> Optional[datetime]:
+    """When the row's change was made, or None when its payload does not say."""
+    stamp = _drift_row_payload(row).get(DRIFT_TIMESTAMP_KEY)
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    # The window arithmetic adds to and subtracts from this time. A time at
+    # the edge of what a datetime holds would raise there, in the digest
+    # worker, and the row would stay pending and raise again on every retry.
+    reach = timedelta(seconds=DRIFT_UPGRADE_WINDOW_SECONDS + DRIFT_UPGRADE_SKEW_SECONDS)
+    try:
+        parsed = datetime.fromisoformat(stamp.replace(DRIFT_TIMESTAMP_UTC_DESIGNATOR, DRIFT_TIMESTAMP_UTC_OFFSET))
+        parsed = (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+        parsed - reach, parsed + reach
+    except (ValueError, OverflowError):
+        return None
+    return parsed
+
+
+class DriftUpgrade(NamedTuple):
+    """One Helm upgrade of the install's own release: who ran it, and from when until when."""
+
+    principal: str
+    namespace: str
+    release: str
+    revision: str
+    started: datetime
+    until: datetime
+
+
+def _drift_helm_release(record: Any, revision: str) -> str:
+    """The name of the release a Helm record Secret belongs to; the Secret's own name when it does not parse."""
+    name = str(record or "")
+    suffix = DRIFT_HELM_RECORD_REVISION_INFIX + revision
+    if name.startswith(DRIFT_HELM_RECORD_PREFIX) and name.endswith(suffix):
+        name = name[len(DRIFT_HELM_RECORD_PREFIX) : -len(suffix)]
+    return name
+
+
+def _drift_upgrades(rows: Sequence[Dict[str, Any]]) -> Dict[str, list[DriftUpgrade]]:
+    """Each principal's Helm upgrades, newest first.
+
+    Read from the claimed rows and from the ledger, since an upgrade's start
+    or end may have been digested earlier. A ledger that cannot be read
+    leaves only the claimed rows, so a row whose upgrade started earlier is
+    carded.
+
+    An upgrade ends at the first update of its record after the create. Helm
+    updates that record a second time when the next upgrade supersedes it,
+    and taking that one would stretch the window over whatever the principal
+    did between the two upgrades.
+    """
+    waiting = {
+        row["principal"] for row in rows if _drift_row_payload(row).get(DRIFT_OWN_RELEASE_KEY) == DRIFT_OWN_RELEASE_OBJECT
+    }
+    if not waiting:
+        return {}
+    marks: Dict[int, Dict[str, Any]] = {row["id"]: row for row in rows if row["principal"] in waiting}
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=DRIFT_UPGRADE_LEDGER_TIMEOUT_SECONDS)) as conn:
+            conn.row_factory = sqlite3.Row
+            recent = conn.execute(
+                "SELECT id, principal, namespace, workload, payload FROM intercepted_events "
+                "WHERE created_at >= datetime('now', ?) AND backlog != 0",
+                (f"-{DRIFT_UPGRADE_LOOKBACK_SECONDS} seconds",),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.error(f"Drift backlog: could not read the ledger for a recent Helm upgrade: {exc}")
+        recent = []
+    for found in recent:
+        if found["principal"] in waiting:
+            marks.setdefault(found["id"], dict(found))
+
+    starts: list[tuple[Dict[str, Any], str, datetime]] = []
+    ends: Dict[tuple[str, str], list[datetime]] = {}
+    for row in marks.values():
+        payload = _drift_row_payload(row)
+        made = _drift_row_time(row)
+        if made is None:
+            continue
+        started = payload.get(DRIFT_OWN_RELEASE_REVISION_KEY)
+        ended = payload.get(DRIFT_OWN_RELEASE_REVISION_END_KEY)
+        if isinstance(started, str) and started:
+            starts.append((row, started, made))
+        if isinstance(ended, str) and ended:
+            ends.setdefault((row["principal"], ended), []).append(made)
+
+    upgrades: Dict[str, list[DriftUpgrade]] = {}
+    for row, revision, began in starts:
+        after = [made for made in ends.get((row["principal"], revision), []) if made >= began]
+        until = min(after) if after else began + timedelta(seconds=DRIFT_UPGRADE_WINDOW_SECONDS)
+        upgrades.setdefault(row["principal"], []).append(
+            DriftUpgrade(
+                principal=row["principal"],
+                namespace=row["namespace"],
+                release=_drift_helm_release(row["workload"], revision),
+                revision=revision,
+                started=began,
+                until=until,
+            )
+        )
+    for found in upgrades.values():
+        found.sort(key=lambda upgrade: upgrade.started, reverse=True)
+    return upgrades
+
+
+def _drift_upgrade_of(row: Dict[str, Any], upgrades: Dict[str, list[DriftUpgrade]]) -> Optional[DriftUpgrade]:
+    """The newest upgrade of the row's own principal that was under way when the row's change was made."""
+    made = _drift_row_time(row)
+    if made is None:
+        return None
+    skew = timedelta(seconds=DRIFT_UPGRADE_SKEW_SECONDS)
+    for upgrade in upgrades.get(row["principal"], []):
+        if upgrade.started - skew <= made <= upgrade.until + skew:
+            return upgrade
+    return None
+
+
+def _mark_drift_backlog_causes(rows: Sequence[Dict[str, Any]]) -> None:
+    """Write on each claimed row why it is in the digest route (DRIFT_CAUSE_FIELD)."""
+    upgrades = _drift_upgrades(rows)
+    for row in rows:
+        payload = _drift_row_payload(row)
+        kind = payload.get(DRIFT_OWN_RELEASE_KEY)
+        upgrade = _drift_upgrade_of(row, upgrades) if kind == DRIFT_OWN_RELEASE_OBJECT else None
+        if kind == DRIFT_OWN_RELEASE_CRD:
+            row[DRIFT_CAUSE_FIELD] = DRIFT_CAUSE_CRD
+        elif upgrade is not None:
+            row[DRIFT_CAUSE_FIELD] = DRIFT_CAUSE_UPGRADE
+            row[DRIFT_UPGRADE_FIELD] = upgrade
+        elif kind == DRIFT_OWN_RELEASE_OBJECT and payload.get(DRIFT_LATE_KEY) is not True:
+            row[DRIFT_CAUSE_FIELD] = DRIFT_CAUSE_NO_UPGRADE
+        else:
+            row[DRIFT_CAUSE_FIELD] = DRIFT_CAUSE_LATE
+
+
+def _drift_backlog_causes(rows: Sequence[Dict[str, Any]]) -> list[tuple[int, str]]:
+    """How many rows each cause has and what the digest says of them, in DRIFT_BACKLOG_CAUSE_ORDER."""
+    counts: Dict[str, int] = {}
+    for row in rows:
+        cause = row.get(DRIFT_CAUSE_FIELD, DRIFT_CAUSE_LATE)
+        counts[cause] = counts.get(cause, 0) + 1
+    return [
+        (counts[cause], DRIFT_BACKLOG_CAUSE_TEXT[cause][0 if counts[cause] == 1 else 1])
+        for cause in DRIFT_BACKLOG_CAUSE_ORDER
+        if cause in counts
+    ]
+
+
+def _drift_backlog_summary(rows: Sequence[Dict[str, Any]], with_outcome: bool, review: Sequence[str]) -> str:
+    """How many rows the digest lists and why none has its own card.
+
+    One cause is one sentence. Several put the count first, so that a reader
+    of the first line alone has the point, and one cause on each line below.
+    with_outcome adds that the rows are listed and not carded, which the chat
+    digest says and the board card's own text already does. review is
+    _drift_review_lines' answer, placed under the cause it names rows of.
+    """
+    causes = _drift_backlog_causes(rows)
+    noun = "change" if len(rows) == 1 else "changes"
+    outcome = DRIFT_BACKLOG_OUTCOME_TEXT[0 if len(rows) == 1 else 1]
+    if len(causes) == 1:
+        reason = causes[0][1]
+        sentence = f"{len(rows)} {noun} {reason}, so {outcome}." if with_outcome else f"{len(rows)} {noun} {reason}."
+        return "\n".join([sentence, *review])
+    unalerted = len(_drift_review_rows(rows))
+    needs = DRIFT_BACKLOG_REVIEW_TEXT[0 if unalerted == 1 else 1].format(count=unalerted) if unalerted else ""
+    if with_outcome:
+        first = f"{len(rows)} {noun}: {outcome}{'; ' + needs if needs else ''}."
+    else:
+        first = f"{len(rows)} {noun}{'; ' + needs if needs else ''}:"
+    cause_lines = [f"{count} {reason}." for count, reason in causes]
+    # The rows to review are of the cause listed first (DRIFT_BACKLOG_CAUSE_ORDER).
+    return "\n".join([first, cause_lines[0], *review, *cause_lines[1:]])
+
+
+def _drift_review_rows(rows: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """The rows that should have had an alert and did not: the ones a person has to look at."""
+    return [row for row in rows if row.get(DRIFT_CAUSE_FIELD) == DRIFT_CAUSE_NO_UPGRADE]
+
+
+def _drift_review_lines(
+    rows: Sequence[Dict[str, Any]], name: Callable[[Dict[str, Any]], str], show: Callable[[Any], str]
+) -> list[str]:
+    """The line that says who changed what in the rows to review, capped as the digest's objects are; none when no row needs it."""
+    review = _drift_review_rows(rows)
+    if not review:
+        return []
+    objects = ", ".join(
+        DRIFT_BACKLOG_REVIEW_OBJECT.format(principal=show(row["principal"]), object=name(row))
+        for row in review[:DRIFT_BACKLOG_MAX_OBJECTS]
+    )
+    if len(review) > DRIFT_BACKLOG_MAX_OBJECTS:
+        objects += f", and {len(review) - DRIFT_BACKLOG_MAX_OBJECTS} more"
+    return [DRIFT_BACKLOG_REVIEW_LINE.format(objects=objects)]
+
+
+def _drift_upgrade_lines(rows: Sequence[Dict[str, Any]], show: Callable[[Any], str]) -> list[str]:
+    """One line for each upgrade the digest's rows rest on, capped as the principals are."""
+    upgrades: Dict[tuple[str, str], DriftUpgrade] = {}
+    for row in rows:
+        upgrade = row.get(DRIFT_UPGRADE_FIELD)
+        if upgrade:
+            upgrades[(upgrade.principal, upgrade.revision)] = upgrade
+    return [
+        DRIFT_UPGRADE_LINE.format(
+            principal=show(upgrade.principal),
+            revision=show(upgrade.revision),
+            namespace=show(upgrade.namespace),
+            release=show(upgrade.release),
+            started=upgrade.started.astimezone(timezone.utc).strftime(DRIFT_UPGRADE_TIME_FORMAT),
+        )
+        for upgrade in sorted(upgrades.values(), key=lambda found: (found.started, found.principal))[
+            :DRIFT_BACKLOG_MAX_PRINCIPALS
+        ]
+    ]
+
+
 def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     """The digest: how many, by whom, a few of what, and where the rest are."""
     by_principal: Dict[str, int] = {}
@@ -7329,20 +7713,28 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     principals = ", ".join(f"{_defang_drift_field(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
     if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
         principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
-    objects = ", ".join(
-        f"{_defang_drift_field('/'.join(part for part in (row['namespace'], row['object_kind'], row['workload']) if part))}"
-        f" on {_defang_drift_field(row['cluster']) or DRIFT_UNKNOWN_FIELD}"
-        for row in rows[:DRIFT_BACKLOG_MAX_OBJECTS]
-    )
-    if len(rows) > DRIFT_BACKLOG_MAX_OBJECTS:
-        objects += f", and {len(rows) - DRIFT_BACKLOG_MAX_OBJECTS} more"
-    noun = "change" if len(rows) == 1 else "changes"
+
+    def named(row: Dict[str, Any]) -> str:
+        return (
+            f"{_defang_drift_field('/'.join(part for part in (row['namespace'], row['object_kind'], row['workload']) if part))}"
+            f" on {_defang_drift_field(row['cluster']) or DRIFT_UNKNOWN_FIELD}"
+        )
+
+    def shown(value: Any) -> str:
+        return _defang_drift_field(value) or DRIFT_UNKNOWN_FIELD
+
+    summary = _drift_backlog_summary(rows, with_outcome=True, review=_drift_review_lines(rows, named, shown))
+    others = [row for row in rows if row.get(DRIFT_CAUSE_FIELD) != DRIFT_CAUSE_NO_UPGRADE]
+    objects = ", ".join(named(row) for row in others[:DRIFT_BACKLOG_MAX_OBJECTS])
+    if len(others) > DRIFT_BACKLOG_MAX_OBJECTS:
+        objects += f", and {len(others) - DRIFT_BACKLOG_MAX_OBJECTS} more"
+    including = f"Including: {objects}\n" if others else ""
+    upgrades = "".join(f"{line}\n" for line in _drift_upgrade_lines(rows, shown))
     return (
-        f"{DRIFT_BACKLOG_EMOJI} **Drift backlog:** {len(rows)} {noun} reached drift detection late "
-        f"(they queued before it started pulling, or waited over "
-        f"{DRIFT_BACKLOG_MAX_WAIT_TEXT}), so they are listed here instead of triaged one card each.\n"
+        f"{DRIFT_BACKLOG_EMOJI} **Drift backlog:** {summary}\n"
+        f"{upgrades}"
         f"By principal: {principals}\n"
-        f"Including: {objects}\n"
+        f"{including}"
         f"Recorded {rows[0]['created_at']} to {rows[-1]['created_at']} UTC. The full list is the "
         f"`{FEED_STATUS_BACKLOG}` rows of `GET /v1/intercepted-events` on the Session KV server."
     )
@@ -7372,20 +7764,32 @@ def _drift_backlog_card_body(rows: Sequence[Dict[str, Any]]) -> str:
     principals = ", ".join(f"{_drift_backlog_card_name(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
     if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
         principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
+
+    def named(row: Dict[str, Any]) -> str:
+        obj = "/".join(_drift_backlog_card_name(part) for part in (row["namespace"], row["object_kind"], row["workload"]) if part)
+        return f"{obj} on {_drift_backlog_card_name(row['cluster'])}"
+
+    summary = _drift_backlog_summary(
+        rows, with_outcome=False, review=_drift_review_lines(rows, named, _drift_backlog_card_name)
+    )
+    explained = _drift_upgrade_lines(rows, _drift_backlog_card_name)
+    # One sentence and the note read as one paragraph. A summary of several
+    # lines (several causes, or one cause with its Review line) is a list, and
+    # the lines that explain it stay next to it, so the note follows them.
     lines = [
-        f"{len(rows)} {'change' if len(rows) == 1 else 'changes'} reached drift detection late (they queued "
-        f"before it started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT}). This install has no chat "
-        "platform enabled, so this card is the digest. No agent acts on it: a person reads it and archives it.",
+        *(
+            [f"{summary} {DRIFT_BACKLOG_BOARD_REMARK}", *explained]
+            if "\n" not in summary
+            else [summary, *explained, DRIFT_BACKLOG_BOARD_REMARK]
+        ),
         "",
         "By principal: " + principals,
         "",
         "Changes:",
     ]
     for row in rows[:DRIFT_BACKLOG_CARD_MAX_ROWS]:
-        obj = "/".join(_drift_backlog_card_name(part) for part in (row["namespace"], row["object_kind"], row["workload"]) if part)
         lines.append(
-            f"- {_drift_backlog_card_name(row['principal'])} changed {obj} on "
-            f"{_drift_backlog_card_name(row['cluster'])} (recorded {row['created_at']} UTC)"
+            f"- {_drift_backlog_card_name(row['principal'])} changed {named(row)} (recorded {row['created_at']} UTC)"
         )
     if len(rows) > DRIFT_BACKLOG_CARD_MAX_ROWS:
         lines.append(f"- and {len(rows) - DRIFT_BACKLOG_CARD_MAX_ROWS} more")
@@ -7400,9 +7804,11 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
     card that exists back rather than a second one.
     """
     noun = "change" if len(rows) == 1 else "changes"
+    all_late = all(row.get(DRIFT_CAUSE_FIELD, DRIFT_CAUSE_LATE) == DRIFT_CAUSE_LATE for row in rows)
+    title = DRIFT_BACKLOG_CARD_TITLE if all_late else DRIFT_BACKLOG_MIXED_CARD_TITLE[0 if len(rows) == 1 else 1]
     cmd = [
         chat_notify.HERMES_CLI, "kanban", "create",
-        DRIFT_BACKLOG_CARD_TITLE.format(count=len(rows), noun=noun),
+        title.format(count=len(rows), noun=noun),
         "--body", _drift_backlog_card_body(rows),
         "--initial-status", DRIFT_BACKLOG_CARD_STATUS,
         "--idempotency-key", f"{DRIFT_BACKLOG_CARD_KEY_PREFIX}{rows[0]['id']}-{rows[-1]['id']}",
@@ -7470,8 +7876,18 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     """Card the rows of every principal with fewer than DRIFT_BACKLOG_CARD_BELOW
     rows, and return the rest for the digest.
 
-    A carded row gets what a live drift record gets, less field ownership (its
-    join was skipped): a quota claim, a session, the alert and the triage turn.
+    The count decides for a late row and a CRD row. A row inside an upgrade
+    window is never carded, and a live own-release row with no window always
+    is (DRIFT_CAUSE_FIELD, written by _mark_drift_backlog_causes).
+
+    A carded row gets what a live drift record gets: a quota claim, a session,
+    the alert and the triage turn. A late row's card has no field ownership
+    (its join was skipped), and the card of an own-release row whose ownership
+    list was too large to store says that it was not kept.
+
+    A row that is carded as a person's (DRIFT_CAUSE_NO_UPGRADE) does not count
+    toward its principal's three: it has its own card, so it is no part of a
+    burst that the digest speaks for.
     A row the ceiling refuses stays in the digest, so the change is still named
     in the digest. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
     crash after it cannot card it twice; a turn that fails after that is lost as
@@ -7482,10 +7898,15 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     """
     counts: Dict[str, int] = {}
     for row in rows:
-        counts[row["principal"]] = counts.get(row["principal"], 0) + 1
+        if row.get(DRIFT_CAUSE_FIELD, DRIFT_CAUSE_LATE) != DRIFT_CAUSE_NO_UPGRADE:
+            counts[row["principal"]] = counts.get(row["principal"], 0) + 1
     digest: list[Dict[str, Any]] = []
     for row in rows:
-        if counts[row["principal"]] >= DRIFT_BACKLOG_CARD_BELOW:
+        cause = row.get(DRIFT_CAUSE_FIELD, DRIFT_CAUSE_LATE)
+        counted = (
+            cause in (DRIFT_CAUSE_LATE, DRIFT_CAUSE_CRD) and counts.get(row["principal"], 0) >= DRIFT_BACKLOG_CARD_BELOW
+        )
+        if cause == DRIFT_CAUSE_UPGRADE or counted:
             digest.append(row)
             continue
         try:
@@ -7497,7 +7918,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
         allowed, suppressed_today = _claim_alert_quota(DRIFT_QUOTA_KEY)
         if not allowed:
             logger.warning(
-                f"Late record {row['id']} stays in the digest: daily limit of "
+                f"Backlog record {row['id']} stays in the digest: daily limit of "
                 f"{ALERT_DAILY_LIMITS[DRIFT_QUOTA_KEY]} drift alerts reached, {suppressed_today} suppressed today"
             )
             digest.append(row)
@@ -7512,11 +7933,11 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
                         (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
                     )
         except sqlite3.Error as exc:
-            logger.error(f"Late record {row['id']} could not be carded and goes to the digest: {exc}")
+            logger.error(f"Backlog record {row['id']} could not be carded and goes to the digest: {exc}")
             _refund_alert_quota(DRIFT_QUOTA_KEY)
             digest.append(row)
             continue
-        logger.info(f"Drift backlog: carding late record {row['id']} (its principal has {counts[row['principal']]} late row(s))")
+        logger.info(f"Drift backlog: carding record {row['id']} (cause {cause}; its principal has {counts.get(row['principal'], 0)} counted row(s) in this digest)")
         threading.Thread(
             target=trigger_agent_troubleshooter,
             args=(session_id, _drift_alert_message(_drift_summary(payload)), payload, row["id"]),
@@ -7610,6 +8031,7 @@ def _post_drift_backlog_digest() -> bool:
     max_id = rows[-1]["id"] if rows else None
     outcome: Optional[int] = None
     try:
+        _mark_drift_backlog_causes(rows)
         rows = _card_drift_backlog_minorities(rows)
         if not rows:
             return True

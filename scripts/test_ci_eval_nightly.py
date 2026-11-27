@@ -739,6 +739,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
             "gce-startup-script-failure",
+            "gce-rotated-console-notes",
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
             "gce-chat-request-runs-collector",

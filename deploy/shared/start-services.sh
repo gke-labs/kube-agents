@@ -512,7 +512,8 @@ normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positi
 # matches the binary's own default, because the value is the kind of thing an
 # operator tunes per install — a cluster with slow-starting workloads wants it
 # higher — and threading it through an env var means doing so does not require
-# rebuilding the image. Set to 1 to restore firing on the first event.
+# rebuilding the image. Set to 1, with WATCHER_SETTLE at 0, to restore firing
+# on the first event: the settle gate below runs after this count.
 readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
 WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
 normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}" positive
@@ -818,7 +819,13 @@ start_credential_runtime() {
   # The role reaches the runtime as the environment variable it already reads
   # (resolve_role), not as a flag: one spelling, and a container that sets the
   # variable without going through this script still gets the role it asked for.
-  "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py &
+  #
+  # Envoy is already running (it starts first), and its pid goes to the runtime
+  # here, set by this script alone and over any value the environment carries:
+  # the runtime believes a Unix-socket peer's address header only from that pid
+  # (EnvoyPeerCheck in credential_proxy.py), and refuses every socket request
+  # when it is empty, as it is in the api-proxy role, which runs no Envoy.
+  CREDENTIAL_PROXY_ENVOY_PID="${envoy_pid}" "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py &
   runtime_pid=$!
 }
 
@@ -1166,7 +1173,7 @@ start_drift_detector() {
     echo "start-services: ALERT SESSION_KV_API_KEY is empty, so drift-detector cannot authenticate to the Session KV server and will exit on every start — NO out-of-band changes are being detected. Add the key to the agent Secret (upgrade.sh backfills it; the chart and the Terraform composition generate it on a fresh install) and restart the pod." >&2
   fi
 
-  # Built as an array because two of the flags have to be omitted rather than
+  # Built as an array because three of the flags have to be omitted rather than
   # passed empty, which a single backslash-continued command line cannot do.
   local detector_args=(
     --project="${DRIFT_DETECTOR_PROJECT_ID:-}"
@@ -1198,6 +1205,12 @@ start_drift_detector() {
   # it reads like a manager named "".
   if [[ -n "${DRIFT_DETECTOR_GITOPS_MANAGERS:-}" ]]; then
     detector_args+=(--gitops-managers="${DRIFT_DETECTOR_GITOPS_MANAGERS}")
+  fi
+
+  # Empty when the PlatformAgent carries no Helm release annotations (a
+  # kustomize or hand install); omitted for the reason above.
+  if [[ -n "${DRIFT_DETECTOR_OWN_RELEASE:-}" ]]; then
+    detector_args+=(--own-release="${DRIFT_DETECTOR_OWN_RELEASE}")
   fi
 
   # A bare flag rather than a value, so it is appended or omitted rather than
@@ -1310,10 +1323,13 @@ start_audit_report_store() {
 }
 
 write_wif_credentials
-start_credential_runtime
+# Envoy before the runtime, so the runtime starts knowing Envoy's pid. Envoy
+# connects to the runtime's socket per request, so a request in the moment
+# before the socket exists is answered 503 and retried, as any other.
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
+start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "exec" ]]; then
   # The same guard as the watcher, and for the same reason: both post to the
   # Session KV server on this pod's loopback, which the broker and exec pods do

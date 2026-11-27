@@ -198,6 +198,16 @@ type UsageCounterPoller struct {
 	// outcomes without the details, and the people reading's target is the
 	// A2A gateway rather than the broker. In memory, like gatewayMisses.
 	readingMisses map[string]map[usageReadingKind]int
+	// slackConnectedMisses counts, per CR, consecutive polls in which Slack is
+	// armed and no scraped A2A gateway pod exported
+	// kubeagents_a2a_gateway_slack_connected. At usageScrapeFailureEventStreak
+	// the poller removes SlackConnected rather than holding a stale reading.
+	slackConnectedMisses map[string]int
+	// slackConnectedDown counts, per CR, consecutive polls in which Slack is
+	// armed and every reporting A2A gateway pod exported 0. Requiring
+	// usageScrapeFailureEventStreak consecutive down polls prevents transient
+	// Socket Mode reconnects and startup handshakes from flapping Degraded.
+	slackConnectedDown map[string]int
 
 	// cursor is the namespace/name of the last CR a poll finished. The next
 	// poll sorts the CRs and resumes after it, wrapping, so a poll the budget
@@ -405,6 +415,16 @@ func (p *UsageCounterPoller) forgetDepartedNewerFieldRecords(swept map[string]bo
 			delete(p.readingMisses, key)
 		}
 	}
+	for key := range p.slackConnectedMisses {
+		if !swept[key] {
+			delete(p.slackConnectedMisses, key)
+		}
+	}
+	for key := range p.slackConnectedDown {
+		if !swept[key] {
+			delete(p.slackConnectedDown, key)
+		}
+	}
 }
 
 // NeedLeaderElection reports true: the counters are per cluster, so exactly
@@ -581,9 +601,11 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 				ReadingsPresent: reading.ReadingsPresent,
 				// DataVolume rides with Clusters: both come from the
 				// watcher's body alone.
-				DataVolume: reading.DataVolume,
-				Dispatcher: reading.Dispatcher,
-				ToolPairs:  reading.ToolPairs,
+				DataVolume:     reading.DataVolume,
+				Dispatcher:     reading.Dispatcher,
+				ToolPairs:      reading.ToolPairs,
+				SlackConnected: reading.SlackConnected,
+				Forges:         reading.Forges,
 			})
 		}
 	}
@@ -604,10 +626,14 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
 	dispatcher := usageDispatcherForPoll(scraped)
+	forges := usageForgesForPoll(scraped)
 	clusterRefs, clusterRefsKnown := usageClusterRefsForPoll(cached, scraped, gatewayRead, watcherDown)
 	misses := p.noteReadings(cached, scraped)
 	readings, readingsKnown := usageReadingsForPoll(cached, scraped, misses)
 	topTools, topToolsKnown := usageTopToolsForPoll(scraped, misses[usageReadingTopTools])
+	slackSample := usageSlackConnectedSample(scraped)
+	slackMisses, slackDown := p.noteSlackConnected(cached, slackSample)
+	slackConnected, slackConnectedKnown := usageSlackConnectedForPoll(cached, slackSample, slackMisses, slackDown)
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -665,7 +691,13 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if err := p.projectKanbanDispatcher(ctx, agent, dispatcher); err != nil {
 		return err
 	}
-	return p.projectScope(ctx, agent, clusterRefs, clusterRefsKnown)
+	if err := p.projectForgeConnection(ctx, agent, forges); err != nil {
+		return err
+	}
+	if err := p.projectScope(ctx, agent, clusterRefs, clusterRefsKnown); err != nil {
+		return err
+	}
+	return p.projectSlackConnected(ctx, agent, slackConnected, slackConnectedKnown)
 }
 
 // usageClusterGaugesForPoll is the fleet reading this poll projects, and
