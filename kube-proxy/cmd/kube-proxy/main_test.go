@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
@@ -20,6 +24,15 @@ const (
 	testAudience    = "kubeagents-profile-audience"
 	testSecondUser  = "system:serviceaccount:agents:fixer-write"
 	testTwoWorkers  = `{"` + testSecondUser + `": {"profile": "fixer", "tier": "write"}, "` + testWorker + `": {"profile": "auditor", "tier": "read"}}`
+)
+
+const (
+	// testUsernameHeader names a test request's caller and testHoldHeader marks one the
+	// upstream keeps open; the proxy strips neither.
+	testUsernameHeader   = "X-Test-Username"
+	testHoldHeader       = "X-Test-Hold"
+	testRetryAfterHeader = "Retry-After"
+	testWatchQuery       = "?watch=true"
 )
 
 func envOf(values map[string]string) func(string) string {
@@ -90,6 +103,64 @@ func TestOptions(t *testing.T) {
 		if opts.AudienceCallers != nil {
 			t.Errorf("AudienceCallers = %v with no identity map, want the stock server's nil", opts.AudienceCallers)
 		}
+		if opts.CallerLimits != nil {
+			t.Error("CallerLimits is set with no identity map, want the stock server's nil")
+		}
+	})
+
+	t.Run("worker limits without workers are not read", func(t *testing.T) {
+		for name, env := range map[string]map[string]string{
+			"limits alone":           {taskgate.WorkerMaxInFlightEnv: "2", taskgate.WorkerMaxLongRunningEnv: "2"},
+			"malformed limits alone": {taskgate.WorkerMaxInFlightEnv: "many", taskgate.WorkerMaxLongRunningEnv: "-1"},
+			"an empty map":           {taskgate.IdentitiesEnv: "{}", taskgate.WorkerMaxInFlightEnv: "many"},
+		} {
+			opts, err := options(nil, envOf(env), logger)
+			if err != nil {
+				t.Errorf("%s: options: %v", name, err)
+				continue
+			}
+			if opts.CallerLimits != nil || opts.Authorize != nil {
+				t.Errorf("%s: options = (limits set=%v, gate set=%v), want the stock server's", name, opts.CallerLimits != nil, opts.Authorize != nil)
+			}
+		}
+	})
+
+	t.Run("the gate's workers are limited and nobody else", func(t *testing.T) {
+		gate := map[string]string{taskgate.IdentitiesEnv: testTwoWorkers, taskgate.ProfileAudienceEnv: testAudience}
+		for name, tc := range map[string]struct {
+			env  map[string]string
+			want k8sapiproxy.CallerLimits
+		}{
+			"the defaults":  {nil, k8sapiproxy.CallerLimits{MaxInFlight: taskgate.DefaultWorkerMaxInFlight, MaxLongRunning: taskgate.DefaultWorkerMaxLongRunning}},
+			"blank values":  {map[string]string{taskgate.WorkerMaxInFlightEnv: " ", taskgate.WorkerMaxLongRunningEnv: ""}, k8sapiproxy.CallerLimits{MaxInFlight: taskgate.DefaultWorkerMaxInFlight, MaxLongRunning: taskgate.DefaultWorkerMaxLongRunning}},
+			"set values":    {map[string]string{taskgate.WorkerMaxInFlightEnv: " 4\n", taskgate.WorkerMaxLongRunningEnv: "2"}, k8sapiproxy.CallerLimits{MaxInFlight: 4, MaxLongRunning: 2}},
+			"zero is unset": {map[string]string{taskgate.WorkerMaxInFlightEnv: "0", taskgate.WorkerMaxLongRunningEnv: "0"}, k8sapiproxy.CallerLimits{}},
+		} {
+			env := map[string]string{}
+			for k, v := range gate {
+				env[k] = v
+			}
+			for k, v := range tc.env {
+				env[k] = v
+			}
+			opts, err := options(nil, envOf(env), logger)
+			if err != nil {
+				t.Errorf("%s: options: %v", name, err)
+				continue
+			}
+			if opts.CallerLimits == nil {
+				t.Errorf("%s: CallerLimits is nil with the gate on", name)
+				continue
+			}
+			for _, worker := range []string{testWorker, testSecondUser} {
+				if got := opts.CallerLimits(&k8sapiproxy.CallerIdentity{Username: worker}); got != tc.want {
+					t.Errorf("%s: limits of %s = %+v, want %+v", name, worker, got, tc.want)
+				}
+			}
+			if got := opts.CallerLimits(&k8sapiproxy.CallerIdentity{Username: testNonWorker}); got != (k8sapiproxy.CallerLimits{}) {
+				t.Errorf("%s: limits of a caller outside the map = %+v, want none", name, got)
+			}
+		}
 	})
 
 	t.Run("a profile audience without workers is not accepted", func(t *testing.T) {
@@ -151,6 +222,8 @@ func TestOptions(t *testing.T) {
 		"a malformed map":     {taskgate.IdentitiesEnv: testBadMap, taskgate.ProfileAudienceEnv: testAudience},
 		"no profile audience": {taskgate.IdentitiesEnv: testIdentityMap},
 		"a blank audience":    {taskgate.IdentitiesEnv: testIdentityMap, taskgate.ProfileAudienceEnv: "  "},
+		"a worded limit":      {taskgate.IdentitiesEnv: testIdentityMap, taskgate.ProfileAudienceEnv: testAudience, taskgate.WorkerMaxInFlightEnv: "many"},
+		"a negative limit":    {taskgate.IdentitiesEnv: testIdentityMap, taskgate.ProfileAudienceEnv: testAudience, taskgate.WorkerMaxLongRunningEnv: "-1"},
 	}
 
 	t.Run("a malformed gate stops a serving invocation", func(t *testing.T) {
@@ -178,6 +251,9 @@ func TestOptions(t *testing.T) {
 				if opts.AudienceCallers != nil {
 					t.Errorf("%s: options(%q): AudienceCallers = %v, want no audience from a gate that did not load", name, args, opts.AudienceCallers)
 				}
+				if opts.CallerLimits != nil {
+					t.Errorf("%s: options(%q): CallerLimits is set by a gate that did not load", name, args)
+				}
 				if opts.Version != "test-build" || !slices.Equal(opts.ExtraCallerHeaders, taskgate.CallerHeaders()) {
 					t.Errorf("%s: options(%q) = (version %q, headers %v), want the build's version and %v", name, args, opts.Version, opts.ExtraCallerHeaders, taskgate.CallerHeaders())
 				}
@@ -189,4 +265,121 @@ func TestOptions(t *testing.T) {
 			}
 		}
 	})
+}
+
+// usernameHeaderAuthenticator admits a request as the caller its testUsernameHeader names.
+type usernameHeaderAuthenticator struct{}
+
+func (usernameHeaderAuthenticator) AuthenticateRequest(r *http.Request) (*k8sapiproxy.CallerIdentity, error) {
+	return &k8sapiproxy.CallerIdentity{Username: r.Header.Get(testUsernameHeader)}, nil
+}
+
+// heldCluster keeps the response of a request marked with testHoldHeader open until
+// release, and says on entered that the request arrived.
+type heldCluster struct {
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func (u *heldCluster) RoundTripCluster(_ context.Context, _ string, req *http.Request) (*http.Response, error) {
+	var body io.ReadCloser = io.NopCloser(strings.NewReader(testPodList))
+	if req.Header.Get(testHoldHeader) != "" {
+		pr, pw := io.Pipe()
+		go func() {
+			<-u.gate
+			_ = pw.Close()
+		}()
+		body = pr
+		u.entered <- struct{}{}
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{testContentJSON}},
+		Body:       body,
+		Request:    req,
+	}, nil
+}
+
+// Through the proxy's handler with the limits options returns: a worker at its in-flight
+// limit is answered 429 while a caller outside the map, holding more than that, is served;
+// the worker's watches are bounded by their own limit; and a finished request is given back.
+func TestWorkersAreLimitedAndOtherCallersAreNot(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	opts, err := options(nil, envOf(map[string]string{
+		taskgate.IdentitiesEnv:           testIdentityMap,
+		taskgate.ProfileAudienceEnv:      testAudience,
+		taskgate.WorkerMaxInFlightEnv:    "1",
+		taskgate.WorkerMaxLongRunningEnv: "1",
+	}), logger)
+	if err != nil {
+		t.Fatalf("options: %v", err)
+	}
+	cluster := &heldCluster{entered: make(chan struct{}, 8), gate: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(cluster.gate) })
+	t.Cleanup(release)
+	// Without the gate's Authorize hook: the limits are what is under test, and a worker
+	// here carries no task credential.
+	h, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+		Authenticator: usernameHeaderAuthenticator{},
+		Upstream:      cluster,
+		Policy:        k8sapiproxy.Policy{Mode: k8sapiproxy.ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:        logger,
+		CallerLimits:  opts.CallerLimits,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	request := func(username, query string, hold bool) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/clusters/"+testClusterID+testPodsPath+query, nil)
+		req.Header.Set(testUsernameHeader, username)
+		if hold {
+			req.Header.Set(testHoldHeader, "1")
+		}
+		return req
+	}
+	get := func(username, query string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, request(username, query, false))
+		return rec
+	}
+	hold := func(username, query string) <-chan int {
+		done := make(chan int, 1)
+		go func() {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, request(username, query, true))
+			done <- rec.Code
+		}()
+		<-cluster.entered
+		return done
+	}
+
+	held := []<-chan int{
+		hold(testWorker, ""),
+		hold(testWorker, testWatchQuery),
+		hold(testNonWorker, ""),
+		hold(testNonWorker, ""),
+		hold(testNonWorker, testWatchQuery),
+		hold(testNonWorker, testWatchQuery),
+	}
+	for name, query := range map[string]string{"list": "", "watch": testWatchQuery} {
+		rec := get(testWorker, query)
+		if rec.Code != http.StatusTooManyRequests || rec.Header().Get(testRetryAfterHeader) == "" {
+			t.Errorf("a worker's second %s: code = %d, Retry-After = %q, want 429 with the header", name, rec.Code, rec.Header().Get(testRetryAfterHeader))
+		}
+		if rec := get(testNonWorker, query); rec.Code != http.StatusOK {
+			t.Errorf("a third %s from a caller outside the map: code = %d, want 200", name, rec.Code)
+		}
+	}
+
+	release()
+	for _, done := range held {
+		if code := <-done; code != http.StatusOK {
+			t.Errorf("held request: code = %d, want 200", code)
+		}
+	}
+	for name, query := range map[string]string{"list": "", "watch": testWatchQuery} {
+		if rec := get(testWorker, query); rec.Code != http.StatusOK {
+			t.Errorf("a worker's %s after its held one finished: code = %d, want 200", name, rec.Code)
+		}
+	}
 }

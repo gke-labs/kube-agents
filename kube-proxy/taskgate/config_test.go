@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
 )
 
 const (
@@ -227,5 +228,77 @@ func TestFromEnvWithNoKeyStartsAndWarnsOnce(t *testing.T) {
 	}
 	if logs.Len() != 0 {
 		t.Errorf("a request logged again: %s", logs.String())
+	}
+}
+
+// The worker limits default, take a non-negative integer, and are an error otherwise; with
+// no worker in the map they are not read at all.
+func TestLoadConfigWorkerLimits(t *testing.T) {
+	gate := func(more map[string]string) func(string) string {
+		env := map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience}
+		for k, v := range more {
+			env[k] = v
+		}
+		return envOf(env)
+	}
+	defaults := k8sapiproxy.CallerLimits{MaxInFlight: DefaultWorkerMaxInFlight, MaxLongRunning: DefaultWorkerMaxLongRunning}
+	for name, tc := range map[string]struct {
+		env  map[string]string
+		want k8sapiproxy.CallerLimits
+	}{
+		"unset":           {nil, defaults},
+		"blank":           {map[string]string{WorkerMaxInFlightEnv: "  ", WorkerMaxLongRunningEnv: "\n"}, defaults},
+		"both set":        {map[string]string{WorkerMaxInFlightEnv: " 4 ", WorkerMaxLongRunningEnv: "12"}, k8sapiproxy.CallerLimits{MaxInFlight: 4, MaxLongRunning: 12}},
+		"one set":         {map[string]string{WorkerMaxLongRunningEnv: "1"}, k8sapiproxy.CallerLimits{MaxInFlight: DefaultWorkerMaxInFlight, MaxLongRunning: 1}},
+		"zero, no limits": {map[string]string{WorkerMaxInFlightEnv: "0", WorkerMaxLongRunningEnv: "0"}, k8sapiproxy.CallerLimits{}},
+	} {
+		cfg, err := LoadConfig(gate(tc.env))
+		if err != nil || cfg == nil {
+			t.Errorf("%s: LoadConfig = %v, %v; want a config", name, cfg, err)
+			continue
+		}
+		if cfg.WorkerLimits != tc.want {
+			t.Errorf("%s: worker limits = %+v, want %+v", name, cfg.WorkerLimits, tc.want)
+		}
+	}
+
+	for _, env := range []string{WorkerMaxInFlightEnv, WorkerMaxLongRunningEnv} {
+		for _, raw := range []string{"many", "-1", "1.5", "4 requests", "0x10"} {
+			cfg, err := LoadConfig(gate(map[string]string{env: raw}))
+			if err == nil || !strings.Contains(err.Error(), env) {
+				t.Errorf("%s=%q: LoadConfig = %+v, %v; want an error naming the variable", env, raw, cfg, err)
+			}
+			if cfg, err := LoadConfig(envOf(map[string]string{env: raw})); err != nil || cfg != nil {
+				t.Errorf("%s=%q with no identity map: LoadConfig = %v, %v; want the gate off and the value unread", env, raw, cfg, err)
+			}
+		}
+	}
+
+	// Under the shared cap's default of 24 with room to spare: two workers at the limit
+	// leave the other callers a third of it.
+	const sharedDefault = 24
+	if 2*DefaultWorkerMaxInFlight > sharedDefault-DefaultWorkerMaxInFlight {
+		t.Errorf("DefaultWorkerMaxInFlight = %d: two workers at it leave less than one worker's share of the %d shared slots", DefaultWorkerMaxInFlight, sharedDefault)
+	}
+}
+
+func TestConfigCallerLimits(t *testing.T) {
+	want := k8sapiproxy.CallerLimits{MaxInFlight: 3, MaxLongRunning: 2}
+	cfg := Config{
+		Identities:   map[string]Identity{testWorker: {Profile: testProfile, Tier: testTier}},
+		WorkerLimits: want,
+	}
+	limits := cfg.CallerLimits()
+	if got := limits(&k8sapiproxy.CallerIdentity{Username: testWorker}); got != want {
+		t.Errorf("a worker's limits = %+v, want %+v", got, want)
+	}
+	for name, caller := range map[string]*k8sapiproxy.CallerIdentity{
+		"a caller outside the map": {Username: testSecondUser},
+		"a nameless caller":        {},
+		"no caller":                nil,
+	} {
+		if got := limits(caller); got != (k8sapiproxy.CallerLimits{}) {
+			t.Errorf("%s: limits = %+v, want none", name, got)
+		}
 	}
 }

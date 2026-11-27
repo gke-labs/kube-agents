@@ -182,6 +182,8 @@ var (
 		ReasonHeldCluster:              {},
 		ReasonHoldUnreadable:           {},
 		ReasonAuthorizeRefused:         {},
+		ReasonCallerInFlightLimit:      {},
+		ReasonCallerLongRunningLimit:   {},
 	}
 
 	knownOutcomes = map[string]struct{}{

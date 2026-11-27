@@ -18,6 +18,10 @@
 // The map also says who the proxy admits as a worker: the binary accepts the profile
 // audience (ProfileAudienceEnv) from exactly the map's usernames (Config.WorkerUsernames),
 // so a caller admitted for that audience is always one the gate checks.
+//
+// And it says whose requests the proxy limits: Config.CallerLimits gives each of the map's
+// usernames WorkerLimits, so one worker can neither fill the in-flight cap every caller
+// shares nor open watches without end.
 package taskgate
 
 import (
@@ -27,6 +31,7 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +56,28 @@ const (
 	// the one the broker gives the profile role by. Required when the identity map names a
 	// worker, and not read otherwise.
 	ProfileAudienceEnv = "CREDENTIAL_PROXY_PROFILE_AUDIENCE" // #nosec G101 -- an environment variable name
+
+	// WorkerMaxInFlightEnv names the most requests one worker ServiceAccount may have in
+	// flight at a replica, and WorkerMaxLongRunningEnv the most watches, log follows and
+	// other long-running requests it may have open there: a non-negative integer, zero for
+	// no limit, the default when unset or blank. Read only when the identity map names a
+	// worker. The broker's CREDENTIAL_PROXY_PROFILE_SLOTS is not reused: it counts whole
+	// kubectl commands across every profile caller, and these count HTTP requests per
+	// ServiceAccount, of which one command has several.
+	WorkerMaxInFlightEnv    = "KUBE_PROXY_PROFILE_MAX_IN_FLIGHT"
+	WorkerMaxLongRunningEnv = "KUBE_PROXY_PROFILE_MAX_LONG_RUNNING"
+
+	// DefaultWorkerMaxInFlight is a third of the 24 requests a replica forwards at once
+	// (the server's --max-in-flight default), so two workers at their limit still leave a
+	// third of the shared slots to the shell and to session pods. It is twice the four
+	// commands the broker runs for the profile role (DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
+	// in credential_proxy.py), because a kubectl command is more than one request: against
+	// an API server without aggregated discovery it fetches every group version in
+	// parallel, and client-go gives up on a request answered 429 ten times.
+	DefaultWorkerMaxInFlight = 8
+	// DefaultWorkerMaxLongRunning leaves room for one `kubectl logs -f` over a selector,
+	// which follows up to five pods at once, beside a few watches.
+	DefaultWorkerMaxLongRunning = 8
 
 	// ReasonTaskCredential is the audit reason of a worker request with no credential,
 	// more than one, or one that does not verify, does not bind to the caller, or names
@@ -123,6 +150,25 @@ type Config struct {
 	// ProfileAudience is the audience a worker's ServiceAccount token is issued for. The
 	// hook does not read it: the binary admits WorkerUsernames for it.
 	ProfileAudience string
+	// WorkerLimits is what each worker ServiceAccount may have open at once at a replica.
+	// The hook does not read it: the binary limits callers with CallerLimits. A zero field
+	// is no limit.
+	WorkerLimits k8sapiproxy.CallerLimits
+}
+
+// CallerLimits is the k8sapiproxy.Config.CallerLimits of a proxy with this gate: WorkerLimits
+// for a caller the identity map names, by its username, and no limit for anyone else. Pods
+// that share a worker ServiceAccount share its limits.
+func (c Config) CallerLimits() func(*k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits {
+	return func(caller *k8sapiproxy.CallerIdentity) k8sapiproxy.CallerLimits {
+		if caller == nil {
+			return k8sapiproxy.CallerLimits{}
+		}
+		if _, worker := c.Identities[caller.Username]; !worker {
+			return k8sapiproxy.CallerLimits{}
+		}
+		return c.WorkerLimits
+	}
 }
 
 // WorkerUsernames are the ServiceAccount usernames the identity map names, sorted: the
@@ -140,8 +186,8 @@ func CallerHeaders() []string {
 
 // LoadConfig reads the gate's configuration from the environment. It returns nil when the
 // identity map is unset, blank or empty: the gate is off, and no other variable is read. A
-// malformed map, key list or lifetime is an error, for the binary to stop on, and so is a
-// map that names workers with no profile audience: the proxy would admit none of them as
+// malformed map, key list, lifetime or worker limit is an error, for the binary to stop on,
+// and so is a map that names workers with no profile audience: the proxy would admit none of them as
 // one. The broker starts in that state, since there a worker's role comes from the audience
 // and a broker without it has no workers to gate; here the map is what turns the gate on.
 func LoadConfig(getenv func(string) string) (*Config, error) {
@@ -164,7 +210,40 @@ func LoadConfig(getenv func(string) string) (*Config, error) {
 	if audience == "" {
 		return nil, fmt.Errorf("%s is required when %s names a worker: it is the audience the proxy admits them for", ProfileAudienceEnv, IdentitiesEnv)
 	}
-	return &Config{Identities: identities, SigningKeys: keys, MaxLifetime: lifetime, ProfileAudience: audience}, nil
+	maxInFlight, err := ParseWorkerLimit(WorkerMaxInFlightEnv, getenv(WorkerMaxInFlightEnv), DefaultWorkerMaxInFlight)
+	if err != nil {
+		return nil, err
+	}
+	maxLongRunning, err := ParseWorkerLimit(WorkerMaxLongRunningEnv, getenv(WorkerMaxLongRunningEnv), DefaultWorkerMaxLongRunning)
+	if err != nil {
+		return nil, err
+	}
+	return &Config{
+		Identities:      identities,
+		SigningKeys:     keys,
+		MaxLifetime:     lifetime,
+		ProfileAudience: audience,
+		WorkerLimits:    k8sapiproxy.CallerLimits{MaxInFlight: maxInFlight, MaxLongRunning: maxLongRunning},
+	}, nil
+}
+
+// ParseWorkerLimit reads one worker limit from the variable named env: blank is fallback,
+// and anything else must be a base-10 integer that is not negative. Zero is no limit. The
+// broker reads its slot count leniently, with a warning and the default; a limit that
+// protects other callers is not replaced by a guess.
+func ParseWorkerLimit(env, raw string, fallback int) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not an integer", env, clip(raw))
+	}
+	if limit < 0 {
+		return 0, fmt.Errorf("%s=%q is negative; 0 sets no limit", env, clip(raw))
+	}
+	return limit, nil
 }
 
 // ParseSigningKeys reads the task-signing public key list as the broker does

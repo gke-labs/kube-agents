@@ -1,6 +1,7 @@
 // Command kube-proxy is the kube-agents build of k8s-api-proxy: the same server, with the
-// task credential gate as its Authorize hook when the environment configures one, and the
-// gate's workers as the callers admitted for the profile audience.
+// task credential gate as its Authorize hook when the environment configures one, the
+// gate's workers as the callers admitted for the profile audience, and a limit on what each
+// of those workers may have open at once.
 package main
 
 import (
@@ -76,12 +77,13 @@ func startupError(err error, opts proxyserver.Options) error {
 // gate the environment asks for, and the credential's header among the ones never
 // forwarded, gate or no gate. With the gate on, the server also accepts the profile
 // audience, from exactly the ServiceAccounts the gate's identity map names: a worker the
-// proxy admits for that audience is always one the gate checks. With the gate off it
-// accepts no audience the stock server does not.
+// proxy admits for that audience is always one the gate checks, and each of them is held to
+// the gate's worker limits, which no other caller gets. With the gate off it accepts no
+// audience and limits no caller the stock server does not.
 //
 // A malformed gate configuration is an error, except when args ask only for the version or
 // the usage text: those answer whatever the environment holds. The server then gets a hook
-// that refuses every request and no profile audience, so if args were misread and it serves
+// that refuses every request, no profile audience and no worker limits, so if args were misread and it serves
 // after all, it serves nothing rather than serving ungated.
 func options(args []string, getenv func(string) string, logger *slog.Logger) (proxyserver.Options, error) {
 	opts := proxyserver.Options{
@@ -99,6 +101,7 @@ func options(args []string, getenv func(string) string, logger *slog.Logger) (pr
 	if cfg != nil {
 		opts.Authorize = taskgate.FromConfig(*cfg, logger)
 		opts.AudienceCallers = map[string][]string{cfg.ProfileAudience: cfg.WorkerUsernames()}
+		opts.CallerLimits = cfg.CallerLimits()
 	}
 	return opts, nil
 }

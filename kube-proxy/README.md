@@ -3,7 +3,7 @@
 The binary the `kube-proxy` image runs. It is the [`k8s-api-proxy`](../k8s-api-proxy/README.md)
 server, with the same flags and environment variables, plus one thing that module cannot hold
 because it is specific to kube-agents: the task credential gate, and with it the workers the proxy
-admits.
+admits and the limits it holds each of them to.
 
 `k8s-api-proxy/` stays generic and separately released. This module imports its server
 (`pkg/proxyserver`) and the task credential verifier (`a2a/taskcred`) through `replace` directives,
@@ -83,6 +83,36 @@ The credential broker applies the same rule to a worker's brokered `kubectl`
 no credential run commands that reach no cluster, and this gate refuses it, because every request
 here reaches one.
 
+## Worker limits
+
+Every caller shares the proxy's in-flight cap (`--max-in-flight`, 24 requests per replica), and a
+watch or a log follow is outside it. So that one worker can neither hold the shared slots nor open
+streams without end, the binary gives each caller the identity map names two limits of its own
+(`proxyserver.Options.CallerLimits`), per replica:
+
+| Limit                                                | Default | Variable                              |
+| ---------------------------------------------------- | ------- | ------------------------------------- |
+| Requests in flight                                   | 8       | `KUBE_PROXY_PROFILE_MAX_IN_FLIGHT`    |
+| Watches, log follows and other long-running requests | 8       | `KUBE_PROXY_PROFILE_MAX_LONG_RUNNING` |
+
+A worker at a limit is answered `429 Too Many Requests` with `Retry-After: 1`, as the shared cap
+answers, which `kubectl` waits out and retries. The audit record's `rejection_reason` is
+`caller_in_flight_limit` or `caller_long_running_limit`. The two counts are separate, a request
+the gate or the policy refuses counts for neither, and a stream counts until it closes. The
+[`k8s-api-proxy` README](../k8s-api-proxy/README.md) owns the mechanics.
+
+The limits belong to the worker's ServiceAccount username, so the pods of one profile and tier
+share them. Callers outside the map, the shell and session pods, get no limit from this binary;
+`--max-in-flight-per-caller` and `--max-long-running-per-caller` set one for them.
+
+Eight requests in flight is a third of the shared 24, so two workers at their limit leave the
+other callers a third of the slots. It is twice the four concurrent commands the broker allows the
+profile role (`CREDENTIAL_PROXY_PROFILE_SLOTS`), because one `kubectl` command is several requests:
+against an API server without aggregated discovery it fetches every group version at once, and a
+request answered `429` ten times fails. The broker's variable is not reused, since it counts
+commands across all profile callers and these count requests per ServiceAccount. Eight streams
+cover one `kubectl logs -f` over a selector, which follows up to five pods, beside a few watches.
+
 ## Configuration
 
 The gate reads four environment variables, the ones the broker reads, in the same formats:
@@ -94,10 +124,17 @@ The gate reads four environment variables, the ones the broker reads, in the sam
 | `A2A_TASK_SIGNING_PUBLIC_KEYS`        | The task-signing public keys, comma separated: one, or two during a key rotation.                                                         |
 | `A2A_TASK_CREDENTIAL_MAX_LIFETIME`    | The longest lifetime a credential may have, as a Go duration (`6h` when unset, at most `168h`).                                           |
 
+The worker limits are two more, which only this binary reads:
+
+| Variable                              | Value                                                                                                |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `KUBE_PROXY_PROFILE_MAX_IN_FLIGHT`    | Requests one worker ServiceAccount may have in flight: an integer, `8` when unset, `0` for no limit. |
+| `KUBE_PROXY_PROFILE_MAX_LONG_RUNNING` | Long-running requests it may have open: an integer, `8` when unset, `0` for no limit.                |
+
 The gate is off by default: with `CREDENTIAL_PROXY_PROFILE_IDENTITIES` unset, blank or `{}`, the
-binary behaves as `k8s-api-proxy` does and reads none of the other three, so a profile audience set
-on its own adds no audience. A malformed identity map, key list or lifetime stops the binary at
-startup, and so does an identity map that names a worker with the profile audience unset or blank:
+binary behaves as `k8s-api-proxy` does and reads none of the other five, so a profile audience set
+on its own adds no audience and a worker limit set on its own limits nobody. A malformed identity
+map, key list, lifetime or worker limit stops the binary at startup, and so does an identity map that names a worker with the profile audience unset or blank:
 the proxy would admit none of the workers it is asked to gate. The broker starts in that state,
 because there the audience confers the role and a broker without it has no profile callers. An
 identity map with no signing key starts, logs a warning once, and refuses every worker.

@@ -81,7 +81,7 @@ type Config struct {
 	// unauthorized callers cannot rely on the hook for it.
 	//
 	// The hook is called on the request's goroutine and must be safe for concurrent use. It
-	// runs before the request takes a MaxInFlight slot and gets no deadline beyond the
+	// runs before the request is counted for CallerLimits or takes a MaxInFlight slot and gets no deadline beyond the
 	// request's context, so a hook that does I/O must bound it itself.
 	Authorize func(AuthorizeAttributes) error
 	// ExtraCallerHeaders names request headers the handler strips before forwarding, on
@@ -106,6 +106,32 @@ type Config struct {
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
 	// bounds its memory. Watches and long-running subresources do not count. Zero is no cap.
 	MaxInFlight int
+	// CallerLimits bounds what one caller may have open at once, so that a single caller can
+	// neither fill MaxInFlight, which every caller shares, nor open watches without end,
+	// which MaxInFlight does not count. It is asked on every request that reaches the
+	// MaxInFlight check, and a caller at the limit for the request's kind is answered 429
+	// with Retry-After, as MaxInFlight answers, audited as throttled with the rejection
+	// reason ReasonCallerInFlightLimit or ReasonCallerLongRunningLimit. Nil limits no
+	// caller, and so does a zero CallerLimits for the callers it is returned for.
+	//
+	// The check runs after Authorize and Policy, so a request they refuse counts for
+	// nothing, and before the MaxInFlight slot, so a caller at its own limit never takes a
+	// shared one. A request is counted until the handler finishes it: when the response has
+	// been copied, when a watch or a log follow ends or its caller disconnects, and when an
+	// upgraded connection closes. One answered from the response cache or joined to
+	// another's fetch is counted like any other, as MaxInFlight counts it.
+	//
+	// Callers are told apart by CallerIdentity.Username alone. The partition is left out:
+	// it names an upstream credential, usually one many callers share, and a caller whose
+	// requests fall in several partitions would get the limit once for each. An embedder
+	// whose authenticators can give two principals one username must make the usernames
+	// distinct.
+	//
+	// The func runs on the request's goroutine with the authenticated caller, which it must
+	// not modify. It must be safe for concurrent use, must not block and must not panic. Its
+	// answer may differ from one request to the next: a lowered limit turns new requests
+	// away and leaves the open ones alone.
+	CallerLimits func(*CallerIdentity) CallerLimits
 	// DefaultClusterID routes requests without a /clusters/<id> prefix to that cluster ID
 	// in single-upstream deployments. Empty requires a /clusters/<id> prefix on every path.
 	DefaultClusterID string
@@ -131,6 +157,8 @@ type handler struct {
 	proxy            *httputil.ReverseProxy
 	// slots holds one token per counted request in flight; nil when there is no cap.
 	slots chan struct{}
+	// callers counts each limited caller's open requests; nil when Config.CallerLimits is.
+	callers *callerLimiter
 }
 
 // NewHandler returns an http.Handler that authenticates the caller, resolves the target
@@ -204,6 +232,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		partition:        cfg.CallerPartition,
 		factory:          NewRequestInfoFactory(),
 		slots:            slots,
+		callers:          newCallerLimiter(cfg.CallerLimits),
 		proxy: &httputil.ReverseProxy{
 			// Rewrite rather than Director: the reverse proxy then also drops the caller's
 			// Forwarded, X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto headers. The
@@ -302,9 +331,14 @@ func (h *handler) recordObservability(r *http.Request, info *request.RequestInfo
 		spanReason = ev.Reason
 		h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
 	// Neither is the upstream failing: the TokenReview did (503), the caller left before or during the copy,
-	// or the in-flight cap turned the request away (429).
+	// or the in-flight cap or a caller's own limit turned the request away (429).
 	case ev.Outcome == OutcomeAuthUnavailable, ev.Outcome == OutcomeCanceled, ev.Outcome == OutcomeThrottled:
 		metricOutcome = string(ev.Outcome)
+		// Only a caller's own limit names a reason; the shared cap's 429 has none.
+		if ev.Outcome == OutcomeThrottled && ev.Reason != ReasonNone {
+			spanReason = ev.Reason
+			h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
+		}
 	case ev.Outcome == OutcomeUpstreamError || ev.Outcome == OutcomeAborted || ev.StatusCode >= http.StatusInternalServerError:
 		metricOutcome = string(OutcomeUpstreamError)
 	default:
@@ -387,12 +421,26 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 
-	if !isLongRunning(info) {
+	longRunning := isLongRunning(info)
+	// Before the shared slot: a caller at its own limit never holds one. The deferred
+	// release runs when the reverse proxy returns, which for a watch, a log follow or an
+	// upgraded connection is when the stream ends, and on a panic too.
+	releaseCaller, reason, ok := h.callers.acquire(caller, longRunning)
+	if !ok {
+		ev.Outcome, ev.Reason = OutcomeThrottled, reason
+		message := callerThrottledMessage
+		if longRunning {
+			message = callerLongRunningMessage
+		}
+		writeThrottled(w, message)
+		return
+	}
+	defer releaseCaller()
+	if !longRunning {
 		release, ok := h.acquireSlot()
 		if !ok {
 			ev.Outcome = OutcomeThrottled
-			w.Header().Set(headerRetryAfter, retryAfterSeconds)
-			writeStatus(w, http.StatusTooManyRequests, metav1.StatusReasonTooManyRequests, throttledMessage)
+			writeThrottled(w, throttledMessage)
 			return
 		}
 		// The reverse proxy copies the whole response before it returns, so the slot covers
@@ -446,6 +494,12 @@ func (h *handler) acquireSlot() (release func(), ok bool) {
 	default:
 		return nil, false
 	}
+}
+
+// writeThrottled answers 429 with the Retry-After client-go waits out before it retries.
+func writeThrottled(w http.ResponseWriter, message string) {
+	w.Header().Set(headerRetryAfter, retryAfterSeconds)
+	writeStatus(w, http.StatusTooManyRequests, metav1.StatusReasonTooManyRequests, message)
 }
 
 // isLongRunning reports a request that stays open for as long as the caller follows it.

@@ -183,8 +183,8 @@ ends, so a watch or an `exec` session is recorded when it closes. The event hold
 authenticator names them), the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
 `unauthenticated`, `auth_unavailable` when the TokenReview or a key set fetch fails, `refused` with its reason,
-`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap
-answered 429, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
+`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap or a caller's own limit
+answered 429 (only the caller's limit sets a reason), or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
 written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
@@ -230,6 +230,42 @@ upstream request, `Secret` payloads are redacted before cache storage, non-dry-r
 evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
+
+The handler bounds what it forwards at once. `--max-in-flight` (`KUBE_PROXY_MAX_IN_FLIGHT`,
+`Config.MaxInFlight`; 24 in the binary, `0` for no cap) is one cap every caller shares: a request
+over it is answered `429 Too Many Requests` with `Retry-After: 1`, which client-go, and so
+`kubectl`, waits out and retries up to ten times. A watch and the `log`, `exec`, `attach`,
+`portforward` and `proxy` subresources stay open for as long as the caller follows them, and take
+no slot.
+
+That cap does not stop one caller from holding all of it, or from opening watches without end.
+`Config.CallerLimits` does. It returns, for a caller, a `CallerLimits`: `MaxInFlight`, the most
+requests of the kind the shared cap counts that the caller may have in flight, and
+`MaxLongRunning`, the most watches and long-running subresource requests it may have open. The two
+are counted apart, so a caller that follows a watch for an hour keeps its whole in-flight limit,
+and a zero or negative field is no limit. The binary applies one pair of limits to every caller:
+
+| Flag                            | Environment variable                     | Meaning                                                                        |
+| ------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------ |
+| `--max-in-flight-per-caller`    | `KUBE_PROXY_MAX_IN_FLIGHT_PER_CALLER`    | `CallerLimits.MaxInFlight` for every caller. `0`, the default, is no limit.    |
+| `--max-long-running-per-caller` | `KUBE_PROXY_MAX_LONG_RUNNING_PER_CALLER` | `CallerLimits.MaxLongRunning` for every caller. `0`, the default, is no limit. |
+
+A caller at a limit gets the shared cap's answer, the same `429` with `Retry-After`, audited as
+`throttled` with `rejection_reason` `caller_in_flight_limit` or `caller_long_running_limit` and
+counted under that reason in `kubeagents_kube_proxy_rejected_requests_total`; the shared cap's
+`429` has no reason. The check runs after `Config.Authorize` and the policy, so a request they
+refuse counts for nothing, and before the shared slot is taken, so a caller at its own limit never
+holds one. A request counts until the handler has finished it: when the response is copied, when a
+watch or a log follow ends or its caller disconnects, and when an upgraded connection closes. A
+request answered from the response cache, or joined to another caller's fetch, counts like any
+other, as it does for the shared cap.
+
+Callers are told apart by username alone, not by partition. Pods that share a ServiceAccount
+share its limits, and under `--auth-mode=none` every caller is `unauthenticated`, so the limits
+are then one more shared cap. Each replica counts for itself. Set the in-flight limit well under
+`--max-in-flight`, and no lower than the clients' own parallelism allows: against an API server
+without aggregated discovery, `kubectl` fetches every group version at once, and a request
+answered `429` ten times fails.
 
 The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
 and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
@@ -306,6 +342,11 @@ func main() {
 `Options.Authorize` and `Options.ExtraCallerHeaders` become the `Config` fields of the same names,
 and `Options.Version` is what `--version` and the startup log report after the name
 `k8s-api-proxy`.
+
+`Options.CallerLimits` is `Config.CallerLimits` for an embedder that limits some callers and not
+others. The two per-caller flags stay the limits of a caller it does not answer for: a field it
+returns as zero takes the flag's value, and a negative field is no limit for that caller whatever
+the flag says.
 
 `Options.AudienceCallers` maps a TokenReview audience to the caller usernames admitted for it, and
 adds those entries to the audiences the flags and the environment configure. A caller admitted this
@@ -463,7 +504,7 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 ```
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
-`AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
+`AuthorizeAttributes`, `AuthorizeError`, `CallerLimits`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
 `AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.NewHandler`, `proxyserver.Options`, `proxyserver.AudienceCallersError` and `pkg/mtlsauth` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.
