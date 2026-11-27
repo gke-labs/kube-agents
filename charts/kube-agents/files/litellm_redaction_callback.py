@@ -770,16 +770,16 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 for key in GEMINI_FUNCTION_RESPONSE_KEYS:
                     response = part.get(key) if isinstance(part, dict) else None
                     body = response.get(GEMINI_RESPONSE_KEY) if isinstance(response, dict) else None
-                    budget = [TOOL_OUTPUT_MAX_NESTED]
+                    # Each top-level string is a tool output of its own, with its
+                    # own nesting budget; the probe below is a fixed cost.
                     for name, value in (body.items() if isinstance(body, dict) else ()):
-                        if not isinstance(value, str) or value.strip()[:1] not in ("{", "[") or budget[0] <= 0:
+                        if not isinstance(value, str) or value.strip()[:1] not in ("{", "["):
                             continue
-                        budget[0] -= 1
                         # A string the structure rules mask whole where it
                         # sits stays a string.
                         if self._masked_whole(body, (name,)):
                             continue
-                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found, 0, budget)
+                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found)
         return found
 
     @staticmethod
