@@ -59,6 +59,8 @@ BROKER_STORE_ROOT = "/opt/data/fleet-audit/reports"
 REPORT_AGE = timedelta(hours=1)
 PLANT_STATUS = "OPENED"
 PLANT_CHECK = "netpol-missing"
+# The one stream whose roster has PLANT_CHECK (variables.tf validates audit_id to it).
+PLANT_AUDIT = "compliance-audit"
 PLANT_SEVERITY = "critical"
 PLANT_LOCATION = "us-central1"
 # The seed's note of what it wrote, and the backup of a real `latest`, in the
@@ -81,6 +83,8 @@ def names(mark):
 
 def planted_document(audit_report, audit_id, mark):
     """The validated document of a run with one critical finding on the marked cluster."""
+    if PLANT_CHECK not in audit_report.audit_checks(audit_id):
+        sys.exit(f"ERROR: the planted finding's check {PLANT_CHECK} is not in the {audit_id} roster; plant {PLANT_AUDIT}.")
     planted = names(mark)
     command = f"kubectl --context {planted['cluster']} get networkpolicy -n {planted['namespace']}"
     document = {
@@ -151,8 +155,22 @@ def write_owned(path, text, owner):
 
 
 def write_note(note_path, note):
-    """The plant note, rewritten as each write lands, so teardown always knows what to undo."""
-    write_owned(note_path, json.dumps(note, sort_keys=True), note_path.parent.stat())
+    """The plant note, rewritten as each write lands, so teardown always knows what to undo.
+
+    Written to a temporary file beside it and moved into place, so the note on
+    disk is always absent or a whole JSON object naming its mark: a write that
+    fails part way (a full volume, a killed exec) leaves the last whole note.
+    """
+    temporary = note_path.with_name(f".{note_path.name}.{os.getpid()}.tmp")
+    try:
+        write_owned(temporary, json.dumps(note, sort_keys=True), note_path.parent.stat())
+        os.replace(temporary, note_path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def refuse_unless_broker_root(audit_report):
@@ -281,8 +299,9 @@ def notes_for(audit_id, mark):
     """Each plant note of `mark` under BROKER_STORE_ROOT/<audit_id>/, found without resolving a repository."""
     stream_root = Path(BROKER_STORE_ROOT) / audit_id
     found = []
-    # A store directory is <stream root>/<owner>/<name>, or deeper for a host-qualified key.
-    for depth in ("*/*", "*/*/*", "*/*/*/*"):
+    # A store directory is always two levels below the stream root
+    # (`reports_dir_for`: <owner>/<name>, or <host>/<path with %2F>).
+    for depth in ("*/*",):
         for note_path in sorted(stream_root.glob(f"{depth}/{PLANT_NOTE}")):
             if not under_root(note_path):
                 continue
@@ -318,8 +337,10 @@ def teardown_one(audit_report, note_path, note):
         os.unlink(latest)
         removed.append(str(latest))
     if note.get("backup") == str(backup) and os.path.isfile(backup):
-        if latest.exists():
-            # A newer real run replaced the plant; the moved-aside run is older.
+        if latest.exists() or (planted is not None and not still_planted):
+            # A real run replaced the plant, or deleted `latest` on purpose
+            # (`invalidate_report_memory`, a failed `write_report`: absent is
+            # honest, stale is not). The moved-aside run is older either way.
             os.unlink(backup)
             removed.append(str(backup))
         else:

@@ -36,8 +36,12 @@ variable "agent_namespace" {
 
 variable "audit_id" {
   type        = string
-  description = "The audit stream whose broker store gets the plant"
+  description = "The audit stream whose broker store gets the plant. Only compliance-audit: the planted finding is a NetworkPolicy check from its roster."
   default     = "compliance-audit"
+  validation {
+    condition     = var.audit_id == "compliance-audit"
+    error_message = "audit_id is compliance-audit, the one stream whose roster has the planted finding's check."
+  }
 }
 
 variable "mark" {
@@ -54,7 +58,7 @@ variable "gitops_repo" {
   description = "owner/name of the GitOps repository; empty resolves it the way audit_report.py does"
   default     = ""
   validation {
-    condition     = can(regex("^([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]*$", var.gitops_repo))
-    error_message = "gitops_repo is empty or a path of letters, digits, '.', '_' and '-' joined by '/'."
+    condition     = var.gitops_repo == "" || (can(regex("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$", var.gitops_repo)) && !can(regex("(^|/)[.][.]?(/|$)", var.gitops_repo)))
+    error_message = "gitops_repo is empty or owner/name (host/path for another forge): two or more segments of letters, digits, '.', '_' and '-', none of them '.' or '..'."
   }
 }

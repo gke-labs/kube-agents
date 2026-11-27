@@ -382,3 +382,63 @@ def test_teardown_is_called_without_the_repository():
     for line in main_tf().splitlines():
         if "- teardown " in line:
             assert "gitops_repo" not in line, line
+
+
+def failing_on_call(monkeypatch, nth):
+    """Make the `nth` note write fail after its file was opened and half written."""
+    real = plant.write_owned
+    calls = {"n": 0}
+
+    def write_owned(path, text, owner):
+        calls["n"] += 1
+        if calls["n"] == nth:
+            real(path, text[: len(text) // 2], owner)
+            raise OSError("no space left on device")
+        real(path, text, owner)
+
+    monkeypatch.setattr(plant, "write_owned", write_owned)
+
+
+@pytest.mark.parametrize("nth", [1, 2, 3])
+def test_a_note_write_that_fails_part_way_leaves_a_whole_note_or_none(store, monkeypatch, nth):
+    # Writes: 1 the first note, 2 the backup's name before the move, 3 the
+    # planted bytes' digest after the report. A cut-short write must not
+    # replace the last whole note, or teardown can't find the plant.
+    real_stream()
+    before = snapshot(store)
+    failing_on_call(monkeypatch, nth)
+    with pytest.raises(OSError):
+        plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    note_path = stream() / plant.PLANT_NOTE
+    if note_path.exists():
+        assert json.loads(note_path.read_text())["mark"] == MARK
+    assert not list(stream().glob(f".{plant.PLANT_NOTE}.*"))
+    monkeypatch.undo()
+    monkeypatch.setenv("FLEET_AUDIT_REPORTS_DIR", str(store))
+    monkeypatch.setattr(plant, "BROKER_STORE_ROOT", str(store))
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert snapshot(store) == before
+
+
+def test_teardown_does_not_bring_back_a_latest_a_real_run_deleted(store):
+    real_stream()
+    plant.seed(audit_report, AUDIT, MARK, GITOPS, NOW)
+    # A real run deletes latest before it edits the ledger
+    # (invalidate_report_memory) and dies before writing a new one.
+    (stream() / "latest.json").unlink()
+    plant.teardown(audit_report, AUDIT, MARK)
+    assert not (stream() / "latest.json").exists()
+    assert not (stream() / plant.LATEST_BACKUP).exists()
+    assert not (stream() / plant.PLANT_NOTE).exists()
+
+
+def test_the_seed_refuses_a_stream_whose_roster_lacks_the_planted_check(store):
+    with pytest.raises(SystemExit, match="not in the fleet-waste-audit roster"):
+        plant.seed(audit_report, "fleet-waste-audit", MARK, GITOPS, NOW)
+    assert snapshot(store) == {}
+
+
+def test_the_stack_pins_audit_id_to_the_planted_checks_stream():
+    variables = (STACK / "variables.tf").read_text(encoding="utf-8")
+    assert f'condition     = var.audit_id == "{plant.PLANT_AUDIT}"' in variables
+    assert plant.PLANT_CHECK in audit_report.audit_checks(plant.PLANT_AUDIT)
