@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
@@ -424,6 +425,16 @@ const steerRefusalPublishTimeout = 5 * time.Second
 // WHICH one missed; the full text is already on the task's own `.in` subject,
 // so this is a pointer, not a second copy of the content.
 const steerEchoCap = 200
+
+// activityFileNameMaxBytes bounds the file name an activity title carries,
+// clip mark included; a longer one is cut on a rune boundary and ends in
+// activityFileNameClipMark. The title is one line in a chat card or console
+// step, and a name that long is a path the model made up, not one a reader
+// needs whole.
+const (
+	activityFileNameMaxBytes = 80
+	activityFileNameClipMark = "…"
+)
 
 // adapter is one task's run state.
 type adapter struct {
@@ -1810,7 +1821,7 @@ func (a *adapter) publishActivity(ctx context.Context, ev Event) {
 	}
 	fields := map[string]any{
 		"tool":  ev.Tool,
-		"title": a.scrub(activityTitle(ev.Tool, ev.Input)),
+		"title": a.scrub(activityTitleScrubbed(ev.Tool, ev.Input, a.scrub)),
 	}
 	if activityCallID.MatchString(ev.CallID) {
 		fields["callId"] = ev.CallID
@@ -2747,17 +2758,36 @@ func chunkString(s string, size int) []string {
 }
 
 // activityTitle is a tool call's title for the activity artifact, with none
-// of its arguments: a shell command's program and subcommand, a file tool's
-// file name, otherwise the tool's name. It goes through the scrub's shape
-// rules here, and the caller scrubs it again with the task's seen values, so
-// a seen value that looks like a bare word is redacted too.
+// of its arguments: a shell command's program and subcommand, a single-file
+// tool's file name, otherwise the tool's name. Claude Code's tools and
+// core-agent's get the same rules under their own names (Bash and bash, Read
+// and read_file); a tool whose argument is a pattern or a list, such as
+// Glob, Grep, glob or grep, keeps its name alone. It goes through the
+// scrub's shape rules here, and the caller scrubs it again with the task's
+// seen values, so a seen value that looks like a bare word is redacted too.
 func activityTitle(tool string, input json.RawMessage) string {
+	return activityTitleScrubbed(tool, input, answerscrub.ScrubInline)
+}
+
+// activityTitleScrubbed is activityTitle with the file name scrubbed by
+// scrub before it is clipped: the adapter passes its own scrub, which also
+// redacts the values the task has seen, so a clip can't cut one of those in
+// two and leave its head for the title's later scrub to miss.
+func activityTitleScrubbed(tool string, input json.RawMessage, scrub func(string) string) string {
 	var args map[string]any
 	_ = json.Unmarshal(input, &args)
 	str := func(k string) string { v, _ := args[k].(string); return strings.TrimSpace(v) }
 	title := tool
+	file := func(path string) {
+		if path == "" {
+			return
+		}
+		if name := activityFileName(filepath.Base(path), scrub); name != "" {
+			title = tool + " " + name
+		}
+	}
 	switch tool {
-	case "Bash":
+	case "Bash", "bash":
 		if bin, sub := leadingCommand(str("command")); bin != "" {
 			title = strings.TrimSpace(tool + " " + bin + " " + sub)
 		}
@@ -2766,11 +2796,44 @@ func activityTitle(tool string, input json.RawMessage) string {
 		if path == "" {
 			path = str("notebook_path")
 		}
-		if path != "" {
-			title = tool + " " + filepath.Base(path)
-		}
+		file(path)
+	case "read_file", "write_file", "edit_file", "view_file_outline", "stat":
+		// core-agent's single-file tools, which name their file "path".
+		file(str("path"))
 	}
 	return answerscrub.ScrubInline(title)
+}
+
+// activityFileName is a file's base name as an activity title carries it:
+// any space character as a plain space, other non-printing characters (line
+// breaks, escape sequences, bidirectional overrides, zero-width characters,
+// U+FFFD) dropped, scrubbed by scrub, and clipped to
+// activityFileNameMaxBytes on a rune boundary. The characters go first, so
+// the scrub sees a secret one of them split; the scrub comes before the
+// clip, so a cut can't leave part of a secret, by its shape or one the task
+// has seen, that a later scrub no longer recognises. Empty when nothing
+// printable is left.
+func activityFileName(base string, scrub func(string) string) string {
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r == utf8.RuneError:
+			return -1
+		case unicode.Is(unicode.Zs, r):
+			return ' '
+		case !unicode.IsPrint(r):
+			return -1
+		}
+		return r
+	}, base)
+	name = scrub(name)
+	if len(name) <= activityFileNameMaxBytes {
+		return name
+	}
+	cut := activityFileNameMaxBytes - len(activityFileNameClipMark)
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut] + activityFileNameClipMark
 }
 
 // activityCallID is the shape of a call id the activity entry carries. The
