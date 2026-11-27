@@ -871,6 +871,64 @@ class WaitForDriftDaemon(_ScriptCase):
         )
 
 
+class TheDetectorIsToldTheInstallsOwnRelease(_ScriptCase):
+    """DRIFT_DETECTOR_OWN_RELEASE reaches the detector as --own-release.
+
+    The operator names the Helm release there, and the detector sends that
+    release's own writes to the digest. A variable that stops reaching argv
+    turns the rule off with nothing in the log: every upgrade is carded again.
+    """
+
+    def _argv(self, **environment: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            argv_file = shlex.quote(str(pathlib.Path(tmp) / "argv"))
+            script = "\n".join(
+                [
+                    "set -u",
+                    "KV_DAEMON_URL=http://127.0.0.1:8699",
+                    _interval_settings(DRIFT_RETRY_MIN_SECONDS=1, DRIFT_RETRY_MAX_SECONDS=1),
+                    'drift_pid=""',
+                    "drift_detector_enabled() { return 0; }",
+                    "drift_detector_log_dropped() { return 1; }",
+                    "wait_for_drift_daemon() { :; }",
+                    # Written whole and then renamed, so the wait below never
+                    # reads half an argv.
+                    "function /usr/local/bin/drift-detector { "
+                    f"printf '%s\\n' \"$@\" > {argv_file}.tmp; mv {argv_file}.tmp {argv_file}; }}",
+                    self.lift("start_drift_detector"),
+                    *(f"export {name}={shlex.quote(value)}" for name, value in environment.items()),
+                    "start_drift_detector",
+                    f"for _ in $(seq 200); do [ -e {argv_file} ] && break; sleep {_MARKER_POLL_SECONDS}; done",
+                    'kill -KILL "$drift_pid"',
+                    f"cat {argv_file}",
+                ]
+            )
+            result = _run_bash(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.split()
+
+    def _environment(self, **extra: str) -> dict[str, str]:
+        return {
+            "DRIFT_DETECTOR_PROJECT_ID": "example-project",
+            "DRIFT_DETECTOR_CLUSTER_NAME": "prod-a",
+            "DRIFT_DETECTOR_CLUSTER_LOCATION": "us-central1",
+            "SESSION_KV_API_KEY": "token-value",
+            **extra,
+        }
+
+    def test_the_release_is_passed_as_a_flag_and_only_when_set(self) -> None:
+        argv = self._argv(**self._environment(DRIFT_DETECTOR_OWN_RELEASE="kubeagents-system/kube-agents"))
+        self.assertIn("--own-release=kubeagents-system/kube-agents", argv)
+
+        for environment in (self._environment(), self._environment(DRIFT_DETECTOR_OWN_RELEASE="")):
+            argv = self._argv(**environment)
+            self.assertIn("--in-cluster", argv, "the fake detector did not record its argv")
+            self.assertFalse(
+                [arg for arg in argv if arg.startswith("--own-release")],
+                "not configured is spelled by omitting the flag, as it is for --gitops-managers",
+            )
+
+
 class EveryTunableIsCorrectedBeforeAnythingReadsIt(_ScriptCase):
     """The settings all arrive from the environment, unfiltered.
 
