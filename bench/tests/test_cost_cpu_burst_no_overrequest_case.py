@@ -20,9 +20,14 @@ has `_` in the namespace segment. A phrase that holds the namespace is in no
 such id, and the case then passes on an audit that files the finding. So the
 case forbids the object segment only.
 
-Each test builds a ledger as the audit renders it, with ids as the audit
-spells them, and grades it with the check that the case file holds. No test
-calls GitHub: the one read of the verifier gets a stand-in.
+Each test builds a ledger with the parts that the verifier reads (the list of
+finding ids and the stamp), with ids as the audit spells them, and grades it
+with the check that the case file holds. No test calls GitHub: the one read of
+the verifier gets a stand-in.
+
+The phrases do not catch a worker that spells the object in another way
+(another kind word, or the namespace inside the object). That limit is the
+case's, and no test here covers it.
 """
 
 from __future__ import annotations
@@ -42,6 +47,8 @@ CASE_ID = "cost-cpu-burst-no-overrequest"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TASK = REPO_ROOT / "bench" / "tasks" / CASE_ID / "task.yaml"
 AUDIT_SCRIPTS = REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts"
+FLEET_FIXTURES = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
+FIXTURE_ROLE = "cpu-burst-and-flat"
 CHECK_NAME = "the-burst-is-not-an-overrequest"
 AUDIT = "fleet-wide-cost-analysis"
 
@@ -52,9 +59,10 @@ NAMESPACE = "seeded-cpu-cycle"
 NAMESPACE_SPELLINGS = (NAMESPACE, "")
 # The phrases of the case before this test: they held the namespace segment.
 PHRASES_WITH_THE_NAMESPACE = [f"{NAMESPACE}.deployment-{name}" for name in DEPLOYMENTS]
-# Cluster names from the shortest a project can give to the longest a GKE
-# cluster name with its project and location can have in an id.
-CLUSTER_NAMES = ["seeded-a"] + ["p" * length + "-us-central1-seeded-a" for length in (6, 14, 22, 30, 42)]
+# Cluster segments of several lengths. The longest ones make an id over the
+# limit, so `published_id` cuts it, and the tests show that the cut keeps the
+# object segment.
+CLUSTER_NAMES = ["seeded-a"] + ["p" * length + "-us-central1-a-seeded-a" for length in (6, 14, 22, 30, 42, 70)]
 
 # The run starts, and the ledger is stamped 30 seconds later.
 RUN_START = datetime(2026, 8, 21, 9, 0, 0, tzinfo=timezone.utc).timestamp()
@@ -90,7 +98,7 @@ def _clean_stash():
 
 
 @pytest.fixture
-def ledger(monkeypatch):
+def ledger(monkeypatch, audit_report):
     """Give the verifier a ledger with these finding ids, as the one issue that the run's report names."""
 
     def put(finding_ids: list[str]) -> None:
@@ -101,7 +109,7 @@ def ledger(monkeypatch):
             "Findings come from read-only inspection of the live fleet; every one "
             "carries the exact command it was derived from.\n\n"
             f"<!-- audit-findings: {json.dumps(sorted(set(finding_ids)), separators=(',', ':'))} -->\n"
-            "<!-- audit-id-scheme: 2 -->\n"
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->\n"
         )
         issue = {"number": LEDGER_NUMBER, "body": body, "labels": [{"name": f"audit:{AUDIT}"}]}
         routes = {LEDGER_API: (200, issue)}
@@ -126,9 +134,31 @@ def _grade(check: dict, **changes):
     return parse_node({**check, **changes}).verify(VERIFY_TIMEOUT_SECONDS)
 
 
-def test_the_case_forbids_the_object_segment_only(check) -> None:
+def _phrase_for(check: dict, deployment: str) -> str:
+    """The one forbidden phrase of the case that is for this Deployment."""
+    [phrase] = [phrase for phrase in check["forbidden_phrases"] if deployment in phrase]
+    return phrase
+
+
+def test_the_case_forbids_no_phrase_with_the_namespace(check) -> None:
     assert check["scope"] == "finding_ids"
-    assert check["forbidden_phrases"] == [f"deployment-{name}" for name in DEPLOYMENTS]
+    assert [phrase for phrase in check["forbidden_phrases"] if NAMESPACE in phrase] == []
+    for deployment in DEPLOYMENTS:
+        _phrase_for(check, deployment)
+
+
+def test_no_other_fleet_object_has_one_of_the_two_names() -> None:
+    """The phrases hold no namespace, so they match in each namespace of each cluster: the names must be unique on the fleet."""
+    roles = json.loads(FLEET_FIXTURES.read_text())["roles"]
+    others = [
+        (role, probe)
+        for role, entry in roles.items()
+        if role != FIXTURE_ROLE
+        for probe in entry.get("probes", [])
+        if any(name in probe for name in DEPLOYMENTS)
+    ]
+    assert others == []
+    assert {f"deployment/{name}" for name in DEPLOYMENTS} <= set(roles[FIXTURE_ROLE]["probes"])
 
 
 @pytest.mark.parametrize("cluster", CLUSTER_NAMES)
@@ -141,7 +171,7 @@ def test_a_ledger_with_the_finding_fails(audit_report, check, ledger, deployment
     ledger([_family_id(audit_report, cluster), finding])
     result = _grade(check)
     assert result.status == "fail", (finding, result.reason)
-    assert f"deployment-{deployment}" in result.reason
+    assert _phrase_for(check, deployment) in result.reason
 
 
 @pytest.mark.parametrize("cluster", CLUSTER_NAMES)
