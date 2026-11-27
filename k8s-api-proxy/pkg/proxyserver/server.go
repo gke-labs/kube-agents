@@ -507,6 +507,7 @@ func buildHandler(
 	if err := validateAuthFlags(cfg, modes); err != nil {
 		return nil, err
 	}
+	warnSharedClientCA(cfg.clientCert, modes, logger)
 	callerPartition, err := callerPartitionFunc(cfg, modes)
 	if err != nil {
 		return nil, err
@@ -791,6 +792,7 @@ func assemble(fs *flag.FlagSet, args []string, opts Options) (cfg proxyConfig, m
 // tests of the Options it passes. With mtls or requestheader in --auth-mode that program's
 // listener must verify client certificates as Run's does (pkg/mtlsauth says how): the
 // handler reads the certificate from Request.TLS and verifies it against its own bundle.
+// --tls-cert-file and --tls-key-file, which only Run's listener reads, are not required.
 // Its audit records go to standard output, as Run's do. Args that ask for the version are
 // an error: they ask for no handler.
 func NewHandler(ctx context.Context, fs *flag.FlagSet, args []string, opts Options) (http.Handler, error) {
@@ -857,6 +859,9 @@ func newServer(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, logg
 		certFile, keyFile = "", ""
 	}
 
+	// This server's listener is the one a certificate mode reads client certificates
+	// from, so those modes need it to serve TLS; NewHandler's caller brings its own.
+	cfg.clientCert.ownListener = true
 	handler, err := buildHandler(ctx, cfg, mode, logger, metrics, tp)
 	if err != nil {
 		return nil, false, err

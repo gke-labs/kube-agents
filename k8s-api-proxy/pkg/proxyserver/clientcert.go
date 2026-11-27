@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -101,6 +103,10 @@ type clientCertConfig struct {
 	// certificates are verified at.
 	reload certreload.Options
 	now    func() time.Time
+	// ownListener says the configuration is for the server Run starts, whose listener the
+	// certificate modes read client certificates from; false for NewHandler, whose caller
+	// serves the handler on a listener of its own.
+	ownListener bool
 }
 
 // clientCertFlag is one --mtls-* or --requestheader-* flag: its name, its environment
@@ -211,7 +217,7 @@ func orderedAuthModes(modes []string) []string {
 }
 
 // validateClientCertFlags refuses a --mtls-* or --requestheader-* flag without its mode,
-// either mode on a listener without TLS, and a mode whose flags are incomplete or
+// either mode on a listener of Run's without TLS, and a mode whose flags are incomplete or
 // contradict each other. What is left for the constructors of pkg/mtlsauth to refuse is the
 // form of a name, a prefix or a header, and a CA bundle that does not load.
 func validateClientCertFlags(cfg proxyConfig, modes []string) error {
@@ -233,7 +239,7 @@ func validateClientCertFlags(cfg proxyConfig, modes []string) error {
 	if !usesClientCertificates(modes) {
 		return nil
 	}
-	if strings.TrimSpace(cfg.tlsCertFile) == "" || strings.TrimSpace(cfg.tlsKeyFile) == "" {
+	if c.ownListener && (strings.TrimSpace(cfg.tlsCertFile) == "" || strings.TrimSpace(cfg.tlsKeyFile) == "") {
 		return fmt.Errorf("--%s with %q or %q requires --%s and --%s: a client certificate is read from the TLS connection, and the listener would otherwise serve plain HTTP",
 			authModeFlag, authModeMTLS, authModeRequestHeader, tlsCertFileFlag, tlsKeyFileFlag)
 	}
@@ -243,9 +249,50 @@ func validateClientCertFlags(cfg proxyConfig, modes []string) error {
 		}
 	}
 	if slices.Contains(modes, authModeRequestHeader) {
-		return validateRequestHeaderFlags(c)
+		if err := validateRequestHeaderFlags(c); err != nil {
+			return err
+		}
+	}
+	// One CA for both modes leaves the allowed names as all that tells a front proxy from a
+	// workload. Read from different fields, a workload's certificate could carry an allowed
+	// name in the front proxies' field next to its own identity in the workloads'.
+	if sharesClientCA(c, modes) && c.mtlsIdentitySource != c.headerNameSource {
+		return fmt.Errorf("--%s and --%s name the same file, so --%s (%s) and --%s (%s) must name the same certificate field: a workload's certificate could otherwise carry an allowed front proxy's name in the other field",
+			mtlsClientCAFileFlag, headerClientCAFileFlag, mtlsIdentitySourceFlag, c.mtlsIdentitySource, headerNameSourceFlag, c.headerNameSource)
 	}
 	return nil
+}
+
+// sharesClientCA reports whether both certificate modes are listed and their CA flags name
+// one file: the same path once cleaned and made absolute, or two paths to one existing
+// file. Two files holding the same CA are not detected.
+func sharesClientCA(c clientCertConfig, modes []string) bool {
+	if !slices.Contains(modes, authModeMTLS) || !slices.Contains(modes, authModeRequestHeader) {
+		return false
+	}
+	if c.mtlsClientCAFile == "" || c.headerClientCAFile == "" {
+		return false
+	}
+	workloads, errWorkloads := filepath.Abs(c.mtlsClientCAFile)
+	proxies, errProxies := filepath.Abs(c.headerClientCAFile)
+	if errWorkloads == nil && errProxies == nil && workloads == proxies {
+		return true
+	}
+	workloadInfo, errWorkloads := os.Stat(c.mtlsClientCAFile)
+	proxyInfo, errProxies := os.Stat(c.headerClientCAFile)
+	return errWorkloads == nil && errProxies == nil && os.SameFile(workloadInfo, proxyInfo)
+}
+
+// warnSharedClientCA says, once at startup, what one CA file for both certificate modes
+// means; validateClientCertFlags has refused the case where they read different fields.
+func warnSharedClientCA(c clientCertConfig, modes []string, logger *slog.Logger) {
+	if !sharesClientCA(c, modes) {
+		return
+	}
+	logger.Warn("--"+mtlsClientCAFileFlag+" and --"+headerClientCAFileFlag+" name the same file: every certificate under that CA whose name is in --"+headerAllowedNamesFlag+" is a front proxy and can name any caller; give front proxies a CA of their own",
+		logKeyClientCAFile, c.headerClientCAFile,
+		logKeyAllowedNames, splitList(c.headerAllowedNames),
+	)
 }
 
 // validateMTLSFlags checks the --mtls-* flags of a listed mtls mode; chained says another
@@ -302,6 +349,22 @@ func validateRequestHeaderFlags(c clientCertConfig) error {
 	if c.headerAllowedPartitions != "" && c.headerPartitionHeaders == "" {
 		return fmt.Errorf("--%s requires --%s", headerAllowedPartitionsFlag, headerPartitionHeadersFlag)
 	}
+	// One header read as two fields would let one value be both the caller and its partition.
+	listed := map[string]string{}
+	for _, list := range []struct{ name, value string }{
+		{headerUsernameHeadersFlag, c.headerUsernameHeaders},
+		{headerUIDHeadersFlag, c.headerUIDHeaders},
+		{headerGroupHeadersFlag, c.headerGroupHeaders},
+		{headerPartitionHeadersFlag, c.headerPartitionHeaders},
+	} {
+		for _, header := range splitList(list.value) {
+			key := http.CanonicalHeaderKey(header)
+			if first, dup := listed[key]; dup {
+				return fmt.Errorf("--%s entry %q is already listed in --%s", list.name, header, first)
+			}
+			listed[key] = list.name
+		}
+	}
 	return nil
 }
 
@@ -315,33 +378,47 @@ type flagNamedError struct {
 func (e *flagNamedError) Error() string { return e.text }
 func (e *flagNamedError) Unwrap() error { return e.err }
 
-// The Go names in the errors of pkg/mtlsauth's constructors and the flags that set them, a
-// qualified name ahead of the bare one it ends in.
+// The configuration fields an error of pkg/mtlsauth's constructors can start with, and the
+// flag that sets each.
 var (
-	mtlsFieldFlags = strings.NewReplacer(
-		libraryErrorPrefix, "",
-		"ClientCertConfig.ClientCAFile", flagArg(mtlsClientCAFileFlag),
-		"ClientCertConfig.IdentitySource", flagArg(mtlsIdentitySourceFlag),
-		"ClientCertConfig.AllowedIdentities", flagArg(mtlsAllowedIdentitiesFlag),
-		"ClientCertConfig.RequiredURIPrefix", flagArg(mtlsRequiredURIPrefixFlag),
-		"IdentitySource", flagArg(mtlsIdentitySourceFlag),
-	)
-	headerFieldFlags = strings.NewReplacer(
-		libraryErrorPrefix, "",
-		"FrontProxyConfig.ClientCAFile", flagArg(headerClientCAFileFlag),
-		"FrontProxyConfig.NameSource", flagArg(headerNameSourceFlag),
-		"FrontProxyConfig.AllowedNames", flagArg(headerAllowedNamesFlag),
-		"FrontProxyConfig.AllowedPartitions", flagArg(headerAllowedPartitionsFlag),
-		"FrontProxyConfig.UsernameHeaders", flagArg(headerUsernameHeadersFlag),
-		"FrontProxyConfig.UIDHeaders", flagArg(headerUIDHeadersFlag),
-		"FrontProxyConfig.GroupHeaders", flagArg(headerGroupHeadersFlag),
-		"FrontProxyConfig.PartitionHeaders", flagArg(headerPartitionHeadersFlag),
-		"UsernameHeaders", flagArg(headerUsernameHeadersFlag),
-		"UIDHeaders", flagArg(headerUIDHeadersFlag),
-		"GroupHeaders", flagArg(headerGroupHeadersFlag),
-		"PartitionHeaders", flagArg(headerPartitionHeadersFlag),
-	)
+	mtlsFieldFlags = map[string]string{
+		"ClientCertConfig.ClientCAFile":      mtlsClientCAFileFlag,
+		"ClientCertConfig.IdentitySource":    mtlsIdentitySourceFlag,
+		"ClientCertConfig.AllowedIdentities": mtlsAllowedIdentitiesFlag,
+		"ClientCertConfig.RequiredURIPrefix": mtlsRequiredURIPrefixFlag,
+	}
+	headerFieldFlags = map[string]string{
+		"FrontProxyConfig.ClientCAFile":      headerClientCAFileFlag,
+		"FrontProxyConfig.NameSource":        headerNameSourceFlag,
+		"FrontProxyConfig.AllowedNames":      headerAllowedNamesFlag,
+		"FrontProxyConfig.AllowedPartitions": headerAllowedPartitionsFlag,
+		"FrontProxyConfig.UsernameHeaders":   headerUsernameHeadersFlag,
+		"FrontProxyConfig.UIDHeaders":        headerUIDHeadersFlag,
+		"FrontProxyConfig.GroupHeaders":      headerGroupHeadersFlag,
+		"FrontProxyConfig.PartitionHeaders":  headerPartitionHeadersFlag,
+	}
 )
+
+// flagNamed words a constructor's error for an operator: the field the error starts with
+// becomes the flag that sets it. Nothing after that is touched, so a flag's value or a
+// path that happens to hold a field's name is reported as it was given. The errors that
+// name a second field are the ones validateClientCertFlags makes itself first.
+func flagNamed(mode string, fields map[string]string, err error) error {
+	text := strings.TrimPrefix(err.Error(), libraryErrorPrefix)
+	for field, name := range fields {
+		if rest, ok := strings.CutPrefix(text, field); ok && !isFieldNameByte(rest) {
+			text = flagArg(name) + rest
+			break
+		}
+	}
+	return &flagNamedError{text: "failed to initialize the " + mode + " authenticator: " + text, err: err}
+}
+
+// isFieldNameByte reports whether rest starts with a letter, so that a field is not
+// matched as the start of a longer one.
+func isFieldNameByte(rest string) bool {
+	return rest != "" && (rest[0] >= 'a' && rest[0] <= 'z' || rest[0] >= 'A' && rest[0] <= 'Z')
+}
 
 // clientCAReload is how a certificate mode's CA bundle is reloaded: on the test's clock
 // when one is set, and with a changed bundle that does not load reported the way a changed
@@ -367,7 +444,7 @@ func newMTLSAuthenticator(c clientCertConfig, logger *slog.Logger, metrics *k8sa
 		Now:               c.now,
 	})
 	if err != nil {
-		return nil, &flagNamedError{text: "failed to initialize the " + authModeMTLS + " authenticator: " + mtlsFieldFlags.Replace(err.Error()), err: err}
+		return nil, flagNamed(authModeMTLS, mtlsFieldFlags, err)
 	}
 	logger.Info(
 		"client certificate caller authentication enabled",
@@ -393,7 +470,7 @@ func newRequestHeaderAuthenticator(c clientCertConfig, logger *slog.Logger, metr
 		Now:               c.now,
 	})
 	if err != nil {
-		return nil, &flagNamedError{text: "failed to initialize the " + authModeRequestHeader + " authenticator: " + headerFieldFlags.Replace(err.Error()), err: err}
+		return nil, flagNamed(authModeRequestHeader, headerFieldFlags, err)
 	}
 	logger.Info(
 		"front proxy caller authentication enabled: every allowed front proxy can name any caller",
@@ -528,21 +605,19 @@ type handshakeConfig struct {
 // handshake; a peer that presents none still connects, which is what a health probe and a
 // bearer-token caller do. The configuration is built once per version of the pool.
 func verifyClientCertificates(base *tls.Config, clientCAs *certreload.CAPool) func(*tls.ClientHelloInfo) (*tls.Config, error) {
-	// Read now: net/http adds protocols to base once the server starts.
-	minVersion, getCertificate := base.MinVersion, base.GetCertificate
+	// Cloned now, before the server starts and before base gets this func: net/http adds
+	// protocols to base once it serves, and every other field of base carries over.
+	template := base.Clone()
 	var current atomic.Pointer[handshakeConfig]
 	return func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		pool := clientCAs.Pool()
 		if cached := current.Load(); cached != nil && cached.pool == pool {
 			return cached.config, nil
 		}
-		config := &tls.Config{
-			MinVersion:     minVersion,
-			GetCertificate: getCertificate,
-			NextProtos:     []string{nextProtoHTTP2, nextProtoHTTP1},
-			ClientAuth:     tls.VerifyClientCertIfGiven,
-			ClientCAs:      pool,
-		}
+		config := template.Clone()
+		config.NextProtos = []string{nextProtoHTTP2, nextProtoHTTP1}
+		config.ClientAuth = tls.VerifyClientCertIfGiven
+		config.ClientCAs = pool
 		current.Store(&handshakeConfig{pool: pool, config: config})
 		return config, nil
 	}

@@ -384,7 +384,10 @@ of its own can find it with `errors.As` and name those settings. An empty map ch
 
 `proxyserver.NewHandler` returns the handler `Run` would serve for the same arguments and options,
 with the flags registered on a `flag.FlagSet` the caller passes and nothing started. It is for a
-program that serves the handler itself and for an embedder's tests of its `Options`.
+program that serves the handler itself and for an embedder's tests of its `Options`. With `mtls`
+or `requestheader` in `--auth-mode`, that program's own listener must verify client certificates
+as `Run`'s does; `NewHandler` does not require `--tls-cert-file` and `--tls-key-file`, which only
+`Run`'s listener reads.
 
 Everything else is the binary's: the same flags, environment variables and
 defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
@@ -479,10 +482,12 @@ Values are trimmed, and a whitespace-only value is unset.
 | `--jwt-ca-file`             | `KUBE_PROXY_JWT_CA_FILE`             | PEM bundle of the roots the issuer's server is verified against (`Config.CAFile`).                                 |
 | `--partition-by-caller`     | `KUBE_PROXY_PARTITION_BY_CALLER`     | `none` (default), `partition` or `username`: what `Config.CallerPartition` separates by. Passed empty is an error. |
 
-A list of several authenticators tries them in order and admits the caller the first one accepts.
+A list of `token-review` and `jwt` tries them in order and admits the caller the first one accepts;
+with `mtls` or `requestheader` also listed, that holds for a request whose connection presented no
+client certificate (the certificate rule, further down).
 When none does, the answer is a 503 if any of them could not decide (a failed TokenReview, a key
-set or metadata that could not be fetched), and a 401 only when every one refused. Every listed
-authenticator sees the request's original `Authorization` header until one accepts it, so with `token-review` first a
+set or metadata that could not be fetched), and a 401 only when every one refused. Each of these
+bearer-token authenticators sees the request's original `Authorization` header until one accepts it, so with `token-review` first a
 platform-issued token is sent to the host cluster's TokenReview API before `jwt` verifies it;
 list `jwt` first to keep it local. The audit record's `caller_authenticator` is the mode that
 admitted the caller (`token-review`, `jwt`, `mtls` or `requestheader`, set by the binary for a
@@ -568,7 +573,12 @@ Trusting a front proxy means believing whatever it sends. Every holder of a cert
 chains to `--requestheader-client-ca-file` and carries a name in `--requestheader-allowed-names`
 can act as any caller in any partition, and the audit record names the caller it sent and not the
 proxy. So the CA signs front proxies and nothing else, the list holds only proxies that
-authenticate their callers, and the headers are ones the proxy overwrites on every request. A
+authenticate their callers, and the headers are ones the proxy overwrites on every request. When
+both modes are listed and the two CA flags name one file, the proxy stops at startup if
+`--mtls-identity-source` and `--requestheader-name-source` differ, since a workload's certificate
+could then carry an allowed front proxy's name in the other field, and otherwise starts with a
+warning that every certificate under that CA with an allowed name is a front proxy. Two files
+holding the same CA are not detected: keeping them apart is the operator's to do. A
 peer that is not an allowed front proxy gains nothing by sending them: they are ignored, and
 stripped before the request is forwarded.
 
@@ -581,8 +591,8 @@ reloaded like the serving certificate: a rotated CA is accepted, and the one it 
 by the next handshake and the next request, and a certificate that expired or whose CA left its
 bundle is answered `401` on the next request of a connection that is already open, HTTP/2
 included. A changed file that does not load keeps the bundle it replaced, and is logged and
-counted in the reload failure metric twice, once for the listener's pool and once for the
-authenticator's. With neither mode the handshake asks no peer for a certificate.
+counted in the reload failure metric once for each pool that reads the file: the listener's and
+each authenticator's that the file is given to. With neither mode the handshake asks no peer for a certificate.
 
 The order of `--auth-mode` does not set the precedence of these two modes. The binary tries
 `requestheader` first and `mtls` second, then `token-review` and `jwt` in the order listed. The
@@ -625,6 +635,7 @@ connection with a certificate is admitted or answered `401`.
 The proxy stops at startup, naming the flag, when:
 
 - `mtls` or `requestheader` is listed and `--tls-cert-file` or `--tls-key-file` is empty;
+- both are listed, their CA flags name one file, and their two source flags differ;
 - `mtls` is listed without `--mtls-client-ca-file` or `--mtls-identity-source`, or
   `requestheader` without `--requestheader-client-ca-file`, `--requestheader-name-source`,
   `--requestheader-allowed-names` or `--requestheader-username-headers`;

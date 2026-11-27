@@ -1369,3 +1369,143 @@ func TestBuildHandlerRefusesCertificateModeFlags(t *testing.T) {
 		})
 	}
 }
+
+// One CA file for both certificate modes is refused when the two modes read the name from
+// different certificate fields, whichever way the two flags spell the path, and is
+// started with a warning when they read the same field. Two files are neither.
+func TestOneClientCAFileForBothCertificateModes(t *testing.T) {
+	p := newCertProxy(t)
+	link := filepath.Join(t.TempDir(), "linked-ca.crt")
+	if err := os.Symlink(p.workloadCAFile, link); err != nil {
+		t.Fatal(err)
+	}
+	unclean := filepath.Dir(p.workloadCAFile) + string(filepath.Separator) + "." + string(filepath.Separator) + filepath.Base(p.workloadCAFile)
+	both := append(append(p.mtlsArgs(), p.headerArgs()...), "--auth-mode=requestheader,mtls")
+	build := func(t *testing.T, args ...string) (string, error) {
+		t.Helper()
+		var logs bytes.Buffer
+		cfg, mode := p.config(t, Options{}, append(slices.Clone(both), args...)...)
+		_, _, err := newServer(context.Background(), cfg, mode, slog.New(slog.NewJSONHandler(&logs, nil)), nil, nil)
+		return logs.String(), err
+	}
+	const sameFile, dnsNames = "name the same file", "--requestheader-name-source=dns"
+
+	for name, path := range map[string]string{"the same path": p.workloadCAFile, "an unclean path": unclean, "a symlink": link} {
+		t.Run("refuses "+name+" read from different fields", func(t *testing.T) {
+			_, err := build(t, "--requestheader-client-ca-file="+path, dnsNames, "--requestheader-allowed-names="+testWorkloadDNS)
+			if err == nil || !strings.Contains(err.Error(), sameFile) || !strings.Contains(err.Error(), "--"+headerNameSourceFlag) {
+				t.Fatalf("err = %v, want a refusal naming the shared file and --%s", err, headerNameSourceFlag)
+			}
+		})
+		t.Run("warns of "+name+" read from the same field", func(t *testing.T) {
+			logs, err := build(t, "--requestheader-client-ca-file="+path)
+			if err != nil {
+				t.Fatalf("newServer: %v", err)
+			}
+			for _, want := range []string{`"level":"WARN"`, sameFile, "--" + headerAllowedNamesFlag, testGatewayURI} {
+				if !strings.Contains(logs, want) {
+					t.Errorf("logs = %s, want them to contain %s", logs, want)
+				}
+			}
+		})
+	}
+	for name, args := range map[string][]string{"the same field": nil, "different fields": {dnsNames, "--requestheader-allowed-names=" + testWorkloadDNS}} {
+		t.Run("two files read from "+name, func(t *testing.T) {
+			logs, err := build(t, args...)
+			if err != nil {
+				t.Fatalf("newServer: %v", err)
+			}
+			if strings.Contains(logs, sameFile) {
+				t.Errorf("logs = %s, want no warning for two CA files", logs)
+			}
+		})
+	}
+}
+
+// NewHandler starts no listener, so a certificate mode does not need the serving files
+// there; the server Run starts does.
+func TestNewHandlerNeedsNoServingCertificateForACertificateMode(t *testing.T) {
+	p := newCertProxy(t)
+	for _, mode := range [][]string{
+		append(p.mtlsArgs(), "--auth-mode=mtls"),
+		append(p.headerArgs(), "--auth-mode=requestheader"),
+	} {
+		args := append(append(p.baseArgs(), mode...), "--tls-cert-file=", "--tls-key-file=")
+		if _, err := NewHandler(context.Background(), testFlagSet(), args, Options{}); err != nil {
+			t.Errorf("NewHandler(%q): %v", args, err)
+		}
+		cfg, proxyMode := p.config(t, Options{}, append(slices.Clone(mode), "--tls-cert-file=", "--tls-key-file=")...)
+		_, _, err := newServer(context.Background(), cfg, proxyMode, slog.New(slog.DiscardHandler), nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "requires --"+tlsCertFileFlag) {
+			t.Errorf("newServer(%q): err = %v, want the serving files required", args, err)
+		}
+	}
+}
+
+// The per-handshake configuration is the listener's own with the client certificate
+// request added: a field of the base it does not set carries over.
+func TestVerifyClientCertificatesKeepsTheBaseConfiguration(t *testing.T) {
+	p := newCertProxy(t)
+	pool, err := certreload.NewCAPool(p.workloadCAFile, certreload.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	curves := []tls.CurveID{tls.X25519}
+	suites := []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}
+	getCertificate := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return nil, nil }
+	base := &tls.Config{MinVersion: tls.VersionTLS13, CurvePreferences: curves, CipherSuites: suites, GetCertificate: getCertificate}
+	forClient := verifyClientCertificates(base, pool)
+	// What the server does next: the base gets the func, and net/http its protocols.
+	base.GetConfigForClient = forClient
+	base.NextProtos = []string{nextProtoHTTP1}
+
+	got, err := forClient(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MinVersion != tls.VersionTLS13 || !slices.Equal(got.CurvePreferences, curves) || !slices.Equal(got.CipherSuites, suites) || got.GetCertificate == nil {
+		t.Errorf("MinVersion %x, CurvePreferences %v, CipherSuites %v, GetCertificate set %v; want the base's", got.MinVersion, got.CurvePreferences, got.CipherSuites, got.GetCertificate != nil)
+	}
+	if got.ClientAuth != tls.VerifyClientCertIfGiven || got.ClientCAs != pool.Pool() || !slices.Equal(got.NextProtos, []string{nextProtoHTTP2, nextProtoHTTP1}) {
+		t.Errorf("ClientAuth %v, NextProtos %q; want VerifyClientCertIfGiven against the pool, offering HTTP/2", got.ClientAuth, got.NextProtos)
+	}
+	if got.GetConfigForClient != nil {
+		t.Error("the per-handshake configuration carries GetConfigForClient")
+	}
+	if base.ClientAuth != tls.NoClientCert || base.ClientCAs != nil {
+		t.Error("the base configuration was changed")
+	}
+}
+
+// A constructor's error is reworded in the field it starts with only: a flag's value or a
+// path that holds the name of a field is reported as the operator gave it.
+func TestStartupErrorKeepsAValueThatHoldsAFieldName(t *testing.T) {
+	p := newCertProxy(t)
+	name := "spiffe://example.test/UsernameHeaders/IdentitySource/a%20b"
+	absent := filepath.Join(t.TempDir(), "ClientCAFile", "IdentitySource.crt")
+	for _, tc := range []struct {
+		args []string
+		want []string
+	}{
+		{append(p.headerArgs(), "--auth-mode=requestheader", "--requestheader-allowed-names="+name), []string{"--" + headerAllowedNamesFlag + " entry", name}},
+		{append(p.mtlsArgs(), "--auth-mode=mtls", "--mtls-allowed-identities="+name), []string{"--" + mtlsAllowedIdentitiesFlag + " entry", name}},
+		{append(p.mtlsArgs(), "--auth-mode=mtls", "--mtls-client-ca-file="+absent), []string{"--" + mtlsClientCAFileFlag + ": ", absent}},
+		{append(p.headerArgs(), "--auth-mode=requestheader", "--requestheader-client-ca-file="+absent), []string{"--" + headerClientCAFileFlag + ": ", absent}},
+	} {
+		cfg, mode := p.config(t, Options{}, tc.args...)
+		_, _, err := newServer(context.Background(), cfg, mode, slog.New(slog.DiscardHandler), nil, nil)
+		if err == nil {
+			t.Fatalf("newServer(%q) succeeded, want a startup error", tc.args)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %q, want it to contain %q", err, want)
+			}
+		}
+		for _, library := range []string{"mtlsauth", "ClientCertConfig", "FrontProxyConfig"} {
+			if strings.Contains(err.Error(), library) {
+				t.Errorf("err = %q names %s", err, library)
+			}
+		}
+	}
+}

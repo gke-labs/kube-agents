@@ -61,8 +61,8 @@ One caveat remains. A caller admitted through another audience, such as a Servic
 the proxy's own allowed callers, is not in the map and so is not gated: it reaches every cluster the
 proxy serves. A worker ServiceAccount must be named in the map and in no other caller list.
 
-The profile audience needs `token-review` in `--auth-mode`. With the gate on, `--auth-mode=none` or
-`jwt` alone stops the binary at startup. Each of these startup errors names
+The profile audience needs `token-review` in `--auth-mode`. With the gate on, any
+`--auth-mode` without `token-review` stops the binary at startup. Each of these startup errors names
 `CREDENTIAL_PROXY_PROFILE_AUDIENCE` and `CREDENTIAL_PROXY_PROFILE_IDENTITIES` and says what to
 change.
 
