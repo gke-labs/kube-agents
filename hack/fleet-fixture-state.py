@@ -59,8 +59,8 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-serial-flood VM, the world-open firewall rule and its VM, the peered
-jumbo-frame network, the two orphaned snapshots) is published as
+serial-flood VM, the world-open firewall rule and its VM, the health-check
+shadow rules on that VM's tag, the peered jumbo-frame network, the two orphaned snapshots) is published as
 `<role>.confirmed` alone, and its subjects
 are read with `gcloud compute instances list`, `gcloud compute firewall-rules
 list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
