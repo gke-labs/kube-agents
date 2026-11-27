@@ -2710,7 +2710,7 @@ main() {
       fi
     fi
     CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
-      PROJECT_NUMBER="$project_number" CHAT_PROJECT_NUMBER="${chat_project_number:-$project_number}" INSTALL_ENV_FILE="$install_env_file" \
+      PROJECT_NUMBER="$project_number" CHAT_PROJECT_NUMBER="$chat_project_number" INSTALL_ENV_FILE="$install_env_file" \
       print_chat_setup_checklists
   fi
   if declare -F print_gateway_home_channel_unset_summary >/dev/null; then
