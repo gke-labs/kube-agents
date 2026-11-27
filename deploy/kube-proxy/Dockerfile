@@ -31,14 +31,18 @@ COPY a2a/lib/ /workspace/a2a/lib/
 COPY a2a/taskcred/ /workspace/a2a/taskcred/
 COPY kube-proxy/ ./
 # The output keeps the name k8s-api-proxy, so the path the image's ENTRYPOINT runs is the
-# one it has always been.
+# one it has always been. It is written under /out, not /workspace: /workspace/k8s-api-proxy
+# is the module's source directory here, and go build -o into a directory puts the binary
+# inside it, which would ship the directory as the entrypoint. The test fails the build if
+# the output is ever not a regular file.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -a -ldflags="-s -w -X main.version=${KUBE_AGENTS_VERSION:-dev}" -o /workspace/k8s-api-proxy ./cmd/kube-proxy/
+    go build -a -ldflags="-s -w -X main.version=${KUBE_AGENTS_VERSION:-dev}" -o /out/k8s-api-proxy ./cmd/kube-proxy/ \
+    && test -f /out/k8s-api-proxy
 
 FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
 
 WORKDIR /
-COPY --from=builder /workspace/k8s-api-proxy /usr/local/bin/k8s-api-proxy
+COPY --from=builder /out/k8s-api-proxy /usr/local/bin/k8s-api-proxy
 
 USER 10000:10000
 
