@@ -295,11 +295,48 @@ Each job in `jobs.json` follows this schema:
 
 ## Disabling a watchdog
 
+### On your install
+
+Set `platformAgent.schedules` in the chart values. No new image is needed.
+
+```yaml
+platformAgent:
+  schedules:
+    suspendAll: true
+    overrides:
+      - name: session-retention
+        suspend: false
+      - name: kanban-workspace-gc
+        suspend: false
+      - name: kanban-block-recheck
+        suspend: false
+```
+
+On an `install.sh` install, put the block in the `TF_VAR_extra_helm_values` line in `install.env`, as [Idle installs](#idle-installs) describes for another chart value. The chart writes the block to `spec.schedules` on the `PlatformAgent`. A hand edit of `spec.schedules` can be lost at the next chart apply.
+
+`suspendAll: true` turns off every job that the image ships in the Platform Agent's roster. An entry in `overrides` wins over it: `suspend: false` turns one job back on, and `suspend: true` with no `suspendAll` turns one job off. The name is the job's `id` in the [roster](/kube-agents/reference/cron-jobs/). A name that matches no job is ignored. The `BuiltinSchedules` condition reports it only while the operator runs AgentSchedules, so check the spelling.
+
+The setting does not reach a job that you or the agent added to the roster. Pause or remove that job with `hermes cron`.
+
+The operator restarts the agent pod when the setting changes for a roster job, and the jobs change state at that start. A suspended job keeps its run history. If a suspended job is run on demand, Hermes turns the job back on, and it stays on until the next pod restart. That happens when you run `hermes cron run`, and when you ask the agent in chat to run the job now. When you turn jobs back on, the [catch-up spacing](#catch-ups-after-a-pause) applies, so the audits do not all start at once.
+
+`suspendAll` also turns off the [helper jobs](#the-helper-jobs), which do work that chat requests depend on:
+
+- `session-retention` and `kanban-workspace-gc` clean up. The data volume grows while they are off.
+- `kanban-block-recheck` retries a blocked card when its block clears. While it is off, a blocked card waits for a person.
+- `github-repo-watcher` and `post-merge-check` follow the GitOps repository. While they are off, the agent does not pick up new issues or check merged changes.
+
+Keep the first three on, as the example does, and turn the others back on when you want that work.
+
+The setting cannot start a job that the image ships disabled. A rollback to a release that does not have the setting turns every suspended job back on. It does not reach the Planning Agent's own jobs, which run the Platform Agent's roster and first-run onboarding. While an audit is suspended, onboarding does not start it.
+
+### In the image
+
 Flip `enabled` to `false` in `agents/platform/cron/jobs.json`. The scheduler honours the flag directly: the job stops being due, and nothing runs.
 
 Flip the flag; do not delete the entry. An id can be dropped from the roster only once no live cluster still needs the image to hold the job off, which is the path the five [retired watchdogs](#the-retired-jobs) took. Deleting is never the whole step: the same release must also name the id in the platform force-sync's `--cron-retire` (`deploy/shared/docker-entrypoint.sh`), or the volume keeps a disabled entry no later image can reach.
 
-**The Platform Agent's roster travels.** That profile is scaffolded by `profile_scaffold.py` on every start-up, and its `merge_cron_store` merges the image's roster over the volume's unfiltered — the image wins every key it ships, the volume keeps every key it does not. So redeploying an entry with `enabled: false` switches it off on every existing cluster at the next pod restart, and a stale enabled copy cannot outlive the release that retired it. A job an operator added by hand survives, because the merge never prunes — unless its id is on the force-sync's `--cron-retire` list, which is applied after the merge and deletes outright.
+**The Platform Agent's roster travels.** That profile is scaffolded by `profile_scaffold.py` on every start-up, and its `merge_cron_store` merges the image's roster over the volume's unfiltered — the image wins every key it ships, the volume keeps every key it does not. The one exception is [the install's own suspend setting](#on-your-install), which can hold a shipped job off. So redeploying an entry with `enabled: false` switches it off on every existing cluster at the next pod restart, and a stale enabled copy cannot outlive the release that retired it. A job an operator added by hand survives, because the merge never prunes — unless its id is on the force-sync's `--cron-retire` list, which is applied after the merge and deletes outright.
 
 **The Planning Agent's roster travels too, by a different road.** The Planning Agent is the `default` profile, which is not scaffolded: it lives at `$HERMES_HOME` directly, and the entrypoint reconciles the volume's `cron/jobs.json` against the shipped roster by job id, per key, under the same rule — the image wins every key it ships, `enabled` among them, and a key it ships nothing for stays as the volume had it.
 
