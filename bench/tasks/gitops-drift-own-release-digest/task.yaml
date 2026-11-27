@@ -43,6 +43,15 @@
 # the upgrade, and seconds later one more write to a release object. That
 # write must be carded: a change after the upgrade ended is a person's.
 #
+# Step 1 of the prompt names the card by the kind of its subject. The fixture
+# makes real writes of its own with kubectl (the namespace, the Deployment, the
+# verdict ConfigMap), and each gets a triage card. The verdict ConfigMap is
+# written last, and its card's text names the workload, so "the most recent
+# card concerning the workload" was that card on one live run: the reply then
+# had no memory limit in it, and the run was broken, not red. The kind leaks
+# nothing the objectives grade (gitops-drift-load-bearing-change-triage has
+# the same step for the same reason).
+#
 # The eval installs run with the drift alert ceiling off and chat off, so the
 # digest becomes one unassigned board card there (backlog = 3), which the
 # fixture checks for and reads the wording of; on an install with chat it is
@@ -84,8 +93,13 @@ prompt: |
   1. Find the card. Call kanban_list separately for status 'running', 'done'
      and 'blocked'. Do not call kanban_list without a status filter -- it
      returns the oldest tasks first and stops at a page, so the newest card is
-     not in the default response. The card you want is the most recent one
-     concerning 'eval-drift-own-release-api'.
+     not in the default response.
+
+     More than one card concerns this namespace, and only one of them is the
+     one to report. The card you want is the most recent one about a change
+     made outside GitOps to a Deployment. Cards about the namespace itself or
+     about a ConfigMap in it are other changes; ignore them, even where their
+     text names the workload.
   2. If it has not finished, wait for it. Call kanban_show on its id, and keep
      re-checking until its status is 'done', 'blocked' or 'archived'.
   3. Reproduce the finished card's result in your reply in full and verbatim.
