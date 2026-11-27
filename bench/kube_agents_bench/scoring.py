@@ -68,7 +68,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from kube_agents_bench import chat_shape
+from kube_agents_bench import chat_shape, session_tools
 from kube_agents_bench.cases import ARGUMENTS_MIXED, ARGUMENTS_NEGATED, HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 from kube_agents_bench.forges import FORGE_SAFEGUARD_MARKER, FORGE_UNAVAILABLE_MARKER
@@ -1106,12 +1106,21 @@ def _inject_trace_shown(trajectory: list[Any]) -> bool:
 def _inject_inputless_tools(trajectory: list[Any]) -> set[str]:
     """The tool names of the router's call entries the transport marked as
     sent with no input (:data:`INJECT_INPUT_ABSENT_FIELD`). A worker's
-    tagged entry (``agent`` set) is not the router's and is left out."""
-    return {
-        str(entry.get("name"))
-        for entry in trajectory
-        if isinstance(entry, dict) and entry.get(INJECT_INPUT_ABSENT_FIELD) is True and not entry.get("agent")
-    }
+    tagged entry (``agent`` set) is not the router's and is left out. A
+    session or profile pod's call adds its tool's name under the other
+    harness too, since the verifier reads it under either
+    (:mod:`kube_agents_bench.session_tools`)."""
+    inject = session_tools.is_inject_trajectory(trajectory)
+    names: set[str] = set()
+    for entry in trajectory:
+        if not (isinstance(entry, dict) and entry.get(INJECT_INPUT_ABSENT_FIELD) is True and not entry.get("agent")):
+            continue
+        name = str(entry.get("name"))
+        names.add(name)
+        other = session_tools.counterpart(name)
+        if other is not None and session_tools.is_worker_adapter_call(entry, inject):
+            names.add(other)
+    return names
 
 
 def _reads_inputless_call(tools: frozenset[str], inputless: set[str]) -> bool:

@@ -3124,6 +3124,74 @@ def test_an_attempted_forbidden_call_still_counts_without_require_success():
     assert res.status == "fail"  # ...so the none-wrapped safeguard trips
 
 
+# An inject record's task marker, and a skill-file path and skill patterns of
+# the shape session-crashloop-question-loads-a-skill's leaves use. Made up for
+# these tests.
+_INJECT_TASK = {"name": "inject.task", "args": {"taskId": "task-1"}, "result": None, "status": "completed"}
+_SKILL_FILE = "/home/node/.claude/skills/pod-crashloop-oom/SKILL.md"
+_SKILL_FILE_PATTERN = r"(?i).*(/\.claude(/.*)?|/skills/.*|skill\.md)"
+_SKILL_NAME_PATTERN = r".*(gke-[a-z-]+|pod-crashloop-oom).*"
+
+
+def _calls_under(trajectory, **leaf):
+    transcript.set("done", trajectory)
+    try:
+        return ToolCalledVerifier(type="tool_called", **leaf).verify(5.0)
+    finally:
+        transcript.clear()
+
+
+def test_tool_called_reads_a_session_pod_call_under_either_harness_s_name():
+    """A leaf naming Claude Code's tool grades core-agent's call to the same
+    tool on an inject record, its arguments re-keyed, and the reverse."""
+    core_agent = [
+        _INJECT_TASK,
+        {"name": "load_skill", "args": {"name": "pod-crashloop-oom"}, "status": "completed"},
+        {"name": "bash", "args": {"command": "kubectl get pods -n seeded-debug"}, "status": "completed"},
+        {"name": "read_file", "args": {"path": _SKILL_FILE}, "status": "completed"},
+    ]
+    for key in ("skill", "command"):
+        assert _calls_under(core_agent, tool_names=["Skill"], arguments={key: _SKILL_NAME_PATTERN}).status == "pass", key
+    assert _calls_under(core_agent, tool_names=["Bash"], arguments={"command": r"(?s).*\bkubectl\s.*"}).status == "pass"
+    assert _calls_under(core_agent, tool_names=["Read"], arguments={"file_path": _SKILL_FILE_PATTERN}).status == "pass"
+    # A pattern that rules the call out still does.
+    assert _calls_under(core_agent, tool_names=["Skill"], arguments={"skill": "gke-.*"}).status == "fail"
+    claude_code = [
+        _INJECT_TASK,
+        {"name": "Skill", "args": {"command": "pod-crashloop-oom"}, "status": "completed"},
+        {"name": "Read", "args": {"file_path": _SKILL_FILE}, "status": "completed"},
+    ]
+    assert _calls_under(claude_code, tool_names=["load_skill"], arguments={"name": _SKILL_NAME_PATTERN}).status == "pass"
+    assert _calls_under(claude_code, tool_names=["read_file"], arguments={"path": _SKILL_FILE_PATTERN}).status == "pass"
+    # A leaf listing both spellings counts each call once.
+    both = _calls_under(core_agent + claude_code[1:], tool_names=["Skill", "load_skill"])
+    assert both.raw == {"matching_calls": 2}
+
+
+def test_tool_called_reads_a_hermes_call_as_named():
+    """Hermes's read_file is keyed like core-agent's. A call the bridge
+    labelled, an api-transport record's call and a worker's tagged call are
+    never read as Claude Code's Read, so a skill-files safeguard does not
+    fire on the platform agent reading its own skills."""
+    hermes_read = {"name": "read_file", "args": {"path": "/opt/data/skills/gke-x/SKILL.md"}, "status": "completed"}
+    leaf = {"tool_names": ["Read"], "arguments": {"file_path": _SKILL_FILE_PATTERN}}
+    labelled = [_INJECT_TASK, {**hermes_read, "origin": "hermes-bridge"}]
+    assert _calls_under(labelled, **leaf).status == "fail"
+    assert _calls_under([hermes_read], **leaf).status == "fail", "an api-transport record is hermes's"
+    tagged = [_INJECT_TASK, {**hermes_read, "agent": "platform"}]
+    assert _calls_under(tagged, scope="all", **leaf).status == "fail"
+    # The same call unlabelled on an inject record is the worker adapter's.
+    assert _calls_under([_INJECT_TASK, hermes_read], **leaf).status == "pass"
+
+
+def test_tool_called_drops_an_argument_with_no_counterpart():
+    """Claude Code's Grep filters by ``glob``; core-agent's grep has no such
+    argument, so a pattern on it rules core-agent's call out."""
+    core_agent = [_INJECT_TASK, {"name": "grep", "args": {"pattern": "x", "path": "/home/node"}, "status": "completed"}]
+    assert _calls_under(core_agent, tool_names=["Grep"], arguments={"glob": ".*"}).status == "fail"
+    assert _calls_under(core_agent, tool_names=["Grep"], arguments={"path": "/home/node"}).status == "pass"
+
+
 def test_tool_called_arguments_count_only_the_calls_shaped_so():
     # The fan-out case's objective: one card per cluster, titled with its bare name.
     transcript.set(

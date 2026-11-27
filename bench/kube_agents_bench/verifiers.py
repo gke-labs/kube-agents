@@ -100,6 +100,7 @@ from kube_agents_bench import (
     gateway_silence,
     github_writes,
     onboarding,
+    session_tools,
     transcript,
     worker_trajectory,
 )
@@ -2001,6 +2002,14 @@ class ToolCalledVerifier(BaseVerifier):
     names before it clips the arguments and records them on the entry, so a wrapper
     too long to parse is still counted by name.
 
+    A router call the worker adapter published on an inject record (a
+    session or profile pod's, which carries no hermes-bridge origin) is read
+    under either of its harnesses' names for its tool, its arguments re-keyed
+    to match: a leaf naming Claude Code's ``Bash``, ``Skill``, ``Read``,
+    ``Glob`` or ``Grep`` matches core-agent's ``bash``, ``load_skill``,
+    ``read_file``, ``glob`` or ``grep``, and the reverse
+    (:mod:`kube_agents_bench.session_tools`). Hermes calls are read as named.
+
     ``agent``: optional Python regular expression. When set, only trajectory
     entries whose ``agent`` tag matches ``re.fullmatch`` are counted. Useful
     under ``scope: workers`` to discriminate calls made by a specific worker
@@ -2203,6 +2212,11 @@ class ToolCalledVerifier(BaseVerifier):
             if not entries:
                 matched_agent = False
         wanted = set(self.tool_names)
+        # A session or profile pod's call is read under either harness's
+        # name for its tool (session_tools), so a leaf written against one
+        # harness grades the other's calls; a hermes call is read as named.
+        inject = session_tools.is_inject_trajectory(snap.trajectory)
+        entries = [session_tools.as_named(entry, wanted, inject) for entry in entries]
         named = [
             entry
             for entry in entries

@@ -3645,6 +3645,22 @@ def test_an_inputless_call_to_another_tool_sets_nothing_aside(write_task, inject
     assert wrapped.not_applicable_checks == [ANSWER_CHECK, BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
 
 
+def test_an_inputless_call_under_the_other_harness_s_name_counts(write_task, inject_run):
+    """The verifier reads a session pod's ``bash`` as ``Bash``, so an
+    inputless core-agent ``bash`` call leaves a ``Bash`` arguments check as
+    uncertain as an inputless ``Bash`` call does. A hermes-labelled call of
+    that name is read as named and sets nothing aside."""
+    spec = _arguments_spec(write_task)
+    core_agent = classify_rep(
+        spec, inject_run(mutate=_arguments_shape([_bash(absent=True, name="bash")], "fail", "pass")), 1
+    )
+    assert core_agent.outcome == "not_applicable", core_agent.reason
+    assert core_agent.not_applicable_checks == [ANSWER_CHECK, BASH_ARGS_OBJECTIVE, BASH_ARGS_SAFEGUARD]
+    labelled = {**_bash(absent=True, name="bash"), "origin": "hermes-bridge"}
+    hermes = classify_rep(spec, inject_run(mutate=_arguments_shape([labelled, _bash("ls")], "fail", "pass")), 1)
+    assert hermes.outcome == "fail" and hermes.not_applicable_checks == []
+
+
 def test_a_positive_pass_over_an_inputless_call_stays_graded(write_task, inject_run):
     """No pattern matches empty args, so an objective that passed did so on
     a call that carried its input; it grades even beside an inputless
