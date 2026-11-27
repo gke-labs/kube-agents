@@ -967,8 +967,9 @@ What goes on the bus, one `data` part per invocation at `post_tool_call`. It sha
 worker adapter's `tool` and `callId` keys, so one fold reads both executors, but it carries the
 call's `input` where the worker adapter's `{"tool","title","callId"}` entry carries a `title`
 and no input. The worker adapter's `title` is the tool's name with its subject and none of its
-arguments (a shell command's program and verb, a single-file tool's file name), under Claude
-Code's tool names and core-agent's alike:
+arguments (a shell command's program and verb, a single-file tool's file name with its
+non-printing characters dropped and clipped to 80 bytes), under Claude Code's tool names and
+core-agent's alike:
 
 ```json
 {

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
@@ -424,6 +425,16 @@ const steerRefusalPublishTimeout = 5 * time.Second
 // WHICH one missed; the full text is already on the task's own `.in` subject,
 // so this is a pointer, not a second copy of the content.
 const steerEchoCap = 200
+
+// activityFileNameMaxBytes bounds the file name an activity title carries,
+// clip mark included; a longer one is cut on a rune boundary and ends in
+// activityFileNameClipMark. The title is one line in a chat card or console
+// step, and a name that long is a path the model made up, not one a reader
+// needs whole.
+const (
+	activityFileNameMaxBytes = 80
+	activityFileNameClipMark = "…"
+)
 
 // adapter is one task's run state.
 type adapter struct {
@@ -2760,8 +2771,11 @@ func activityTitle(tool string, input json.RawMessage) string {
 	str := func(k string) string { v, _ := args[k].(string); return strings.TrimSpace(v) }
 	title := tool
 	file := func(path string) {
-		if path != "" {
-			title = tool + " " + filepath.Base(path)
+		if path == "" {
+			return
+		}
+		if name := activityFileName(filepath.Base(path)); name != "" {
+			title = tool + " " + name
 		}
 	}
 	switch tool {
@@ -2780,6 +2794,31 @@ func activityTitle(tool string, input json.RawMessage) string {
 		file(str("path"))
 	}
 	return answerscrub.ScrubInline(title)
+}
+
+// activityFileName is a file's base name as an activity title carries it:
+// non-printing characters (line breaks, escape sequences, bidirectional
+// overrides, zero-width characters) dropped, secrets scrubbed, and the
+// result clipped to activityFileNameMaxBytes on a rune boundary. The
+// characters go first, so the scrubber sees a secret one of them split; the
+// scrub comes before the clip, so a cut can't leave part of a secret the
+// scrubber no longer recognises. Empty when nothing printable is left.
+func activityFileName(base string) string {
+	name := strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || !unicode.IsPrint(r) {
+			return -1
+		}
+		return r
+	}, base)
+	name = answerscrub.ScrubInline(name)
+	if len(name) <= activityFileNameMaxBytes {
+		return name
+	}
+	cut := activityFileNameMaxBytes - len(activityFileNameClipMark)
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut] + activityFileNameClipMark
 }
 
 // activityCallID is the shape of a call id the activity entry carries. The
