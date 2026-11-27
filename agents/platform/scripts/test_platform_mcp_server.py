@@ -401,6 +401,18 @@ class TestSwitchKubeContext(unittest.TestCase):
         self.mock_dns = dns.start()
         self.addCleanup(dns.stop)
 
+    def test_unsandboxed_the_kubeconfig_follows_the_shared_resolver(self):
+        # $KUBE_AGENTS_KUBECONFIG_DIR is the directory itself when set (#7462); unset, the
+        # directory is `$HERMES_HOME/.kubeconfigs` as before.
+        override = os.path.join(self.home, "scratch", ".kubeconfigs")
+        with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": override}):
+            path = platform_mcp_server._thread_kubeconfig_path("proj", "clust", "loc")
+        self.assertEqual(path, os.path.join(override, "kubeconfig_proj_clust_loc.yaml"))
+        self.assertTrue(os.path.isdir(override))
+        with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": ""}):
+            path = platform_mcp_server._thread_kubeconfig_path("proj", "clust", "loc")
+        self.assertEqual(path, os.path.join(self.home, ".kubeconfigs", "kubeconfig_proj_clust_loc.yaml"))
+
     @patch('platform_mcp_server.subprocess.run')
     def test_switch_kube_context_all_empty_noop(self, mock_run):
         err, env = switch_kube_context("", "", "")

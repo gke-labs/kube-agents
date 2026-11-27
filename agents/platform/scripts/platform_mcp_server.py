@@ -621,8 +621,11 @@ def _thread_kubeconfig_path(project_id: str, cluster_name: str, location: str) -
     if sandbox_exec.sandbox_enabled():
         directory = SANDBOX_KUBECONFIG_DIR
     else:
-        home = os.environ.get("HERMES_HOME", "/opt/data")
-        directory = os.path.join(home, ".kubeconfigs")
+        # The one resolver ($KUBE_AGENTS_KUBECONFIG_DIR when set, else
+        # `$HERMES_HOME/.kubeconfigs`), beside this file.
+        import credential_proxy_client  # noqa: PLC0415
+
+        directory = str(credential_proxy_client.kubeconfig_dir())
         os.makedirs(directory, exist_ok=True)
     slug = "_".join(
         _kubeconfig_slug(part) for part in (project_id, cluster_name, location)

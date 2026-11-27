@@ -50,6 +50,13 @@ const (
 	// fleetAuditScratchDirEnv is the fleet-audit scripts' working directory
 	// (agents/platform/skills/fleet-audit/scripts/audit_report.py).
 	fleetAuditScratchDirEnv = "FLEET_AUDIT_SCRATCH_DIR"
+	// kubeconfigDirEnv is the directory the fleet-audit collectors and the
+	// credential-proxy shim keep per-cluster kubeconfigs in
+	// (credential_proxy_client.kubeconfig_dir), in place of
+	// $HERMES_HOME/.kubeconfigs, which a profile worker can't create.
+	kubeconfigDirEnv = "KUBE_AGENTS_KUBECONFIG_DIR"
+	// profileWorkerKubeconfigDir is on the scratch mount; see its env entry.
+	profileWorkerKubeconfigDir = profileWorkerScratchPath + "/.kubeconfigs"
 
 	profileWorkerScratchVolume = "scratch"
 	profileWorkerScratchPath   = "/scratch"
@@ -140,6 +147,14 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		// after every task, which would remove a subdirectory too, and not
 		// every script path creates the directory before using it.
 		{Name: fleetAuditScratchDirEnv, Value: profileWorkerScratchPath},
+		// The per-cluster kubeconfigs the fleet-audit collectors fetch, whose
+		// default $HERMES_HOME/.kubeconfigs (/opt/data with HERMES_HOME
+		// unset) is on the read-only root here. A directory on the scratch
+		// mount, the one writable mount the worker empties after every task
+		// (resetWorkspace in a2a/worker-adapter/profile.go removes the
+		// mount's entries): the scripts recreate it, 0700, at each task, and
+		// no kubeconfig outlives the task that fetched it.
+		{Name: kubeconfigDirEnv, Value: profileWorkerKubeconfigDir},
 		// Children of a profile task go through the gateway, which a later
 		// change wires; until then the worker has no delegate tool.
 		{Name: "A2A_DELEGATE_TOOL", Value: "off"},

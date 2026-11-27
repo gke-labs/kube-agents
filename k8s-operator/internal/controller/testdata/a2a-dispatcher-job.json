@@ -211,6 +211,10 @@
                 "value": "/scratch"
               },
               {
+                "name": "KUBE_AGENTS_KUBECONFIG_DIR",
+                "value": "/scratch/.kubeconfigs"
+              },
+              {
                 "name": "A2A_DELEGATE_TOOL",
                 "value": "off"
               },

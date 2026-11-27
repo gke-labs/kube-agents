@@ -31,7 +31,8 @@ Inspects live GKE Standard clusters and non-system workloads to report:
 
 Workload reads page one resource kind at a time through `collector_run.paged_dump`
 (`kubectl get --raw` at `limit=500`) using a per-target kubeconfig under
-`${HERMES_HOME:-/opt/data}/.kubeconfigs/` (or an explicit `--kubeconfig`). Any failed
+`$KUBE_AGENTS_KUBECONFIG_DIR`, else `${HERMES_HOME:-/opt/data}/.kubeconfigs/`
+(or an explicit `--kubeconfig`). Any failed
 cluster or workload read is reported as `unknown` and sets exit code 1.
 """
 
@@ -67,6 +68,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
 
 import collector_run  # noqa: E402
 import fleet_scope_args  # noqa: E402
+import credential_proxy_client  # noqa: E402
 
 DEFAULT_TIMEOUT_SECONDS = 60
 PROJECTS_LIST_TIMEOUT_SECONDS = 240
@@ -76,14 +78,11 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 KUBECONFIG_REFUSED_RC = 1
 
-HERMES_HOME_ENV = "HERMES_HOME"
-DEFAULT_HERMES_HOME = "/opt/data"
-KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_ENV = "KUBECONFIG"
 KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
-DEFAULT_KUBECONFIG_DIR = (
-    Path(os.environ.get(HERMES_HOME_ENV) or DEFAULT_HERMES_HOME) / KUBECONFIG_SUBDIR
-)
+# `credential_proxy_client.kubeconfig_dir`, the one resolver, read once at
+# import: $KUBE_AGENTS_KUBECONFIG_DIR when set, else `$HERMES_HOME/.kubeconfigs`.
+DEFAULT_KUBECONFIG_DIR = credential_proxy_client.kubeconfig_dir()
 OUTPUT_TMP_PREFIX = ".autopilot-migration-scan-"
 OUTPUT_TMP_SUFFIX = ".tmp"
 

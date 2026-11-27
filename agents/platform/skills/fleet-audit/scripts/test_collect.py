@@ -17122,6 +17122,99 @@ class TestOnlyCluster(unittest.TestCase):
             collect.main(["compliance-audit", "--cluster", "us-east1/c2"])
 
 
+class KubeconfigDirOverrideTest(unittest.TestCase):
+    """$KUBE_AGENTS_KUBECONFIG_DIR (#7462): a profile worker has no HERMES_HOME and a read-only root,
+    so the operator names a directory on its scratch mount. Every fleet-audit collector resolves the
+    directory through `credential_proxy_client.kubeconfig_dir`, the one resolver; the directory is
+    made 0700 when missing, and the no-symlink rule holds for it."""
+
+    # The import-time constants and call-time resolvers, read in a fresh interpreter per case so the
+    # environment the module was imported under is the one under test.
+    PROBE = textwrap.dedent(
+        """
+        import json, sys
+        sys.path.insert(0, sys.argv[1])
+        import collect, fleet_stockout, fleet_waste, autopilot_migration_scan, upgrade_retrospective
+        import credential_proxy_client
+        print(json.dumps({
+            "resolver": str(credential_proxy_client.kubeconfig_dir()),
+            "collect.KUBECONFIG_DIR": str(collect.KUBECONFIG_DIR),
+            "fleet_stockout.KUBECONFIG_DIR": str(fleet_stockout.KUBECONFIG_DIR),
+            "fleet_waste.KUBECONFIG_DIR": str(fleet_waste.KUBECONFIG_DIR),
+            "autopilot_migration_scan.DEFAULT_KUBECONFIG_DIR": str(autopilot_migration_scan.DEFAULT_KUBECONFIG_DIR),
+            "upgrade_retrospective.kubeconfig_dir()": str(upgrade_retrospective.kubeconfig_dir()),
+        }))
+        """
+    )
+    CASES = (
+        ("unset", {}, "/opt/data/.kubeconfigs"),
+        ("empty", {"KUBE_AGENTS_KUBECONFIG_DIR": ""}, "/opt/data/.kubeconfigs"),
+        ("override", {"KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/.kubeconfigs"}, "/scratch/.kubeconfigs"),
+        ("home only", {"HERMES_HOME": "/home/h"}, "/home/h/.kubeconfigs"),
+        ("both", {"HERMES_HOME": "/home/h", "KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/k"}, "/scratch/k"),
+    )
+
+    def mode(self, path):
+        return path.stat().st_mode & collect.KUBECONFIG_DIR_MODE_MASK
+
+    def test_every_collector_resolves_the_directory_as_the_shim_does(self):
+        base = {k: v for k, v in os.environ.items() if k not in ("HERMES_HOME", "KUBE_AGENTS_KUBECONFIG_DIR")}
+        here = str(Path(__file__).resolve().parent)
+        for name, env, want in self.CASES:
+            with self.subTest(name):
+                out = subprocess.run(
+                    [sys.executable, "-c", self.PROBE, here],
+                    env={**base, **env, "PYTHONDONTWRITEBYTECODE": "1"},
+                    capture_output=True, text=True, timeout=120, check=False,
+                )
+                self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+                got = json.loads(out.stdout.strip().splitlines()[-1])
+                self.assertEqual(got, dict.fromkeys(got, want))
+
+    def test_a_missing_override_directory_is_made_0700_whatever_the_umask(self):
+        for umask in (0o022, 0o077, 0o000):
+            with self.subTest(umask=oct(umask)), TemporaryDirectory() as tmp:
+                directory = Path(tmp) / "scratch" / ".kubeconfigs"
+                kc = directory / "kubeconfig_p_c_l.yaml"
+                previous = os.umask(umask)
+                try:
+                    with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": str(directory)}):
+                        self.assertIsNone(collect.prepare_kubeconfig(kc))
+                finally:
+                    os.umask(previous)
+                self.assertEqual(self.mode(directory), 0o700)
+
+    def test_a_wider_override_directory_is_brought_to_0700(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp) / ".kubeconfigs"
+            directory.mkdir()
+            directory.chmod(0o755)
+            with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": str(directory)}):
+                self.assertIsNone(collect.usable_kubeconfig_dir(directory))
+            self.assertEqual(self.mode(directory), 0o700)
+
+    def test_without_the_override_the_shared_directory_keeps_0755(self):
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp) / ".kubeconfigs"
+            env = {k: v for k, v in os.environ.items() if k != "KUBE_AGENTS_KUBECONFIG_DIR"}
+            with patch.dict(os.environ, env, clear=True):
+                self.assertIsNone(collect.usable_kubeconfig_dir(directory))
+            self.assertEqual(self.mode(directory), collect.KUBECONFIG_DIR_MODE)
+
+    def test_a_symlinked_override_directory_is_refused_not_followed(self):
+        with TemporaryDirectory() as tmp:
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir(0o755)
+            directory = Path(tmp) / ".kubeconfigs"
+            directory.symlink_to(elsewhere)
+            kc = directory / "kubeconfig_p_c_l.yaml"
+            with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": str(directory)}):
+                for euid in (os.geteuid(), collect.ROOT_UID):
+                    with self.subTest(euid=euid), patch.object(os, "geteuid", return_value=euid):
+                        self.assertEqual(collect.prepare_kubeconfig(kc), collect.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory))
+            self.assertEqual((self.mode(elsewhere), directory.is_symlink(), list(elsewhere.iterdir())), (0o755, True, []))
+
+
 if __name__ == "__main__":
     unittest.main()
 

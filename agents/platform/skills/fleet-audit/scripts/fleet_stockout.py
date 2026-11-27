@@ -110,7 +110,6 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
 ]
 
-KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 # The rc a refused kubeconfig directory stands for in the credentials
 # result: gcloud was not run through it, and the note is the error.
 KUBECONFIG_REFUSED_RC = 1
@@ -346,6 +345,11 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+import credential_proxy_client  # noqa: E402
+# The per-cluster kubeconfig directory: `credential_proxy_client.kubeconfig_dir`,
+# the one resolver ($KUBE_AGENTS_KUBECONFIG_DIR when set, else
+# `$HERMES_HOME/.kubeconfigs`), read once at import.
+KUBECONFIG_DIR = credential_proxy_client.kubeconfig_dir()
 import logging_reads  # noqa: E402
 # The Config Connector read that `main` adds to the manifest: this stream's
 # `manifest` fixes can edit Config Connector declarations, and `finish` says so

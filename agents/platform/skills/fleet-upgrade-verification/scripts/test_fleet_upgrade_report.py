@@ -1257,6 +1257,50 @@ def owned_by(path, uid):
         yield
 
 
+class KubeconfigDirOverrideTest(unittest.TestCase):
+    """$KUBE_AGENTS_KUBECONFIG_DIR (#7462): the default directory is the one
+    `credential_proxy_client.kubeconfig_dir` resolves, made 0700 when the override names it, and a
+    symlink there is refused as at `$HERMES_HOME/.kubeconfigs`."""
+
+    CASES = (
+        ("unset", {}, "/opt/data/.kubeconfigs"),
+        ("empty", {"KUBE_AGENTS_KUBECONFIG_DIR": ""}, "/opt/data/.kubeconfigs"),
+        ("override", {"KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/.kubeconfigs"}, "/scratch/.kubeconfigs"),
+        ("home only", {"HERMES_HOME": "/home/h"}, "/home/h/.kubeconfigs"),
+        ("both", {"HERMES_HOME": "/home/h", "KUBE_AGENTS_KUBECONFIG_DIR": "/scratch/k"}, "/scratch/k"),
+    )
+
+    def test_the_default_directory_is_the_shims(self):
+        for name, env, want in self.CASES:
+            with self.subTest(name), patch.dict(os.environ, env, clear=True):
+                self.assertEqual((report.default_kubeconfig_dir(), str(credential_proxy_client.kubeconfig_dir())), (want, want))
+
+    def test_a_missing_override_directory_is_made_0700_whatever_the_umask(self):
+        for umask in (0o022, 0o077, 0o000):
+            with self.subTest(umask=oct(umask)), tempfile.TemporaryDirectory() as tmp:
+                directory = os.path.join(tmp, "scratch", ".kubeconfigs")
+                previous = os.umask(umask)
+                try:
+                    with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": directory}):
+                        shared = report.default_kubeconfig_dir()
+                        self.assertIsNone(report.prepare_kubeconfig(shared, report.kubeconfig_path(shared, "p1", "c", "l")))
+                finally:
+                    os.umask(previous)
+                self.assertEqual((shared, os.stat(directory).st_mode & report.KUBECONFIG_DIR_MODE_MASK), (directory, 0o700))
+
+    def test_a_symlinked_override_directory_is_refused_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            elsewhere = os.path.join(tmp, "elsewhere")
+            os.mkdir(elsewhere, 0o755)
+            directory = os.path.join(tmp, ".kubeconfigs")
+            os.symlink(elsewhere, directory)
+            with patch.dict(os.environ, {"KUBE_AGENTS_KUBECONFIG_DIR": directory}):
+                shared = report.default_kubeconfig_dir()
+                note = report.prepare_kubeconfig(shared, report.kubeconfig_path(shared, "p1", "c", "l"))
+            self.assertEqual(note, report.KUBECONFIG_IS_SYMLINK_FORMAT.format(directory=directory))
+            self.assertEqual((os.stat(elsewhere).st_mode & 0o7777, os.listdir(elsewhere)), (0o755, []))
+
+
 class PrepareKubeconfigTest(unittest.TestCase):
     def test_the_default_directory_is_shared_and_a_named_one_keeps_the_umask(self):
         # The default `$HERMES_HOME/.kubeconfigs` follows the fleet-audit collectors' rule: sticky and

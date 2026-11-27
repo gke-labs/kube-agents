@@ -110,6 +110,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import credential_proxy_client  # noqa: E402
 
 # The JSON reads page through `kubectl get --raw`, one kind at a time
 # (collector_run.paged_dump), so a list the credential proxy would cut at its
@@ -287,7 +288,8 @@ VERSION_PAIR_SEPARATOR = " / "
 # per-target kubeconfig, passed to every command as KUBECONFIG in the subprocess
 # environment rather than through a flag,
 # because the gcloud and kubectl in the agent pod are credential-proxy shims that forward
-# that variable. The directory is `$HERMES_HOME/.kubeconfigs`, the platform AGENTS.md
+# that variable. The directory is `$HERMES_HOME/.kubeconfigs` (or $KUBE_AGENTS_KUBECONFIG_DIR
+# when set, `credential_proxy_client.kubeconfig_dir`), the platform AGENTS.md
 # convention, and the file name mirrors `_thread_kubeconfig_path` in
 # scripts/platform_mcp_server.py: one file per target, so concurrent reads of different
 # clusters never race on one current-context; the proxy refuses a path outside its
@@ -411,8 +413,6 @@ WHERE_SEPARATOR = " "
 WHERE_NOTHING = "the run"
 KUBECONFIG_ENV = "KUBECONFIG"
 HERMES_HOME_ENV = "HERMES_HOME"
-DEFAULT_HERMES_HOME = "/opt/data"
-KUBECONFIG_SUBDIR = ".kubeconfigs"
 KUBECONFIG_FILE_FORMAT = "kubeconfig_{project}_{cluster}_{location}.yaml"
 # The default, shared directory is this uid's and closed to every other uid
 # (0755), the rule the fleet-audit collectors' `collect.prepare_kubeconfig`
@@ -928,8 +928,9 @@ def grade_member(cluster: dict, project: str, explicit_target: str | None, cache
 
 
 def default_kubeconfig_dir() -> str:
-    """`$HERMES_HOME/.kubeconfigs`, resolved at run time so the environment decides."""
-    return os.path.join(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME), KUBECONFIG_SUBDIR)
+    """`credential_proxy_client.kubeconfig_dir`, the one resolver, at run time so the
+    environment decides: $KUBE_AGENTS_KUBECONFIG_DIR when set, else `$HERMES_HOME/.kubeconfigs`."""
+    return str(credential_proxy_client.kubeconfig_dir())
 
 
 def _kubeconfig_slug(value) -> str:
@@ -1006,6 +1007,10 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
         except OSError as exc:
             return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
     else:
+        # The directory $KUBE_AGENTS_KUBECONFIG_DIR names is this uid's alone (a
+        # profile worker's scratch mount, #7462): 0700, as collect.kubeconfig_dir_mode
+        # holds it. The shared `$HERMES_HOME/.kubeconfigs` keeps KUBECONFIG_DIR_MODE.
+        wanted = credential_proxy_client.KUBECONFIG_OVERRIDE_DIR_MODE if credential_proxy_client.kubeconfig_dir_override() is not None else KUBECONFIG_DIR_MODE
         euid = os.geteuid()
         if os.path.islink(kubeconfig_dir):
             # Never followed, as the shared rule reads it: a root run would
@@ -1045,22 +1050,22 @@ def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
                 current = os.stat(kubeconfig_dir)
             except OSError as exc:
                 return KUBECONFIG_NOT_MADE_FORMAT.format(directory=kubeconfig_dir, error=exc)
-        if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != KUBECONFIG_DIR_MODE:
+        if (current.st_mode & KUBECONFIG_DIR_MODE_MASK) != wanted:
             # Through a descriptor opened without following, as the shared rule.
             try:
                 opened = os.open(kubeconfig_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             except OSError as exc:
                 return KUBECONFIG_NOT_READ_FORMAT.format(directory=kubeconfig_dir, error=exc)
             try:
-                os.fchmod(opened, KUBECONFIG_DIR_MODE)
+                os.fchmod(opened, wanted)
             except OSError as exc:
                 # Judged on the directory the descriptor holds, as the shared rule.
                 actual = os.fstat(opened)
                 mode = actual.st_mode & KUBECONFIG_DIR_MODE_MASK
                 private = actual.st_uid == euid and (mode & KUBECONFIG_DIR_OWNER_WRITE_SEARCH) == KUBECONFIG_DIR_OWNER_WRITE_SEARCH and not mode & KUBECONFIG_DIR_OTHERS_WRITE
                 if not private:
-                    return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc)
-                print(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(KUBECONFIG_DIR_MODE), error=exc), file=sys.stderr)
+                    return KUBECONFIG_MODE_NOT_CHANGED_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(wanted), error=exc)
+                print(KUBECONFIG_MODE_KEPT_FORMAT.format(directory=kubeconfig_dir, mode=oct(mode), wanted=oct(wanted), error=exc), file=sys.stderr)
             finally:
                 os.close(opened)
     try:
@@ -1947,7 +1952,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own; three gcloud list reads per project (backend services, instances, operations) and the server config per location feed them, one `clusters describe` and one `operations list` for the cluster confirm a member listed not RUNNING with no RUNNING operation, and the add-on inventory follows the readiness table.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument(READINESS_EXCLUDED_FLAG, default=None, help="project/location/cluster entries, space- or comma-separated, whose versions are graded but whose in-cluster readiness reads are skipped: the clusters spec.scope.exclude.clusters keeps the agents out of. Only with --readiness.")
-    parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
+    parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $KUBE_AGENTS_KUBECONFIG_DIR, else $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     global readiness_excluded
