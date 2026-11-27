@@ -1369,8 +1369,12 @@ class BrokerReportStore(str):
         self._streams = None
 
     def write_run_start(self, audit_id: str, repo: str, run_id: str, data: bytes) -> None:
-        """PUT one run-start record (`runs/started-<run id>`). Not seeded first:
-        the seed copies the ring and latest, and a record is neither."""
+        """PUT one run-start record (`runs/started-<run id>`). Seeded first, as
+        every other touch is: `start` writes its record before anything else
+        reaches the broker, and the listener takes a record only into a store
+        that exists, so on the first run after the switch only the seed has
+        made it."""
+        self._maybe_seed(audit_id, repo)
         self._request("PUT", self._stream_path(audit_id, repo, "runs", self._run_start_name(run_id)), data)
         self._streams = None
 

@@ -1112,6 +1112,18 @@ class TestSeed(BrokerTestCase):
         self.assertEqual(self.envelope(5), self.broker.stream(AUDIT, KEY)["latest"])
         self.assertIn("seeded compliance-audit in acme/fleet into the broker", err.getvalue())
 
+    def test_a_run_start_record_seeds_first(self):
+        """`start` writes its run-start record before anything else touches the
+        broker, so on the first run after the switch the record seeds the local
+        history in first; otherwise the listener has no store for it yet and the
+        run goes untracked (#6812)."""
+        self.plant_local()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.record_run_start(AUDIT, REPO, "task-1", True, NOW + timedelta(minutes=5))
+        self.assertIn("seeded compliance-audit in acme/fleet into the broker", err.getvalue())
+        self.assertEqual({"task-1"}, set(self.broker.stream(AUDIT, KEY)["starts"]))
+        self.assertEqual("task-1", report_status.unfinished_run_of(self.store(str(self.local)), AUDIT, REPO)["run_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
