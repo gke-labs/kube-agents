@@ -46,10 +46,12 @@ const (
 	defaultRecurrenceFloor       = 2
 	cliOpTimeout                 = 30 * time.Second
 	indexOpTimeout               = 60 * time.Second
+	dreamOpTimeout               = 90 * time.Second
 	overseerTimeout              = 15 * time.Second
 	maxCheckFileBytes            = 4 << 20
 	statusReadHeaderTimeout      = 5 * time.Second
 	exitCodeBlocked              = 2
+	exitCodeNoResponders         = 2
 )
 
 const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator and Dreamer for kube-agents
@@ -859,22 +861,70 @@ func runDream(args []string) error {
 	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	threshold := fs.Int("recurrence-threshold", defaultRecurrenceFloor, "clusters required to graduate a lesson to a fleet-wide decision")
+	localOnly := fs.Bool("local", false, "run dream locally against --repo without calling the Curator daemon over NATS")
+	natsOnly := fs.Bool("nats-only", false, "require the Curator daemon over NATS and do not fall back to local --repo")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), indexOpTimeout)
+	if *localOnly && *natsOnly {
+		return errors.New("--local and --nats-only cannot both be set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dreamOpTimeout)
 	defer cancel()
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	var client *lib.Client
+	defer func() {
+		if client != nil {
+			client.Close()
+		}
+	}()
+	if !*localOnly && (os.Getenv("NATS_URL") != "" || *natsOnly) && (strings.TrimSpace(*repoID) != "" || *natsOnly) {
+		c, cErr := connectNATS(ctx, "dream", log)
+		if cErr == nil {
+			client = c
+			resp, dErr := memory.DreamViaNATS(ctx, client, memory.MemoryQueryRequest{
+				Schema: memory.MemoryQuerySchema,
+				Action: "dream",
+				Bank:   *bank,
+				Repo:   strings.TrimSpace(*repoID),
+			})
+			if dErr == nil {
+				report := memory.DreamReport{
+					Repo:           strings.TrimSpace(*repoID),
+					Revision:       resp.Revision,
+					VerifiedActive: []string{},
+					Upserted:       resp.Upserted,
+					Deleted:        resp.Deleted,
+					Silent:         true,
+				}
+				if resp.Dream != nil {
+					report = *resp.Dream
+				}
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(report)
+			}
+			if errors.Is(dErr, nats.ErrNoResponders) {
+				if *natsOnly {
+					fmt.Fprintln(os.Stderr, "curator dream: no responders")
+					return &exitCodeError{code: exitCodeNoResponders}
+				}
+			} else {
+				return dErr
+			}
+		} else if *natsOnly {
+			return cErr
+		}
+	}
 
 	var hs *memory.HindsightClient
 	if *hsURL != "" {
 		hs = memory.NewHindsightClient(*hsURL, *bank)
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	var client *lib.Client
-	if os.Getenv("NATS_URL") != "" {
+	if client == nil && !*localOnly && os.Getenv("NATS_URL") != "" {
 		if c, err := connectNATS(ctx, "dream", log); err == nil {
 			client = c
-			defer client.Close()
 		}
 	}
 	cur, err := memory.NewCurator(memory.CuratorConfig{

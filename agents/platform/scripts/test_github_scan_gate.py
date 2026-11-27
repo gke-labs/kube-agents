@@ -5351,5 +5351,343 @@ class RepoMemorySweepTest(unittest.TestCase):
             self.assertEqual(emit_cmd[emit_cmd.index("--repo") + 1], "acme/gitops")
 
 
+class TestSweepMemoryDream(unittest.TestCase):
+    """Test `sweep_memory_dream` scheduling, backoff, dedup, and chat delivery."""
+
+    def _clean_report(self, repo: str = "acme/gitops", revision: str = "rev-1") -> dict:
+        return {
+            "repo": repo,
+            "revision": revision,
+            "verified_active": ["DEC-2026-001"],
+            "demoted_drifted": [],
+            "obsolete": [],
+            "supersession_issues": [],
+            "conflicts": [],
+            "graduated_decisions": [],
+            "upserted": [],
+            "deleted": [],
+            "silent": True,
+        }
+
+    def _findings_report(self, repo: str = "acme/gitops", revision: str = "rev-2") -> dict:
+        return {
+            "repo": repo,
+            "revision": revision,
+            "verified_active": ["DEC-2026-001"],
+            "demoted_drifted": ["LES-2026-002"],
+            "obsolete": [{"id": "LES-2026-003", "reason": "no file matches its scope paths"}],
+            "supersession_issues": [
+                {"id": "LES-2026-001", "superseded_by": "DEC-2026-005", "current_status": "active"}
+            ],
+            "conflicts": [
+                {
+                    "file": "clusters/*/app.yaml",
+                    "path": "spec.replicas",
+                    "record_ids": ["DEC-2026-001", "DEC-2026-002"],
+                }
+            ],
+            "graduated_decisions": ["DEC-2026-009"],
+            "upserted": [],
+            "deleted": [],
+            "silent": False,
+        }
+
+    def test_registered_after_repo_memory(self):
+        order = list(gate.SWEEP_ORDER)
+        self.assertIn("memory_dream", order)
+        self.assertEqual(order.index("memory_dream"), order.index("repo_memory") + 1)
+
+    def test_noop_when_disabled_or_missing_prereqs(self):
+        with tempfile.TemporaryDirectory() as td:
+            # Disabled by DECISION_MEMORY_DREAM=false.
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "PLATFORM_AGENT_HOME": td,
+                    "NATS_URL": "nats://localhost:4222",
+                    "DECISION_MEMORY_DREAM": "false",
+                },
+                clear=True,
+            ), mock.patch.object(
+                gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"
+            ), mock.patch("subprocess.run") as mock_run:
+                res = gate.sweep_memory_dream()
+            self.assertEqual(res, gate.SweepResult())
+            mock_run.assert_not_called()
+
+            # Missing curator binary.
+            with mock.patch.dict(
+                "os.environ",
+                {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                clear=True,
+            ), mock.patch.object(
+                gate, "_resolve_curator_bin", return_value=""
+            ), mock.patch("subprocess.run") as mock_run:
+                res = gate.sweep_memory_dream()
+            self.assertEqual(res, gate.SweepResult())
+            mock_run.assert_not_called()
+
+            # Missing NATS_URL.
+            with mock.patch.dict(
+                "os.environ", {"PLATFORM_AGENT_HOME": td}, clear=True
+            ), mock.patch.object(
+                gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"
+            ), mock.patch("subprocess.run") as mock_run:
+                res = gate.sweep_memory_dream()
+            self.assertEqual(res, gate.SweepResult())
+            mock_run.assert_not_called()
+
+    def test_no_responders_backoff_suppresses_repeat_spawns_for_one_hour(self):
+        t0 = datetime(2026, 11, 27, 10, 0, tzinfo=timezone.utc)
+        t_within = datetime(2026, 11, 27, 10, 30, tzinfo=timezone.utc)
+        t_after = datetime(2026, 11, 27, 11, 1, tzinfo=timezone.utc)
+
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if len(calls) == 1:
+                return _completed("", returncode=2, stderr="nats: no responders available for request")
+            return _completed(json.dumps(self._clean_report()))
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+             mock.patch("chat_platforms.enabled_chat_platforms", return_value=["google_chat"]) as mock_chat, \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            res1 = gate.sweep_memory_dream(now=t0)
+            self.assertEqual(res1, gate.SweepResult())
+            self.assertEqual(len(calls), 1)
+            mock_chat.assert_not_called()
+
+            # Within 1-hour backoff: zero subprocesses spawned.
+            res2 = gate.sweep_memory_dream(now=t_within)
+            self.assertEqual(res2, gate.SweepResult())
+            self.assertEqual(len(calls), 1)
+
+            # After 1-hour backoff expires: curator dream runs and clears backoff key.
+            res3 = gate.sweep_memory_dream(now=t_after)
+            self.assertEqual(res3, gate.SweepResult())
+            self.assertEqual(len(calls), 2)
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+        self.assertNotIn("dream_no_responders_at", saved)
+        self.assertEqual(saved["repos"]["acme/gitops"]["dream"]["last_dream_at"], "2026-11-27T11:01:00Z")
+
+    def test_interval_gating_and_deterministic_ordering_for_managed_repos_only(self):
+        t0 = datetime(2026, 11, 27, 0, 0, tzinfo=timezone.utc)
+        t_plus_10m = datetime(2026, 11, 27, 0, 10, tzinfo=timezone.utc)
+        t_plus_20m = datetime(2026, 11, 27, 0, 20, tzinfo=timezone.utc)
+        t_plus_24h = datetime(2026, 11, 28, 0, 0, tzinfo=timezone.utc)
+
+        dreamed_repos = []
+
+        def fake_run(cmd, **kw):
+            repo = cmd[cmd.index("--repo-id") + 1]
+            dreamed_repos.append(repo)
+            self.assertEqual(cmd, ["/usr/local/bin/curator", "dream", "--repo-id", repo, "--nats-only"])
+            return _completed(json.dumps(self._clean_report(repo=repo)))
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/repo-a", "acme/repo-b"]), \
+             mock.patch(
+                 "gitops_workspace.get_context_repo_specs",
+                 side_effect=AssertionError("context repos must not be dreamed"),
+             ), \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            # Tick 1: processes only repo-a (MAX_DREAM_REPOS_PER_TICK=1).
+            gate.sweep_memory_dream(now=t0)
+            self.assertEqual(dreamed_repos, ["acme/repo-a"])
+
+            # Tick 2 (+10m): repo-a is not due, so never-dreamed repo-b runs next.
+            gate.sweep_memory_dream(now=t_plus_10m)
+            self.assertEqual(dreamed_repos, ["acme/repo-a", "acme/repo-b"])
+
+            # Tick 3 (+20m): neither repo is due yet.
+            gate.sweep_memory_dream(now=t_plus_20m)
+            self.assertEqual(dreamed_repos, ["acme/repo-a", "acme/repo-b"])
+
+            # Tick 4 (+24h): repo-a (oldest last_dream_at) is due again first.
+            gate.sweep_memory_dream(now=t_plus_24h)
+            self.assertEqual(dreamed_repos, ["acme/repo-a", "acme/repo-b", "acme/repo-a"])
+
+        # Verify interval parsing clamps to [1, 168] and falls back to 24 on invalid input.
+        for raw, expected in (("", 24), ("bad", 24), ("0", 1), ("-5", 1), ("999", 168), ("12", 12)):
+            with mock.patch.dict(
+                "os.environ",
+                {"DECISION_MEMORY_DREAM_INTERVAL_HOURS": raw},
+                clear=True,
+            ):
+                self.assertEqual(gate._dream_interval_hours(), expected)
+
+    def test_silent_when_clean_posts_no_chat_messages(self):
+        t0 = datetime(2026, 11, 27, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+             mock.patch("chat_platforms.enabled_chat_platforms", return_value=["google_chat"]) as mock_chat, \
+             mock.patch("subprocess.run", return_value=_completed(json.dumps(self._clean_report()))) as mock_run:
+            res = gate.sweep_memory_dream(now=t0)
+            saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+        self.assertEqual(res, gate.SweepResult())
+        self.assertEqual(mock_run.call_count, 1)
+        mock_chat.assert_not_called()
+        self.assertEqual(saved["repos"]["acme/gitops"]["dream"]["last_report_hash"], "")
+
+    def test_findings_post_diary_and_handle_outcome_unknown_and_kept(self):
+        t0 = datetime(2026, 11, 27, 2, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 11, 28, 2, 0, tzinfo=timezone.utc)
+        report = self._findings_report()
+
+        for exit_code in (0, gate.chat_notify.NOTIFY_OUTCOME_UNKNOWN, gate.chat_notify.NOTIFY_KEPT):
+            with self.subTest(notify_exit=exit_code):
+                posted_messages = []
+
+                def fake_run(cmd, **kw):
+                    if cmd[0] == "/usr/local/bin/curator":
+                        return _completed(json.dumps(report))
+                    posted_messages.append(list(cmd))
+                    if exit_code != 0:
+                        raise subprocess.CalledProcessError(exit_code, cmd)
+                    return _completed("{}")
+
+                with tempfile.TemporaryDirectory() as td, \
+                     mock.patch.dict(
+                         "os.environ",
+                         {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                         clear=True,
+                     ), \
+                     mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                     mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+                     mock.patch("chat_platforms.enabled_chat_platforms", return_value=["google_chat"]), \
+                     mock.patch("chat_notify.command", side_effect=lambda p, m, json_output=False: ["notify", p, m]), \
+                     mock.patch("chat_notify.subprocess_timeout", return_value=30), \
+                     mock.patch("subprocess.run", side_effect=fake_run):
+                    res = gate.sweep_memory_dream(now=t0)
+                    saved = json.loads((Path(td) / "memory" / "repo_scan_state.json").read_text())
+
+                    # Second run 24h later with exact same findings and revision must NOT re-post.
+                    gate.sweep_memory_dream(now=t1)
+
+                self.assertEqual(res, gate.SweepResult())
+                self.assertEqual(len(posted_messages), 1)
+                body = posted_messages[0][2]
+                self.assertIn("acme/gitops", body)
+                self.assertIn("LES-2026-002", body)
+                self.assertIn("LES-2026-003", body)
+                self.assertIn("LES-2026-001", body)
+                self.assertIn("DEC-2026-005", body)
+                self.assertIn("clusters/*/app.yaml:spec.replicas", body)
+                self.assertIn("DEC-2026-009", body)
+                self.assertTrue(saved["repos"]["acme/gitops"]["dream"]["last_report_hash"])
+                self.assertEqual(
+                    saved["repos"]["acme/gitops"]["dream"]["last_notified_at"],
+                    "2026-11-27T02:00:00Z",
+                )
+
+    def test_dedup_reposts_when_revision_or_findings_change(self):
+        t0 = datetime(2026, 11, 27, 2, 0, tzinfo=timezone.utc)
+        t1 = datetime(2026, 11, 28, 2, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 11, 29, 2, 0, tzinfo=timezone.utc)
+        reports = [
+            self._findings_report(revision="rev-2"),
+            self._findings_report(revision="rev-3"),
+            {**self._findings_report(revision="rev-3"), "demoted_drifted": ["LES-2026-002", "LES-2026-008"]},
+        ]
+        posted = []
+        idx = [0]
+
+        def fake_run(cmd, **kw):
+            if cmd[0] == "/usr/local/bin/curator":
+                rep = reports[idx[0]]
+                idx[0] += 1
+                return _completed(json.dumps(rep))
+            posted.append(cmd[2])
+            return _completed("{}")
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+             mock.patch("chat_platforms.enabled_chat_platforms", return_value=["slack"]), \
+             mock.patch("chat_notify.command", side_effect=lambda p, m, json_output=False: ["notify", p, m]), \
+             mock.patch("chat_notify.subprocess_timeout", return_value=30), \
+             mock.patch("subprocess.run", side_effect=fake_run):
+            gate.sweep_memory_dream(now=t0)
+            gate.sweep_memory_dream(now=t1)
+            gate.sweep_memory_dream(now=t2)
+
+        self.assertEqual(len(posted), 3)
+        self.assertIn("LES-2026-008", posted[2])
+
+    def test_dry_run_spawns_nothing_notifies_nothing_writes_nothing(self):
+        t0 = datetime(2026, 11, 27, 2, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(
+                 "os.environ",
+                 {"PLATFORM_AGENT_HOME": td, "NATS_URL": "nats://localhost:4222"},
+                 clear=True,
+             ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/gitops"]), \
+             mock.patch("chat_platforms.enabled_chat_platforms") as mock_chat, \
+             mock.patch("subprocess.run") as mock_run:
+            res = gate.sweep_memory_dream(dry_run=True, now=t0)
+            state_exists = (Path(td) / "memory" / "repo_scan_state.json").exists()
+
+        self.assertEqual(res, gate.SweepResult())
+        mock_run.assert_not_called()
+        mock_chat.assert_not_called()
+        self.assertFalse(state_exists)
+
+    def test_diary_sanitizes_control_chars_and_bounds_long_lists(self):
+        report = {
+            "repo": "acme/gitops\nFAKE_HEADER",
+            "revision": "abc123\r\ninjected",
+            "demoted_drifted": [f"LES-2026-00{i}\n" for i in range(1, 8)],
+            "obsolete": [{"id": "LES-2026-099\x00\x1b[31m", "reason": "UNTRUSTED PROSE DO NOT ECHO"}],
+            "supersession_issues": [],
+            "conflicts": [
+                {
+                    "file": "clusters/a.yaml\n**alert**",
+                    "path": "spec.replicas\t`evil`",
+                    "record_ids": ["DEC-1\r", "DEC-2"],
+                }
+            ],
+            "graduated_decisions": [],
+            "silent": False,
+        }
+        diary = gate._format_dream_diary("acme/gitops\nFAKE_HEADER", report)
+        lines = diary.splitlines()
+        self.assertLessEqual(len(lines), 10)
+        self.assertNotIn("UNTRUSTED PROSE DO NOT ECHO", diary)
+        self.assertNotIn("\x00", diary)
+        self.assertNotIn("\x1b", diary)
+        self.assertIn("(+2 more)", diary)
+        self.assertIn("`acme/gitops FAKE_HEADER`", lines[0])
+        self.assertIn("`clusters/a.yaml **alert**:spec.replicas evil`", diary)
+
+
 if __name__ == "__main__":
     unittest.main()

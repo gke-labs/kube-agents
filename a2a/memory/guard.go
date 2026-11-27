@@ -495,6 +495,64 @@ func EvaluateGuard(exp GuardExpect, files map[string]string, scopeResources []st
 	return results
 }
 
+// GuardPassesOnFiles checks whether a guard passes on an in-memory map of repository files.
+func GuardPassesOnFiles(files map[string]string, g *RecordGuard, scopeResources []string) bool {
+	if g == nil || g.Expect == nil {
+		return false
+	}
+	exp := *g.Expect
+	if exp.File == "" || exp.Path == "" || !isValidOp(exp.Op) {
+		return false
+	}
+	matched := map[string]string{}
+	for k, content := range files {
+		slashRel := filepath.ToSlash(k)
+		if MatchGlob(exp.File, slashRel) {
+			matched[slashRel] = content
+		}
+	}
+	if len(matched) == 0 {
+		return false
+	}
+	res := EvaluateGuard(exp, matched, scopeResources)
+	if len(res) == 0 {
+		return false
+	}
+	for _, r := range res {
+		if !r.OK {
+			return false
+		}
+	}
+	return true
+}
+
+// ScopePathsExist reports whether at least one file in allFiles matches any glob in paths.
+func ScopePathsExist(allFiles []string, paths []string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	hasPattern := false
+	for _, p := range paths {
+		if strings.TrimSpace(p) != "" {
+			hasPattern = true
+			break
+		}
+	}
+	if !hasPattern {
+		return true
+	}
+	for _, f := range allFiles {
+		slashFile := filepath.ToSlash(f)
+		for _, p := range paths {
+			p = strings.TrimSpace(p)
+			if p != "" && MatchGlob(p, slashFile) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // GuardPassesOnHead verifies that a candidate guard passes on the current worktree in repoDir.
 func GuardPassesOnHead(repoDir string, g *RecordGuard, scopeResources []string) bool {
 	if g == nil || g.Expect == nil {
@@ -533,19 +591,7 @@ func GuardPassesOnHead(repoDir string, g *RecordGuard, scopeResources []string) 
 		}
 		return nil
 	})
-	if len(matched) == 0 {
-		return false
-	}
-	res := EvaluateGuard(exp, matched, scopeResources)
-	if len(res) == 0 {
-		return false
-	}
-	for _, r := range res {
-		if !r.OK {
-			return false
-		}
-	}
-	return true
+	return GuardPassesOnFiles(matched, g, scopeResources)
 }
 
 func isFleetWideClusterScope(clusters []string) bool {

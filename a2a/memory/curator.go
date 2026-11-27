@@ -61,6 +61,8 @@ const (
 	defaultMaxQueryResults     = 8
 	queryHandlerTimeout        = 30 * time.Second
 	indexHandlerTimeout        = 60 * time.Second
+	dreamHandlerTimeout        = 90 * time.Second
+	maxDreamTarEntries         = 50000
 	defaultRequestReplyTimeout = 10 * time.Second
 	hindsightRecallTimeout     = 4 * time.Second
 	stateSnapshotFile          = "decisions_state.json"
@@ -632,32 +634,57 @@ func (c *Curator) handleCuratorOutcomeMsg(ctx context.Context, msg *nats.Msg, ex
 		Action string `json:"action"`
 		Kind   string `json:"kind"`
 	}
-	if json.Unmarshal(msg.Data, &actionPeek) == nil &&
-		strings.EqualFold(strings.TrimSpace(actionPeek.Action), "index") &&
-		actionPeek.Kind != string(lib.KindTopicUpdate) {
-		var idxReq MemoryQueryRequest
-		if err := json.Unmarshal(msg.Data, &idxReq); err != nil {
+	if json.Unmarshal(msg.Data, &actionPeek) == nil && actionPeek.Kind != string(lib.KindTopicUpdate) {
+		switch strings.ToLower(strings.TrimSpace(actionPeek.Action)) {
+		case "index":
+			var idxReq MemoryQueryRequest
+			if err := json.Unmarshal(msg.Data, &idxReq); err != nil {
+				if msg.Reply != "" {
+					raw, _ := json.Marshal(MemoryQueryResponse{
+						Schema: MemoryQueryReplySchema,
+						Error:  fmt.Sprintf("invalid index request: %v", err),
+					})
+					_ = msg.Respond(raw)
+				}
+				return
+			}
+			if idxReq.CorrelationID == "" && msg.Header != nil {
+				idxReq.CorrelationID = strings.TrimSpace(msg.Header.Get("Nats-Correlation-Id"))
+			}
+			idxCtx, cancel := context.WithTimeout(ctx, indexHandlerTimeout)
+			defer cancel()
+			resp := c.IndexRepo(idxCtx, idxReq)
 			if msg.Reply != "" {
-				raw, _ := json.Marshal(MemoryQueryResponse{
-					Schema: MemoryQueryReplySchema,
-					Error:  fmt.Sprintf("invalid index request: %v", err),
-				})
-				_ = msg.Respond(raw)
+				if raw, mErr := json.Marshal(resp); mErr == nil {
+					_ = msg.Respond(raw)
+				}
+			}
+			return
+		case "dream":
+			var dreamReq MemoryQueryRequest
+			if err := json.Unmarshal(msg.Data, &dreamReq); err != nil {
+				if msg.Reply != "" {
+					raw, _ := json.Marshal(MemoryQueryResponse{
+						Schema: MemoryQueryReplySchema,
+						Error:  fmt.Sprintf("invalid dream request: %v", err),
+					})
+					_ = msg.Respond(raw)
+				}
+				return
+			}
+			if dreamReq.CorrelationID == "" && msg.Header != nil {
+				dreamReq.CorrelationID = strings.TrimSpace(msg.Header.Get("Nats-Correlation-Id"))
+			}
+			dreamCtx, cancel := context.WithTimeout(ctx, dreamHandlerTimeout)
+			defer cancel()
+			resp := c.HandleDream(dreamCtx, dreamReq)
+			if msg.Reply != "" {
+				if raw, mErr := json.Marshal(resp); mErr == nil {
+					_ = msg.Respond(raw)
+				}
 			}
 			return
 		}
-		if idxReq.CorrelationID == "" && msg.Header != nil {
-			idxReq.CorrelationID = strings.TrimSpace(msg.Header.Get("Nats-Correlation-Id"))
-		}
-		idxCtx, cancel := context.WithTimeout(ctx, indexHandlerTimeout)
-		defer cancel()
-		resp := c.IndexRepo(idxCtx, idxReq)
-		if msg.Reply != "" {
-			if raw, mErr := json.Marshal(resp); mErr == nil {
-				_ = msg.Respond(raw)
-			}
-		}
-		return
 	}
 	var ev OutcomeEvent
 	var corrID string
@@ -1208,41 +1235,49 @@ func (c *Curator) syncVerifiedSnapshotFromBrokerLocked(ctx context.Context, repo
 	return err
 }
 
-func (c *Curator) syncVerifiedSnapshotWithRevisionLocked(ctx context.Context, repoID string) (string, error) {
+func (c *Curator) prepareBrokerSnapshotClient() (endpoint, bearerToken string, httpClient *http.Client, err error) {
 	rawURL := strings.TrimSpace(c.cfg.BrokerURL)
-	cleanRepo := strings.TrimSpace(repoID)
-	if rawURL == "" || cleanRepo == "" {
-		return "", nil
-	}
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-		return "", fmt.Errorf("invalid broker URL %q", rawURL)
+		return "", "", nil, fmt.Errorf("invalid broker URL %q", rawURL)
 	}
-	endpoint := u.Scheme + "://" + u.Host + brokerSnapshotPath
+	endpoint = u.Scheme + "://" + u.Host + brokerSnapshotPath
 
-	var bearerToken string
 	if tf := strings.TrimSpace(c.cfg.BrokerTokenFile); tf != "" {
 		cleanTF := filepath.Clean(tf)
 		tokRoot, rErr := os.OpenRoot(filepath.Dir(cleanTF))
 		if rErr != nil {
-			return "", rErr
+			return "", "", nil, rErr
 		}
 		tokBytes, readErr := tokRoot.ReadFile(filepath.Base(cleanTF))
 		_ = tokRoot.Close()
 		if readErr != nil {
-			return "", readErr
+			return "", "", nil, readErr
 		}
 		bearerToken = strings.TrimSpace(string(tokBytes))
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	httpClient := &http.Client{
+	httpClient = &http.Client{
 		Timeout:   brokerSnapshotTimeout,
 		Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+	return endpoint, bearerToken, httpClient, nil
+}
+
+func (c *Curator) syncVerifiedSnapshotWithRevisionLocked(ctx context.Context, repoID string) (string, error) {
+	rawURL := strings.TrimSpace(c.cfg.BrokerURL)
+	cleanRepo := strings.TrimSpace(repoID)
+	if rawURL == "" || cleanRepo == "" {
+		return "", nil
+	}
+	endpoint, bearerToken, httpClient, err := c.prepareBrokerSnapshotClient()
+	if err != nil {
+		return "", err
 	}
 
 	status, rawResp, snap, err := c.postBrokerSnapshotRequest(ctx, httpClient, endpoint, bearerToken, map[string]any{
@@ -2206,6 +2241,20 @@ func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID, gitByID map[string]R
 }
 
 func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, records []Record, year int, dateStr string) ([]string, error) {
+	return c.graduateRecurrencesWithChecker(ctx, repoID, records, year, dateStr, func(g *RecordGuard, resources []string) bool {
+		return GuardPassesOnHead(c.cfg.RepoDir, g, resources)
+	}, false)
+}
+
+func (c *Curator) graduateRecurrencesWithChecker(
+	ctx context.Context,
+	repoID string,
+	records []Record,
+	year int,
+	dateStr string,
+	guardPasses func(g *RecordGuard, scopeResources []string) bool,
+	lockMu bool,
+) ([]string, error) {
 	cleanRepo := strings.TrimSpace(repoID)
 	var repoScoped []Record
 	for _, r := range records {
@@ -2225,7 +2274,14 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 
 	var graduated []string
 	for _, cand := range candidates {
-		decID := c.nextRecordIDLocked(ctx, RecordTypeDecision, year)
+		var decID string
+		if lockMu {
+			c.mu.Lock()
+			decID = c.nextRecordIDLocked(ctx, RecordTypeDecision, year)
+			c.mu.Unlock()
+		} else {
+			decID = c.nextRecordIDLocked(ctx, RecordTypeDecision, year)
+		}
 		synth := c.cfg.LLM.Synthesize(ctx, RecordTypeDecision, cand)
 		title := synthTitle(synth)
 		if title == "" {
@@ -2272,7 +2328,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 					Value: cand.Value,
 				},
 			}
-			if GuardPassesOnHead(c.cfg.RepoDir, candidateGuard, cand.Resources) {
+			if guardPasses != nil && guardPasses(candidateGuard, cand.Resources) {
 				guard = candidateGuard
 			} else {
 				guard = &RecordGuard{
@@ -2293,7 +2349,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 					Severity: sev,
 					Expect:   synth.Guard.Expect,
 				}
-				if GuardPassesOnHead(c.cfg.RepoDir, candidateGuard, cand.Resources) {
+				if guardPasses != nil && guardPasses(candidateGuard, cand.Resources) {
 					guard = candidateGuard
 				}
 			}
@@ -2342,8 +2398,16 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 			decID,
 		)
 		decRec := Record{Meta: decMeta, Body: decBody}
-		if err := SaveRecord(c.cfg.RepoDir, &decRec); err != nil {
-			return graduated, err
+		var saveErr error
+		if lockMu {
+			c.mu.Lock()
+			saveErr = SaveRecord(c.cfg.RepoDir, &decRec)
+			c.mu.Unlock()
+		} else {
+			saveErr = SaveRecord(c.cfg.RepoDir, &decRec)
+		}
+		if saveErr != nil {
+			return graduated, saveErr
 		}
 		if c.cfg.Hindsight != nil {
 			if err := c.cfg.Hindsight.RetainRecord(ctx, repoID, decRec); err != nil {
@@ -2544,7 +2608,7 @@ func (c *Curator) handleQueryMsg(ctx context.Context, msg *nats.Msg, expectedSub
 		_ = msg.Respond(raw)
 		return
 	}
-	if req.Action == "index" {
+	if strings.EqualFold(strings.TrimSpace(req.Action), "index") || strings.EqualFold(strings.TrimSpace(req.Action), "dream") {
 		resp := MemoryQueryResponse{
 			Schema: MemoryQueryReplySchema,
 			Error:  fmt.Sprintf("action %q is restricted to %s", req.Action, SubjectCuratorOutcomes),
@@ -2590,8 +2654,8 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) (resp
 			c.metrics.recordQuery(queryStatusEmpty)
 		}
 	}()
-	switch req.Action {
-	case "index":
+	switch strings.ToLower(strings.TrimSpace(req.Action)) {
+	case "index", "dream":
 		return MemoryQueryResponse{
 			Schema: MemoryQueryReplySchema,
 			Error:  fmt.Sprintf("action %q is restricted to %s", req.Action, SubjectCuratorOutcomes),
@@ -3419,6 +3483,40 @@ func IndexViaNATS(ctx context.Context, client *lib.Client, req MemoryQueryReques
 		lastResp = resp
 	}
 	return lastResp, nil
+}
+
+// DreamViaNATS sends a dream request to the Curator on SubjectCuratorOutcomes.
+func DreamViaNATS(ctx context.Context, client *lib.Client, req MemoryQueryRequest) (MemoryQueryResponse, error) {
+	if client == nil {
+		return MemoryQueryResponse{}, errors.New("NATS client is nil")
+	}
+	req.Action = "dream"
+	if req.Schema == "" {
+		req.Schema = MemoryQuerySchema
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = lib.NewCorrelationID()
+	}
+	rawReq, err := json.Marshal(req)
+	if err != nil {
+		return MemoryQueryResponse{}, fmt.Errorf("marshal dream request: %w", err)
+	}
+	subj := outcomesSubject()
+	outMsg := nats.NewMsg(subj)
+	outMsg.Data = rawReq
+	outMsg.Header.Set("Nats-Correlation-Id", req.CorrelationID)
+	msg, err := requestOnMemoryReplyInbox(ctx, client.Conn(), outMsg)
+	if err != nil {
+		return MemoryQueryResponse{}, fmt.Errorf("curator dream request on %s: %w", subj, err)
+	}
+	var resp MemoryQueryResponse
+	if err := json.Unmarshal(msg.Data, &resp); err != nil {
+		return MemoryQueryResponse{}, fmt.Errorf("decode curator dream reply: %w", err)
+	}
+	if resp.Error != "" {
+		return resp, errors.New(resp.Error)
+	}
+	return resp, nil
 }
 
 // QueryViaNATS sends a MemoryQueryRequest over NATS to the Curator's memory
@@ -4318,20 +4416,970 @@ func SyncRecordsToHindsight(ctx context.Context, hs *HindsightClient, repoID, re
 	return upserted, deleted, nil
 }
 
-// DreamReport summarizes a Dreamer consolidation and guard verification pass.
-type DreamReport struct {
-	Repo               string   `json:"repo"`
-	VerifiedActive     []string `json:"verified_active"`
-	DemotedDrifted     []string `json:"demoted_drifted,omitempty"`
-	GraduatedDecisions []string `json:"graduated_decisions,omitempty"`
-	Upserted           []string `json:"upserted,omitempty"`
-	Deleted            []string `json:"deleted,omitempty"`
+// DreamObsoleteItem identifies an active record whose scope paths match zero files on HEAD.
+type DreamObsoleteItem struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
 }
 
-// RunDream executes a Dreamer consolidation pass: it audits active guards against
-// the current HEAD worktree (downgrading drifted "block" guards to "warn"),
-// graduates cross-cluster recurring lessons into fleet-wide proposed decisions,
-// and syncs all valid OKF records to Hindsight.
+// DreamSupersessionIssue identifies a superseded record whose metadata disagrees with its successor.
+type DreamSupersessionIssue struct {
+	ID            string       `json:"id"`
+	SupersededBy  string       `json:"superseded_by"`
+	CurrentStatus RecordStatus `json:"current_status"`
+}
+
+// DreamConflict identifies active records with conflicting guards on the same file and path.
+type DreamConflict struct {
+	File      string   `json:"file"`
+	Path      string   `json:"path"`
+	RecordIDs []string `json:"record_ids"`
+}
+
+// DreamReport summarizes a Dreamer consolidation and guard verification pass.
+type DreamReport struct {
+	Repo               string                   `json:"repo"`
+	Revision           string                   `json:"revision,omitempty"`
+	VerifiedActive     []string                 `json:"verified_active"`
+	DemotedDrifted     []string                 `json:"demoted_drifted,omitempty"`
+	Obsolete           []DreamObsoleteItem      `json:"obsolete,omitempty"`
+	SupersessionIssues []DreamSupersessionIssue `json:"supersession_issues,omitempty"`
+	Conflicts          []DreamConflict          `json:"conflicts,omitempty"`
+	GraduatedDecisions []string                 `json:"graduated_decisions,omitempty"`
+	Upserted           []string                 `json:"upserted,omitempty"`
+	Deleted            []string                 `json:"deleted,omitempty"`
+	Silent             bool                     `json:"silent"`
+}
+
+type dreamSnapshot struct {
+	revision            string
+	allFiles            []string
+	fullTree            bool
+	rawTar              []byte
+	guardFiles          map[string]string
+	guardFilesAvailable bool
+	fetchedRoots        map[string]bool
+	entries413          []snapshotEntry
+	httpClient          *http.Client
+	endpoint            string
+	bearerToken         string
+}
+
+func cleanArchiveRelPath(rawName string) (string, bool) {
+	rawSlash := filepath.ToSlash(strings.TrimLeft(rawName, "/"))
+	if rawSlash == "" || rawSlash == "." {
+		return "", false
+	}
+	for _, seg := range strings.Split(rawSlash, "/") {
+		if seg == ".." || seg == ".git" {
+			return "", false
+		}
+	}
+	rel := filepath.ToSlash(filepath.Clean(rawSlash))
+	if rel == "." || rel == "" || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") {
+		return "", false
+	}
+	return rel, true
+}
+
+func scanDreamTarPaths(tarBytes []byte) (allFiles []string, fullTree bool) {
+	if len(tarBytes) == 0 {
+		return nil, true
+	}
+	tr := tar.NewReader(bytes.NewReader(tarBytes))
+	fullTree = true
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return allFiles, false
+		}
+		if (hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA) || hdr.Linkname != "" {
+			continue
+		}
+		rel, ok := cleanArchiveRelPath(hdr.Name)
+		if !ok {
+			continue
+		}
+		if len(allFiles) >= maxDreamTarEntries {
+			fullTree = false
+			break
+		}
+		allFiles = append(allFiles, rel)
+	}
+	return allFiles, fullTree
+}
+
+// guardFileLiteralRoot returns the top-level directory segment of pattern when
+// it is a literal name without glob metacharacters.
+func guardFileLiteralRoot(pattern string) (string, bool) {
+	trimmed := strings.TrimSpace(pattern)
+	if trimmed == "" {
+		return "", false
+	}
+	trimmed = strings.TrimPrefix(filepath.ToSlash(trimmed), "./")
+	trimmed = strings.TrimLeft(trimmed, "/")
+	if trimmed == "" {
+		return "", false
+	}
+	top, _, _ := strings.Cut(trimmed, "/")
+	if top == "" || strings.ContainsAny(top, "*?[") {
+		return "", false
+	}
+	return top, true
+}
+
+// extractGuardFilesFromTar extracts matching regular files from tarBytes.
+// It returns complete=true only when the stream reaches io.EOF without error
+// and stays within the entry and byte caps.
+func extractGuardFilesFromTar(tarBytes []byte, globs []string) (map[string]string, bool) {
+	out := map[string]string{}
+	if len(tarBytes) == 0 || len(globs) == 0 {
+		return out, true
+	}
+	tr := tar.NewReader(bytes.NewReader(tarBytes))
+	var totalBytes int64
+	seenEntries := 0
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return out, true
+		}
+		if err != nil {
+			return out, false
+		}
+		if (hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA) || hdr.Linkname != "" {
+			continue
+		}
+		seenEntries++
+		if seenEntries > maxDreamTarEntries {
+			return out, false
+		}
+		if hdr.Size < 0 || hdr.Size > maxRecordFileBytes {
+			continue
+		}
+		rel, ok := cleanArchiveRelPath(hdr.Name)
+		if !ok {
+			continue
+		}
+		matched := false
+		for _, g := range globs {
+			if g != "" && MatchGlob(g, rel) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		data, rErr := io.ReadAll(io.LimitReader(tr, maxRecordFileBytes+1))
+		if rErr != nil {
+			return out, false
+		}
+		if int64(len(data)) > maxRecordFileBytes {
+			continue
+		}
+		totalBytes += int64(len(data))
+		if totalBytes > maxBrokerSnapshotBytes {
+			return out, false
+		}
+		out[rel] = string(data)
+	}
+}
+
+func collectLocalRepoFiles(repoDir string) (allFiles []string, fullTree bool) {
+	fullTree = true
+	_ = filepath.WalkDir(repoDir, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == verifiedGitSubdir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(repoDir, p)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			return nil
+		}
+		if len(allFiles) >= maxDreamTarEntries {
+			fullTree = false
+			return filepath.SkipAll
+		}
+		allFiles = append(allFiles, filepath.ToSlash(rel))
+		return nil
+	})
+	return allFiles, fullTree
+}
+
+func (c *Curator) syncAndCaptureDreamSnapshot(ctx context.Context, repoID string) (dreamSnapshot, error) {
+	cleanRepo := strings.TrimSpace(repoID)
+	endpoint, bearerToken, httpClient, err := c.prepareBrokerSnapshotClient()
+	if err != nil {
+		return dreamSnapshot{}, err
+	}
+	status, rawResp, snap, err := c.postBrokerSnapshotRequest(ctx, httpClient, endpoint, bearerToken, map[string]any{
+		"repository": cleanRepo,
+		"maxBytes":   maxBrokerSnapshotBytes,
+	})
+	if err != nil {
+		return dreamSnapshot{}, err
+	}
+
+	stagingRoot := c.verifiedBaseDir()
+	vDir := c.verifiedRepoDirFor(cleanRepo)
+	writeRepoID := filepath.Clean(vDir) != filepath.Clean(strings.TrimSpace(c.cfg.VerifiedRepoDir))
+
+	switch status {
+	case http.StatusOK:
+		if snap.ArchiveBase64 == "" {
+			return dreamSnapshot{}, errors.New("broker snapshot missing archiveBase64 payload")
+		}
+		tarBytes, dErr := base64.StdEncoding.DecodeString(snap.ArchiveBase64)
+		if dErr != nil {
+			return dreamSnapshot{}, dErr
+		}
+		if err := unpackVerifiedSnapshotArchive(stagingRoot, vDir, cleanRepo, tarBytes, writeRepoID); err != nil {
+			return dreamSnapshot{}, err
+		}
+		allFiles, fullTree := scanDreamTarPaths(tarBytes)
+		return dreamSnapshot{
+			revision:            strings.TrimSpace(snap.Revision),
+			allFiles:            allFiles,
+			fullTree:            fullTree,
+			rawTar:              tarBytes,
+			guardFilesAvailable: fullTree,
+		}, nil
+
+	case http.StatusRequestEntityTooLarge:
+		if !strings.EqualFold(strings.TrimSpace(snap.Code), "SNAPSHOT_TOO_LARGE") || snap.Entries == nil {
+			return dreamSnapshot{}, fmt.Errorf("broker snapshot too large without directory listing (code=%q)", snap.Code)
+		}
+		matchedRoots := intersectSnapshotDocRoots(*snap.Entries)
+		rev := strings.TrimSpace(snap.Revision)
+		if len(matchedRoots) == 0 {
+			if err := unpackVerifiedSnapshotArchive(stagingRoot, vDir, cleanRepo, nil, writeRepoID); err != nil {
+				return dreamSnapshot{}, err
+			}
+		} else {
+			status2, raw2, snap2, err2 := c.postBrokerSnapshotRequest(ctx, httpClient, endpoint, bearerToken, map[string]any{
+				"repository": cleanRepo,
+				"paths":      matchedRoots,
+				"maxBytes":   maxBrokerSnapshotBytes,
+			})
+			if err2 != nil {
+				return dreamSnapshot{}, err2
+			}
+			rev = strings.TrimSpace(firstNonEmpty(snap2.Revision, snap.Revision))
+			switch {
+			case status2 == http.StatusOK:
+				if snap2.ArchiveBase64 == "" {
+					return dreamSnapshot{}, errors.New("broker snapshot missing archiveBase64 payload")
+				}
+				tarBytes, dErr := base64.StdEncoding.DecodeString(snap2.ArchiveBase64)
+				if dErr != nil {
+					return dreamSnapshot{}, dErr
+				}
+				if err := unpackVerifiedSnapshotArchive(stagingRoot, vDir, cleanRepo, tarBytes, writeRepoID); err != nil {
+					return dreamSnapshot{}, err
+				}
+			case isPathNotFoundSnapshotResp(status2, snap2, raw2):
+				if len(matchedRoots) == 1 {
+					if err := unpackVerifiedSnapshotArchive(stagingRoot, vDir, cleanRepo, nil, writeRepoID); err != nil {
+						return dreamSnapshot{}, err
+					}
+				} else {
+					return dreamSnapshot{}, errors.New("broker snapshot narrowed roots returned PATH_NOT_FOUND across multiple roots")
+				}
+			default:
+				return dreamSnapshot{}, fmt.Errorf("broker snapshot status %d", status2)
+			}
+		}
+		return dreamSnapshot{
+			revision:            rev,
+			fullTree:            false,
+			guardFilesAvailable: false,
+			entries413:          *snap.Entries,
+			httpClient:          httpClient,
+			endpoint:            endpoint,
+			bearerToken:         bearerToken,
+		}, nil
+
+	default:
+		if isPathNotFoundSnapshotResp(status, snap, rawResp) {
+			if err := unpackVerifiedSnapshotArchive(stagingRoot, vDir, cleanRepo, nil, writeRepoID); err != nil {
+				return dreamSnapshot{}, err
+			}
+			return dreamSnapshot{
+				revision:            strings.TrimSpace(snap.Revision),
+				fullTree:            true,
+				guardFilesAvailable: true,
+			}, nil
+		}
+		return dreamSnapshot{}, fmt.Errorf("broker snapshot status %d", status)
+	}
+}
+
+func (c *Curator) fetchTargetedDreamGuardFiles(ctx context.Context, repoID string, snap *dreamSnapshot, records []Record) {
+	if snap == nil || len(snap.entries413) == 0 || snap.httpClient == nil {
+		return
+	}
+	present := map[string]bool{}
+	for _, e := range snap.entries413 {
+		clean := strings.Trim(filepath.ToSlash(strings.TrimSpace(e.Path)), "/")
+		if clean == "" {
+			continue
+		}
+		top, _, _ := strings.Cut(clean, "/")
+		present[top] = true
+	}
+	rootSet := map[string]bool{}
+	var globs []string
+	for _, r := range records {
+		if r.Meta.Status != StatusActive || r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
+			continue
+		}
+		g := strings.TrimSpace(r.Meta.Guard.Expect.File)
+		if g == "" {
+			continue
+		}
+		top, ok := guardFileLiteralRoot(g)
+		if !ok {
+			continue
+		}
+		if present[top] {
+			rootSet[top] = true
+			globs = append(globs, g)
+		}
+	}
+	if len(rootSet) == 0 || len(globs) == 0 {
+		return
+	}
+	guardRoots := make([]string, 0, len(rootSet))
+	for r := range rootSet {
+		guardRoots = append(guardRoots, r)
+	}
+	sort.Strings(guardRoots)
+
+	status, _, respSnap, err := c.postBrokerSnapshotRequest(ctx, snap.httpClient, snap.endpoint, snap.bearerToken, map[string]any{
+		"repository": strings.TrimSpace(repoID),
+		"paths":      guardRoots,
+		"maxBytes":   maxBrokerSnapshotBytes,
+	})
+	if err != nil || status != http.StatusOK || respSnap.ArchiveBase64 == "" {
+		return
+	}
+	tarBytes, dErr := base64.StdEncoding.DecodeString(respSnap.ArchiveBase64)
+	if dErr != nil {
+		return
+	}
+	extracted, complete := extractGuardFilesFromTar(tarBytes, globs)
+	if !complete {
+		return
+	}
+	snap.guardFiles = extracted
+	snap.guardFilesAvailable = true
+	if snap.fetchedRoots == nil {
+		snap.fetchedRoots = make(map[string]bool, len(guardRoots))
+	}
+	for _, r := range guardRoots {
+		snap.fetchedRoots[r] = true
+	}
+}
+
+func recordBelongsToRepo(r Record, targetRepo, primaryRepo string) bool {
+	cleanTarget := strings.TrimSpace(targetRepo)
+	if cleanTarget == "" {
+		return true
+	}
+	recRepo := strings.TrimSpace(r.Meta.Repo)
+	if recRepo == "" {
+		cleanPrimary := strings.TrimSpace(primaryRepo)
+		return cleanPrimary == "" || SameRepoSlug(cleanPrimary, cleanTarget)
+	}
+	return SameRepoSlug(recRepo, cleanTarget)
+}
+
+func setDreamSilent(report *DreamReport) {
+	report.Silent = len(report.DemotedDrifted) == 0 &&
+		len(report.Obsolete) == 0 &&
+		len(report.SupersessionIssues) == 0 &&
+		len(report.Conflicts) == 0 &&
+		len(report.GraduatedDecisions) == 0
+}
+
+func checkAsymmetricSupersessions(records []Record) []DreamSupersessionIssue {
+	byID := make(map[string]Record, len(records))
+	for _, r := range records {
+		byID[r.Meta.ID] = r
+	}
+	type pairKey struct {
+		oldID string
+		newID string
+	}
+	seen := map[pairKey]bool{}
+	var issues []DreamSupersessionIssue
+	for _, r := range records {
+		if r.Meta.Status == StatusProposed || r.Meta.Status == StatusRejected || r.Meta.Status == StatusRetired {
+			continue
+		}
+		for _, oldID := range r.Meta.Supersedes {
+			oldID = strings.TrimSpace(oldID)
+			if oldID == "" || oldID == r.Meta.ID {
+				continue
+			}
+			oldRec, exists := byID[oldID]
+			if !exists {
+				continue
+			}
+			if oldRec.Meta.Status != StatusSuperseded || oldRec.Meta.SupersededBy != r.Meta.ID {
+				pk := pairKey{oldID: oldID, newID: r.Meta.ID}
+				if seen[pk] {
+					continue
+				}
+				seen[pk] = true
+				issues = append(issues, DreamSupersessionIssue{
+					ID:            oldID,
+					SupersededBy:  r.Meta.ID,
+					CurrentStatus: oldRec.Meta.Status,
+				})
+			}
+		}
+	}
+	return issues
+}
+
+func clusterScopeInfo(clusters []string) (fleetWide bool, specific map[string]bool) {
+	specific = map[string]bool{}
+	for _, raw := range clusters {
+		c := strings.TrimSpace(raw)
+		if c == "" {
+			continue
+		}
+		if c == "*" {
+			return true, nil
+		}
+		specific[c] = true
+	}
+	if len(specific) == 0 {
+		return true, nil
+	}
+	return false, specific
+}
+
+func clustersConflict(a, b []string) bool {
+	fleetA, specA := clusterScopeInfo(a)
+	fleetB, specB := clusterScopeInfo(b)
+	// Skip broad-vs-narrow pairs because narrow cluster guards override fleet-wide defaults.
+	if fleetA != fleetB {
+		return false
+	}
+	if fleetA && fleetB {
+		return true
+	}
+	for c := range specA {
+		if specB[c] {
+			return true
+		}
+	}
+	return false
+}
+
+func resourcesDisjoint(a, b []string) bool {
+	var cleanA, cleanB []string
+	for _, r := range a {
+		if s := strings.TrimSpace(r); s != "" {
+			cleanA = append(cleanA, s)
+		}
+	}
+	for _, r := range b {
+		if s := strings.TrimSpace(r); s != "" {
+			cleanB = append(cleanB, s)
+		}
+	}
+	if len(cleanA) == 0 || len(cleanB) == 0 {
+		return false
+	}
+	for _, ra := range cleanA {
+		for _, rb := range cleanB {
+			if ra == rb || MatchGlob(ra, rb) || MatchGlob(rb, ra) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func recordsShareSupersedesLink(a, b Record) bool {
+	for _, sup := range a.Meta.Supersedes {
+		if strings.TrimSpace(sup) == b.Meta.ID {
+			return true
+		}
+	}
+	for _, sup := range b.Meta.Supersedes {
+		if strings.TrimSpace(sup) == a.Meta.ID {
+			return true
+		}
+	}
+	return false
+}
+
+func checkConflictingActiveGuards(records []Record) []DreamConflict {
+	type guardKey struct {
+		file string
+		path string
+	}
+	groups := map[guardKey][]Record{}
+	for _, r := range records {
+		if r.Meta.Status != StatusActive || r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
+			continue
+		}
+		file := strings.TrimSpace(r.Meta.Guard.Expect.File)
+		path := strings.TrimSpace(r.Meta.Guard.Expect.Path)
+		if file == "" || path == "" {
+			continue
+		}
+		k := guardKey{file: file, path: path}
+		groups[k] = append(groups[k], r)
+	}
+	keys := make([]guardKey, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].file != keys[j].file {
+			return keys[i].file < keys[j].file
+		}
+		return keys[i].path < keys[j].path
+	})
+
+	var conflicts []DreamConflict
+	for _, k := range keys {
+		grp := groups[k]
+		if len(grp) < 2 {
+			continue
+		}
+		conflictingIDs := map[string]bool{}
+		for i := 0; i < len(grp); i++ {
+			for j := i + 1; j < len(grp); j++ {
+				a, b := grp[i], grp[j]
+				if a.Meta.ID == b.Meta.ID {
+					continue
+				}
+				expA, expB := a.Meta.Guard.Expect, b.Meta.Guard.Expect
+				if expA.Op == expB.Op && fmt.Sprint(expA.Value) == fmt.Sprint(expB.Value) {
+					continue
+				}
+				if recordsShareSupersedesLink(a, b) {
+					continue
+				}
+				if !clustersConflict(a.Meta.Scope.Clusters, b.Meta.Scope.Clusters) {
+					continue
+				}
+				if resourcesDisjoint(a.Meta.Scope.Resources, b.Meta.Scope.Resources) {
+					continue
+				}
+				conflictingIDs[a.Meta.ID] = true
+				conflictingIDs[b.Meta.ID] = true
+			}
+		}
+		if len(conflictingIDs) < 2 {
+			continue
+		}
+		recIDs := make([]string, 0, len(conflictingIDs))
+		for id := range conflictingIDs {
+			recIDs = append(recIDs, id)
+		}
+		sort.Strings(recIDs)
+		conflicts = append(conflicts, DreamConflict{
+			File:      k.file,
+			Path:      k.path,
+			RecordIDs: recIDs,
+		})
+	}
+	return conflicts
+}
+
+func runDeterministicDreamAudit(
+	records []Record,
+	allFiles []string,
+	fullTree bool,
+	guardFilesAvailable bool,
+	fetchedRoots map[string]bool,
+	guardPasses func(g *RecordGuard, scopeResources []string) bool,
+	onDrifted func(r Record) error,
+	report *DreamReport,
+) error {
+	sorted := make([]Record, len(records))
+	copy(sorted, records)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Meta.ID < sorted[j].Meta.ID
+	})
+
+	obsoleteIDs := map[string]bool{}
+	if fullTree {
+		for _, r := range sorted {
+			if r.Meta.Status != StatusActive || len(r.Meta.Scope.Paths) == 0 {
+				continue
+			}
+			if !ScopePathsExist(allFiles, r.Meta.Scope.Paths) {
+				obsoleteIDs[r.Meta.ID] = true
+				report.Obsolete = append(report.Obsolete, DreamObsoleteItem{
+					ID:     r.Meta.ID,
+					Reason: fmt.Sprintf("scope.paths %v matched 0 files on HEAD", r.Meta.Scope.Paths),
+				})
+			}
+		}
+	}
+
+	if guardFilesAvailable && guardPasses != nil {
+		for _, r := range sorted {
+			if r.Meta.Status != StatusActive || obsoleteIDs[r.Meta.ID] {
+				continue
+			}
+			if r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
+				continue
+			}
+			// On partial snapshots, evaluate only guards whose literal root was fetched completely.
+			if !fullTree {
+				root, ok := guardFileLiteralRoot(r.Meta.Guard.Expect.File)
+				if !ok || !fetchedRoots[root] {
+					continue
+				}
+			}
+			if guardPasses(r.Meta.Guard, r.Meta.Scope.Resources) {
+				report.VerifiedActive = append(report.VerifiedActive, r.Meta.ID)
+				continue
+			}
+			if onDrifted != nil {
+				if err := onDrifted(r); err != nil {
+					return err
+				}
+			}
+			report.DemotedDrifted = append(report.DemotedDrifted, r.Meta.ID)
+		}
+	}
+
+	report.SupersessionIssues = checkAsymmetricSupersessions(sorted)
+	report.Conflicts = checkConflictingActiveGuards(sorted)
+	return nil
+}
+
+// HandleDream validates a NATS dream request and executes RunDreamForRepo.
+func (c *Curator) HandleDream(ctx context.Context, req MemoryQueryRequest) MemoryQueryResponse {
+	repoID := strings.TrimSpace(req.Repo)
+	bank := DefaultBankID
+	if c.cfg.Hindsight != nil && c.cfg.Hindsight.bankID != "" {
+		bank = c.cfg.Hindsight.bankID
+	}
+	if repoID == "" {
+		return MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Bank:   bank,
+			Error:  "repo is required for action dream",
+		}
+	}
+	reqRole := strings.ToLower(strings.TrimSpace(req.Role))
+	if reqRole == RoleContext {
+		return MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Bank:   bank,
+			Repo:   repoID,
+			Error:  fmt.Sprintf("action dream is restricted to %s repositories", RoleManaged),
+		}
+	}
+	if configuredRole, configured := resolveConfiguredRepoRole(repoID); configured {
+		if configuredRole == "" {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Bank:   bank,
+				Repo:   repoID,
+				Error:  fmt.Sprintf("repo %q is not in managed_repos", repoID),
+			}
+		}
+		if configuredRole != RoleManaged {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Bank:   bank,
+				Repo:   repoID,
+				Error:  fmt.Sprintf("repo %q has role %q; dream is restricted to %s repositories", repoID, configuredRole, RoleManaged),
+			}
+		}
+	}
+
+	report, err := c.RunDreamForRepo(ctx, repoID)
+	if err != nil {
+		return MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Bank:   bank,
+			Repo:   repoID,
+			Error:  err.Error(),
+		}
+	}
+	backend := "okf-local"
+	if c.cfg.Hindsight != nil {
+		backend = "hindsight"
+	}
+	return MemoryQueryResponse{
+		Schema:   MemoryQueryReplySchema,
+		OK:       true,
+		Backend:  backend,
+		Bank:     bank,
+		Repo:     repoID,
+		Revision: report.Revision,
+		Upserted: report.Upserted,
+		Deleted:  report.Deleted,
+		Dream:    &report,
+	}
+}
+
+// RunDreamForRepo audits active records for repoID against a broker snapshot or
+// verified repository directory without holding c.mu across network calls.
+func (c *Curator) RunDreamForRepo(ctx context.Context, repoID string) (DreamReport, error) {
+	cleanRepo := strings.TrimSpace(repoID)
+	if cleanRepo == "" {
+		cleanRepo = strings.TrimSpace(c.cfg.RepoID)
+	}
+	if strings.TrimSpace(c.cfg.BrokerURL) == "" && strings.TrimSpace(c.cfg.VerifiedRepoDir) == "" {
+		return DreamReport{}, errors.New(ErrBrokerNotConfigured)
+	}
+
+	c.indexMu.Lock()
+	defer c.indexMu.Unlock()
+
+	var snap dreamSnapshot
+	var err error
+	brokerBacked := strings.TrimSpace(c.cfg.BrokerURL) != ""
+	if brokerBacked {
+		snap, err = c.syncAndCaptureDreamSnapshot(ctx, cleanRepo)
+		if err != nil {
+			return DreamReport{}, err
+		}
+	}
+
+	vDir := c.verifiedRepoDirFor(cleanRepo)
+	var verifiedRecords []Record
+	if vDir != "" {
+		loaded, lErr := loadSingleDirRecordsForIndex(vDir)
+		if lErr != nil {
+			return DreamReport{}, lErr
+		}
+		verifiedRecords = NormalizeRepoRecords(cleanRepo, RoleManaged, loaded)
+	}
+
+	c.mu.Lock()
+	c.ensureKnownIDsLocked(ctx)
+	localAll, _ := LoadRecords(c.cfg.RepoDir)
+	c.mu.Unlock()
+
+	localByID := map[string]Record{}
+	for _, r := range localAll {
+		if recordBelongsToRepo(r, cleanRepo, c.cfg.RepoID) {
+			localByID[r.Meta.ID] = r
+		}
+	}
+
+	mergedByID := map[string]Record{}
+	for _, r := range verifiedRecords {
+		if reRecordID.MatchString(r.Meta.ID) {
+			mergedByID[r.Meta.ID] = r
+		}
+	}
+	for id, r := range localByID {
+		if _, exists := mergedByID[id]; !exists {
+			mergedByID[id] = r
+		}
+	}
+	mergedRecords := make([]Record, 0, len(mergedByID))
+	for _, r := range mergedByID {
+		mergedRecords = append(mergedRecords, r)
+	}
+
+	if brokerBacked && len(snap.entries413) > 0 {
+		c.fetchTargetedDreamGuardFiles(ctx, cleanRepo, &snap, mergedRecords)
+	}
+
+	allFiles := snap.allFiles
+	fullTree := snap.fullTree
+	guardFilesAvailable := snap.guardFilesAvailable
+	if !brokerBacked && vDir != "" {
+		allFiles, fullTree = collectLocalRepoFiles(vDir)
+		guardFilesAvailable = true
+	}
+
+	var activeGuardFiles map[string]string
+	if brokerBacked && len(snap.rawTar) > 0 {
+		var globs []string
+		for _, r := range mergedRecords {
+			if r.Meta.Status == StatusActive && r.Meta.Guard != nil && r.Meta.Guard.Expect != nil && r.Meta.Guard.Expect.File != "" {
+				globs = append(globs, r.Meta.Guard.Expect.File)
+			}
+		}
+		extracted, complete := extractGuardFilesFromTar(snap.rawTar, globs)
+		if complete {
+			activeGuardFiles = extracted
+		} else {
+			guardFilesAvailable = false
+		}
+	} else {
+		activeGuardFiles = snap.guardFiles
+	}
+
+	guardPasses := func(g *RecordGuard, scopeResources []string) bool {
+		if g == nil || g.Expect == nil {
+			return false
+		}
+		if !brokerBacked && vDir != "" {
+			return GuardPassesOnHead(vDir, g, scopeResources)
+		}
+		if len(snap.rawTar) > 0 {
+			if !guardFilesAvailable {
+				return false
+			}
+			if GuardPassesOnFiles(activeGuardFiles, g, scopeResources) {
+				return true
+			}
+			extracted, complete := extractGuardFilesFromTar(snap.rawTar, []string{g.Expect.File})
+			if !complete {
+				return false
+			}
+			return GuardPassesOnFiles(extracted, g, scopeResources)
+		}
+		if guardFilesAvailable {
+			return GuardPassesOnFiles(snap.guardFiles, g, scopeResources)
+		}
+		return false
+	}
+
+	report := DreamReport{
+		Repo:           cleanRepo,
+		Revision:       snap.revision,
+		VerifiedActive: []string{},
+	}
+
+	// Lock order across Curator is always c.indexMu before c.mu.
+	onDrifted := func(r Record) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		liveRecords, lErr := LoadRecords(c.cfg.RepoDir)
+		if lErr != nil {
+			return lErr
+		}
+		for i := range liveRecords {
+			live := liveRecords[i]
+			if live.Meta.ID != r.Meta.ID || !recordBelongsToRepo(live, cleanRepo, c.cfg.RepoID) {
+				continue
+			}
+			if live.Meta.Status != StatusActive || live.Meta.Guard == nil || live.Meta.Guard.Severity != SeverityBlock {
+				return nil
+			}
+			g := *live.Meta.Guard
+			g.Severity = SeverityWarn
+			live.Meta.Guard = &g
+			return SaveRecord(c.cfg.RepoDir, &live)
+		}
+		return nil
+	}
+
+	if err := runDeterministicDreamAudit(mergedRecords, allFiles, fullTree, guardFilesAvailable, snap.fetchedRoots, guardPasses, onDrifted, &report); err != nil {
+		return report, err
+	}
+
+	if len(report.DemotedDrifted) > 0 {
+		driftedSet := make(map[string]bool, len(report.DemotedDrifted))
+		for _, id := range report.DemotedDrifted {
+			driftedSet[id] = true
+		}
+		for i := range verifiedRecords {
+			if driftedSet[verifiedRecords[i].Meta.ID] &&
+				verifiedRecords[i].Meta.Guard != nil &&
+				verifiedRecords[i].Meta.Guard.Severity == SeverityBlock {
+				g := *verifiedRecords[i].Meta.Guard
+				g.Severity = SeverityWarn
+				verifiedRecords[i].Meta.Guard = &g
+			}
+		}
+	}
+
+	now := time.Now().UTC()
+	dateStr := now.Format("2006-01-02")
+	year := now.Year()
+
+	graduated, err := c.graduateRecurrencesWithChecker(ctx, cleanRepo, mergedRecords, year, dateStr, guardPasses, true)
+	if err != nil {
+		return report, err
+	}
+	if len(graduated) > 0 {
+		report.GraduatedDecisions = graduated
+	}
+
+	if c.cfg.Hindsight != nil {
+		upserted, deleted, syncErr := SyncRecordListToHindsight(ctx, c.cfg.Hindsight, cleanRepo, verifiedRecords)
+		if syncErr != nil {
+			return report, syncErr
+		}
+		report.Upserted = upserted
+		report.Deleted = deleted
+	} else {
+		for _, r := range verifiedRecords {
+			if strings.TrimSpace(r.Meta.ID) != "" {
+				report.Upserted = append(report.Upserted, r.Meta.ID)
+			}
+		}
+	}
+
+	setDreamSilent(&report)
+
+	var digestToPublish *BlueprintDigest
+	c.mu.Lock()
+	if len(graduated) > 0 {
+		c.graduatedIDs = append(c.graduatedIDs, graduated...)
+	}
+	if c.indexedRepoRecords == nil {
+		c.indexedRepoRecords = map[string][]Record{}
+	}
+	deleteRepoRecordAliases(c.indexedRepoRecords, cleanRepo)
+	deleteRepoRecordAliases(c.contextRepoRecords, cleanRepo)
+	if len(c.indexedRepoRecords) >= maxCachedIndexedRepos {
+		clear(c.indexedRepoRecords)
+	}
+	c.indexedRepoRecords[cleanRepo] = verifiedRecords
+	c.queryCache = map[string]MemoryQueryResponse{}
+
+	if strings.TrimSpace(c.cfg.RepoID) == "" || SameRepoSlug(cleanRepo, c.cfg.RepoID) {
+		digestRecs, _ := LoadRecords(c.cfg.RepoDir)
+		seenDigestID := map[string]bool{}
+		for _, r := range digestRecs {
+			seenDigestID[r.Meta.ID] = true
+		}
+		for _, r := range verifiedRecords {
+			if reRecordID.MatchString(r.Meta.ID) && !seenDigestID[r.Meta.ID] {
+				seenDigestID[r.Meta.ID] = true
+				digestRecs = append(digestRecs, r)
+			}
+		}
+		gradCopy := append([]string(nil), c.graduatedIDs...)
+		digest := BuildBlueprintDigest(firstNonEmpty(c.cfg.RepoID, cleanRepo), digestRecs, "dream:"+cleanRepo, gradCopy)
+		_ = persistLocalStateSnapshot(c.cfg.RepoDir, digest)
+		if c.cfg.Client != nil {
+			digestToPublish = &digest
+		}
+	}
+	c.mu.Unlock()
+
+	if digestToPublish != nil {
+		_ = c.publishBlueprintDigest(ctx, *digestToPublish, "")
+	}
+	return report, nil
+}
+
+// RunDream executes a Dreamer consolidation pass against the local RepoDir: it
+// checks obsolete scopes, audits active guards against HEAD (downgrading drifted
+// "block" guards to "warn"), detects supersession issues and conflicting guards,
+// graduates cross-cluster recurring lessons, and syncs valid records to Hindsight.
 func (c *Curator) RunDream(ctx context.Context) (DreamReport, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -4349,26 +5397,27 @@ func (c *Curator) RunDream(ctx context.Context) (DreamReport, error) {
 	dateStr := now.Format("2006-01-02")
 	year := now.Year()
 
+	var scopedRecords []Record
 	for _, r := range records {
-		if r.Meta.Status != StatusActive || r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
-			continue
+		if recordBelongsToRepo(r, c.cfg.RepoID, c.cfg.RepoID) {
+			scopedRecords = append(scopedRecords, r)
 		}
-		if strings.TrimSpace(c.cfg.RepoID) != "" && strings.TrimSpace(r.Meta.Repo) != "" && !SameRepoSlug(r.Meta.Repo, c.cfg.RepoID) {
-			continue
-		}
-		if GuardPassesOnHead(c.cfg.RepoDir, r.Meta.Guard, r.Meta.Scope.Resources) {
-			report.VerifiedActive = append(report.VerifiedActive, r.Meta.ID)
-			continue
-		}
-		if r.Meta.Guard.Severity == "block" {
+	}
+	allFiles, fullTree := collectLocalRepoFiles(c.cfg.RepoDir)
+	guardPasses := func(g *RecordGuard, scopeResources []string) bool {
+		return GuardPassesOnHead(c.cfg.RepoDir, g, scopeResources)
+	}
+	onDrifted := func(r Record) error {
+		if r.Meta.Guard != nil && r.Meta.Guard.Severity == SeverityBlock {
 			g := *r.Meta.Guard
-			g.Severity = "warn"
+			g.Severity = SeverityWarn
 			r.Meta.Guard = &g
-			if sErr := SaveRecord(c.cfg.RepoDir, &r); sErr != nil {
-				return report, sErr
-			}
+			return SaveRecord(c.cfg.RepoDir, &r)
 		}
-		report.DemotedDrifted = append(report.DemotedDrifted, r.Meta.ID)
+		return nil
+	}
+	if err := runDeterministicDreamAudit(scopedRecords, allFiles, fullTree, true, nil, guardPasses, onDrifted, &report); err != nil {
+		return report, err
 	}
 
 	records, err = LoadRecords(c.cfg.RepoDir)
@@ -4400,6 +5449,7 @@ func (c *Curator) RunDream(ctx context.Context) (DreamReport, error) {
 		}
 	}
 
+	setDreamSilent(&report)
 	c.queryCache = map[string]MemoryQueryResponse{}
 	gradCopy := append([]string(nil), c.graduatedIDs...)
 	digest := BuildBlueprintDigest(c.cfg.RepoID, records, "dream-pass", gradCopy)

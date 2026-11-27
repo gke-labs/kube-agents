@@ -81,6 +81,8 @@ from urllib.parse import urlsplit
 
 # Siblings in `$HERMES_HOME/scripts`, which is this script's own directory and
 # therefore already `sys.path[0]` when the scheduler runs it.
+import chat_notify
+import chat_platforms
 import clean_merges
 import forge
 import gitops_workspace
@@ -385,6 +387,22 @@ _BACKFILL_SITUATIONAL_RE = re.compile(
 _DIFF_PLUS_FILE_RE = re.compile(r"^\+\+\+\s+b/(.+)$", re.M)
 _SINCE_SPEC_RE = re.compile(r"^(\d+)\s*([hdwmy])$", re.I)
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Nightly Decision Memory dream sweep constants.
+DECISION_MEMORY_DREAM_ENV = "DECISION_MEMORY_DREAM"
+DECISION_MEMORY_DREAM_INTERVAL_HOURS_ENV = "DECISION_MEMORY_DREAM_INTERVAL_HOURS"
+DEFAULT_DREAM_INTERVAL_HOURS = 24
+MIN_DREAM_INTERVAL_HOURS = 1
+MAX_DREAM_INTERVAL_HOURS = 168
+MAX_DREAM_REPOS_PER_TICK = 1
+CURATOR_DREAM_TIMEOUT_S = 120
+CURATOR_NO_RESPONDERS_EXIT_CODE = 2
+DREAM_NOTIFY_SEND_TIMEOUT_SECONDS = 30
+DREAM_NO_RESPONDERS_BACKOFF_SECONDS = 3600
+DREAM_DIARY_MAX_ITEMS_PER_SECTION = 5
+DREAM_REVISION_SHORT_CHARS = 12
+DREAM_TOKEN_MAX_CHARS = 120
+_DREAM_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 @dataclass
@@ -3749,11 +3767,412 @@ def sweep_repo_memory(
     return SweepResult()
 
 
+# --------------------------------------------------------------------------
+# Sweep: Nightly Decision Memory dream reconciliation
+# --------------------------------------------------------------------------
+
+
+def _memory_dream_enabled() -> bool:
+    """Return False only when the operator explicitly disables nightly dreams."""
+    raw = os.environ.get(DECISION_MEMORY_DREAM_ENV, "").strip().lower()
+    return raw not in _FALSY_ENV_VALUES
+
+
+def _dream_interval_hours() -> int:
+    """Return the dream interval in hours, clamped to `[1, 168]`."""
+    raw = os.environ.get(DECISION_MEMORY_DREAM_INTERVAL_HOURS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_DREAM_INTERVAL_HOURS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_DREAM_INTERVAL_HOURS
+    return max(MIN_DREAM_INTERVAL_HOURS, min(MAX_DREAM_INTERVAL_HOURS, parsed))
+
+
+def _default_dream_entry() -> dict[str, str]:
+    """Build the initial nightly dream cursor for one repository."""
+    return {
+        "last_dream_at": "",
+        "last_revision": "",
+        "last_report_hash": "",
+        "last_notified_at": "",
+    }
+
+
+def _ensure_repo_dream_entry(repos_map: dict, repo: str) -> dict[str, str]:
+    """Return a normalized nightly dream state dictionary for `repo`."""
+    raw = repos_map.get(repo)
+    if not isinstance(raw, dict):
+        raw = _default_repo_scan_entry(ROLE_MANAGED, None, DEFAULT_BOOTSTRAP_SINCE)
+        repos_map[repo] = raw
+    dream = raw.get("dream")
+    if not isinstance(dream, dict):
+        dream = _default_dream_entry()
+        raw["dream"] = dream
+        return dream
+    dream.setdefault("last_dream_at", "")
+    dream.setdefault("last_revision", "")
+    dream.setdefault("last_report_hash", "")
+    dream.setdefault("last_notified_at", "")
+    return dream
+
+
+def _sanitize_dream_token(value: object) -> str:
+    """Remove control characters and newlines from a dream report token."""
+    cleaned = _DREAM_CONTROL_CHARS_RE.sub(" ", str(value or ""))
+    cleaned = " ".join(cleaned.replace("`", "").split())
+    return cleaned[:DREAM_TOKEN_MAX_CHARS]
+
+
+def _format_dream_items(items: list[str], cap: int = DREAM_DIARY_MAX_ITEMS_PER_SECTION) -> str:
+    """Format up to `cap` sanitized items with an overflow count."""
+    shown = items[:cap]
+    extra = len(items) - len(shown)
+    text = ", ".join(shown)
+    if extra > 0:
+        text += f" (+{extra} more)"
+    return text
+
+
+def _dream_report_has_findings(report: dict) -> bool:
+    """Return True when a DreamReport contains actionable findings."""
+    if not bool(report.get("silent", True)):
+        return True
+    for key in (
+        "demoted_drifted",
+        "obsolete",
+        "supersession_issues",
+        "conflicts",
+        "graduated_decisions",
+    ):
+        val = report.get(key)
+        if isinstance(val, list) and len(val) > 0:
+            return True
+    return False
+
+
+def _dream_report_hash(repo: str, report: dict) -> str:
+    """Compute a deterministic SHA-256 digest over actionable dream findings."""
+    demoted = sorted(
+        str(x).strip() for x in (report.get("demoted_drifted") or []) if str(x).strip()
+    )
+    obsolete_ids = sorted(
+        str(item.get("id") or "").strip() if isinstance(item, dict) else str(item).strip()
+        for item in (report.get("obsolete") or [])
+    )
+    supersession_pairs = sorted(
+        f"{str(item.get('id') or '').strip()}->{str(item.get('superseded_by') or '').strip()}"
+        if isinstance(item, dict)
+        else str(item).strip()
+        for item in (report.get("supersession_issues") or [])
+    )
+    conflict_keys = sorted(
+        (
+            f"{str(item.get('file') or '').strip()}:{str(item.get('path') or '').strip()}:"
+            f"{','.join(sorted(str(r).strip() for r in (item.get('record_ids') or [])))}"
+        )
+        if isinstance(item, dict)
+        else str(item).strip()
+        for item in (report.get("conflicts") or [])
+    )
+    graduated = sorted(
+        str(x).strip() for x in (report.get("graduated_decisions") or []) if str(x).strip()
+    )
+    payload = {
+        "repo": str(repo or "").strip(),
+        "demoted_drifted": demoted,
+        "obsolete_ids": obsolete_ids,
+        "supersession_pairs": supersession_pairs,
+        "conflict_keys": conflict_keys,
+        "graduated_decisions": graduated,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _format_dream_diary(repo: str, report: dict) -> str:
+    """Format a concise, sanitized plain-English dream diary message."""
+    safe_repo = _sanitize_dream_token(repo) or "repository"
+    safe_rev = _sanitize_dream_token(report.get("revision"))
+    header = f"**Decision Memory nightly dream — `{safe_repo}`**"
+    if safe_rev:
+        header += f" (`{safe_rev[:DREAM_REVISION_SHORT_CHARS]}`)"
+    lines = [header]
+
+    demoted = [
+        f"`{tok}`"
+        for tok in (_sanitize_dream_token(x) for x in (report.get("demoted_drifted") or []))
+        if tok
+    ]
+    if demoted:
+        lines.append(
+            f"- Drifted guards (`at_risk`, demoted to `warn`, {len(demoted)}): "
+            f"{_format_dream_items(demoted)}"
+        )
+
+    obsolete: list[str] = []
+    for item in report.get("obsolete") or []:
+        raw_id = item.get("id") if isinstance(item, dict) else item
+        tok = _sanitize_dream_token(raw_id)
+        if tok:
+            obsolete.append(f"`{tok}`")
+    if obsolete:
+        lines.append(
+            f"- Obsolete records (scoped files removed, {len(obsolete)}): "
+            f"{_format_dream_items(obsolete)}"
+        )
+
+    supersessions: list[str] = []
+    for item in report.get("supersession_issues") or []:
+        if isinstance(item, dict):
+            rec_id = _sanitize_dream_token(item.get("id"))
+            sup_by = _sanitize_dream_token(item.get("superseded_by"))
+            if rec_id and sup_by:
+                supersessions.append(f"`{rec_id}` -> `{sup_by}`")
+            elif rec_id:
+                supersessions.append(f"`{rec_id}`")
+        else:
+            tok = _sanitize_dream_token(item)
+            if tok:
+                supersessions.append(f"`{tok}`")
+    if supersessions:
+        lines.append(
+            f"- Asymmetric `supersedes` links ({len(supersessions)}): "
+            f"{_format_dream_items(supersessions)}"
+        )
+
+    conflicts: list[str] = []
+    for item in report.get("conflicts") or []:
+        if isinstance(item, dict):
+            c_file = _sanitize_dream_token(item.get("file"))
+            c_path = _sanitize_dream_token(item.get("path"))
+            rec_ids = [
+                tok
+                for tok in (_sanitize_dream_token(r) for r in (item.get("record_ids") or []))
+                if tok
+            ]
+            target = f"{c_file}:{c_path}" if c_file and c_path else (c_file or c_path)
+            if target and rec_ids:
+                conflicts.append(f"`{target}` ({', '.join(rec_ids)})")
+            elif target:
+                conflicts.append(f"`{target}`")
+            elif rec_ids:
+                conflicts.append(f"({', '.join(rec_ids)})")
+        else:
+            tok = _sanitize_dream_token(item)
+            if tok:
+                conflicts.append(f"`{tok}`")
+    if conflicts:
+        lines.append(
+            f"- Conflicting active guards ({len(conflicts)}): "
+            f"{_format_dream_items(conflicts)}"
+        )
+
+    graduated = [
+        f"`{tok}`"
+        for tok in (_sanitize_dream_token(x) for x in (report.get("graduated_decisions") or []))
+        if tok
+    ]
+    if graduated:
+        lines.append(
+            f"- Graduated fleet-wide `DEC-*` proposals ({len(graduated)}): "
+            f"{_format_dream_items(graduated)}"
+        )
+
+    if len(lines) == 1:
+        lines.append("- Dream reconciliation reported repository updates.")
+
+    return "\n".join(lines)
+
+
+def _notify_dream_diary(message: str) -> bool:
+    """Deliver a dream diary message to each configured chat platform.
+
+    Returns True when no chat platforms are configured or at least one
+    delivery succeeds, is kept for digest, or ends with unknown outcome.
+    """
+    platforms = list(chat_platforms.enabled_chat_platforms())
+    if not platforms:
+        return True
+    delivered = False
+    run_env = {**os.environ, "HOME": "/tmp"}
+    for platform in platforms:
+        try:
+            cmd = chat_notify.command(platform, message, json_output=False)
+            timeout = chat_notify.subprocess_timeout(
+                platform, DREAM_NOTIFY_SEND_TIMEOUT_SECONDS
+            )
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=run_env,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+            delivered = True
+        except subprocess.CalledProcessError as exc:
+            if chat_notify.outcome_unknown(exc.returncode):
+                sys.stderr.write(
+                    f"github_scan_gate: dream diary to {platform} timed out; it may have posted\n"
+                )
+                delivered = True
+                continue
+            if chat_notify.kept(exc.returncode):
+                sys.stderr.write(
+                    f"github_scan_gate: dream diary to {platform} kept for home-channel digest\n"
+                )
+                delivered = True
+                continue
+            sys.stderr.write(
+                f"github_scan_gate: dream diary delivery to {platform} failed: {exc}\n"
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort; never fail the sweep
+            sys.stderr.write(
+                f"github_scan_gate: dream diary delivery to {platform} failed: {exc}\n"
+            )
+    return delivered
+
+
+def sweep_memory_dream(
+    dry_run: bool = False, *, now: datetime | None = None
+) -> SweepResult:
+    """Run nightly Decision Memory dream reconciliation over NATS for due managed repos.
+
+    Processes at most `MAX_DREAM_REPOS_PER_TICK` managed repositories per tick
+    once `DECISION_MEMORY_DREAM_INTERVAL_HOURS` elapses. Stays silent on clean
+    runs and posts a deduplicated dream diary to chat only when findings exist.
+    """
+    if not _memory_dream_enabled():
+        return SweepResult()
+    curator_bin = _resolve_curator_bin()
+    nats_url = os.environ.get("NATS_URL", "").strip()
+    if not curator_bin or not nats_url:
+        return SweepResult()
+
+    try:
+        managed_repos = gitops_workspace.get_managed_repos()
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"github_scan_gate: memory_dream repo discovery failed: {exc}\n")
+        return SweepResult()
+    if not managed_repos:
+        return SweepResult()
+
+    cur_now = now or datetime.now(timezone.utc)
+    now_iso = cur_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    interval = timedelta(hours=_dream_interval_hours())
+
+    state = _load_repo_scan_state()
+    backoff_dt = _parse_any_timestamp(state.get("dream_no_responders_at"))
+    if backoff_dt is not None:
+        elapsed_s = (cur_now - backoff_dt).total_seconds()
+        if 0 <= elapsed_s < DREAM_NO_RESPONDERS_BACKOFF_SECONDS:
+            return SweepResult()
+
+    repos_state: dict = state.setdefault("repos", {})
+    due_repos: list[tuple[int, float, int, str]] = []
+    for idx, repo in enumerate(managed_repos):
+        repo_entry = repos_state.get(repo) if isinstance(repos_state.get(repo), dict) else {}
+        dream_info = repo_entry.get("dream") if isinstance(repo_entry.get("dream"), dict) else {}
+        last_dt = _parse_any_timestamp(dream_info.get("last_dream_at"))
+        if last_dt is None:
+            due_repos.append((0, 0.0, idx, repo))
+        elif (cur_now - last_dt) >= interval:
+            due_repos.append((1, last_dt.timestamp(), idx, repo))
+
+    if not due_repos:
+        return SweepResult()
+
+    due_repos.sort(key=lambda item: (item[0], item[1], item[2]))
+    selected_repos = [item[3] for item in due_repos[:MAX_DREAM_REPOS_PER_TICK]]
+
+    if dry_run:
+        for repo in selected_repos:
+            sys.stderr.write(f"github_scan_gate: would run curator dream for {repo}\n")
+        return SweepResult()
+
+    state_dirty = False
+    for repo in selected_repos:
+        cmd = [curator_bin, "dream", "--repo-id", repo, "--nats-only"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=CURATOR_DREAM_TIMEOUT_S,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            sys.stderr.write(
+                f"github_scan_gate: curator dream for {repo} did not complete: {exc}\n"
+            )
+            continue
+
+        if proc.returncode != 0:
+            combined = f"{proc.stderr or ''}\n{proc.stdout or ''}".lower()
+            if proc.returncode == CURATOR_NO_RESPONDERS_EXIT_CODE or "no responders" in combined:
+                state["dream_no_responders_at"] = now_iso
+                _save_repo_scan_state(state, dry_run=dry_run)
+                return SweepResult()
+            detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[
+                :MAX_REASON_CHARS
+            ]
+            sys.stderr.write(
+                f"github_scan_gate: curator dream for {repo} failed: {detail}\n"
+            )
+            continue
+
+        state.pop("dream_no_responders_at", None)
+        stdout = (proc.stdout or "").strip()
+        try:
+            report = json.loads(stdout)
+        except ValueError as exc:
+            sys.stderr.write(
+                f"github_scan_gate: curator dream for {repo} returned invalid JSON: {exc}\n"
+            )
+            continue
+        if not isinstance(report, dict):
+            sys.stderr.write(
+                f"github_scan_gate: curator dream for {repo} returned non-object JSON\n"
+            )
+            continue
+
+        dream_entry = _ensure_repo_dream_entry(repos_state, repo)
+        prev_revision = str(dream_entry.get("last_revision") or "")
+        prev_hash = str(dream_entry.get("last_report_hash") or "")
+        revision = str(report.get("revision") or "").strip()
+
+        dream_entry["last_dream_at"] = now_iso
+        dream_entry["last_revision"] = revision
+        state_dirty = True
+
+        if not _dream_report_has_findings(report):
+            dream_entry["last_report_hash"] = ""
+            continue
+
+        report_hash = _dream_report_hash(repo, report)
+        if report_hash == prev_hash and revision == prev_revision:
+            continue
+
+        diary = _format_dream_diary(repo, report)
+        if _notify_dream_diary(diary):
+            dream_entry["last_report_hash"] = report_hash
+            dream_entry["last_notified_at"] = now_iso
+
+    if state_dirty:
+        _save_repo_scan_state(state, dry_run=dry_run)
+
+    return SweepResult()
+
+
 SWEEPS = {
     "issues": sweep_issues,
     "pr_comments": sweep_pr_comments,
     "memory_proposals": sweep_memory_proposals,
     "repo_memory": sweep_repo_memory,
+    "memory_dream": sweep_memory_dream,
 }
 
 # Insertion order is run order, so this is the registry read one way rather
