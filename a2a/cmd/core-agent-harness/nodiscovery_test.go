@@ -13,6 +13,11 @@ import (
 // The harness loads nothing on its own: no call in this package reaches
 // core-agent's discovery (config.Load, instruction.Load, skills.Load or
 // skills.LoadAll, mcp.Build), which read AGENTS.md, .agents/ and HOME.
+//
+// One exception: buildMCP calls mcp.Build once, on the private directory it
+// wrote the Envelope's servers into (its dir), with no home directory (a ""
+// third argument), since core-agent exports no builder that takes the servers in
+// memory. Build then reads that one file and nothing else.
 func TestTheHarnessCallsNoDiscovery(t *testing.T) {
 	banned := map[string][]string{
 		"config":      {"Load", "LoadFrom", "Discover"},
@@ -50,8 +55,39 @@ func TestTheHarnessCallsNoDiscovery(t *testing.T) {
 				t.Errorf("%s imports %s", f, path)
 			}
 		}
+		allowed := map[*ast.SelectorExpr]bool{}
+		for _, d := range file.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || f != "mcp.go" || fd.Name.Name != "buildMCP" {
+				continue
+			}
+			ast.Inspect(fd, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "Build" || !strings.HasSuffix(imports[identName(sel.X)], "/pkg/mcp") {
+					return true
+				}
+				// Only Build(<ctx>, dir, "", ...): dir is buildMCP's own
+				// MkdirTemp result, and no home directory.
+				if len(call.Args) > 2 && identName(call.Args[1]) == "dir" {
+					if lit, ok := call.Args[2].(*ast.BasicLit); ok && lit.Value == `""` {
+						allowed[sel] = true
+					}
+				}
+				return true
+			})
+		}
+		if len(allowed) > 1 {
+			t.Errorf("%s: buildMCP calls mcp.Build %d times; the exception covers one", f, len(allowed))
+		}
 		ast.Inspect(file, func(n ast.Node) bool {
 			sel, ok := n.(*ast.SelectorExpr)
+			if ok && allowed[sel] {
+				return true
+			}
 			if !ok {
 				return true
 			}
@@ -71,4 +107,11 @@ func TestTheHarnessCallsNoDiscovery(t *testing.T) {
 			return true
 		})
 	}
+}
+
+func identName(e ast.Expr) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return id.Name
+	}
+	return ""
 }

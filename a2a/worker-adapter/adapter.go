@@ -215,6 +215,11 @@ type Config struct {
 	// Empty for every other run.
 	TaskStem string
 
+	// ToolLines, when set, writes the per-tool log line for the task
+	// (toollog.go). A profile worker sets it for each task it runs; nil
+	// writes none.
+	ToolLines *ToolLines
+
 	Logger *slog.Logger
 
 	// Trajectory, when set, is the session's tool-call capture for the
@@ -443,6 +448,9 @@ type adapter struct {
 	// panicked marks a task a recovered panic ended: nothing of its answer
 	// is published after it (panic.go).
 	panicked atomic.Bool
+	// tools writes the task's per-tool log lines (Config.ToolLines), or is
+	// nil and writes none.
+	tools *toolLog
 	// askKind is the mark.ask token for the task's prompt (lib/askkind),
 	// carried on every progress line as the hermes-bridge carries it, so the
 	// gateway's reaction follows a profile task as it follows a platform one
@@ -719,6 +727,7 @@ func newTaskAdapter(cfg Config, b *busConns) *adapter {
 		js:       b.js,
 		from:     lib.Party{Session: cfg.Addressee(), AgentType: string(cfg.driver().Harness()), Profile: cfg.Profile},
 		appended: map[string]bool{},
+		tools:    newToolLog(cfg.Logger, cfg.TaskID, cfg.ToolLines),
 	}
 }
 
@@ -1295,6 +1304,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					}
 					switch ev.Kind {
 					case EventToolResult:
+						a.tools.ended(ev)
 						// A tool step's result is in: the call that wrote a
 						// record has exited. Only the record is read, never the
 						// result.
@@ -1330,6 +1340,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 						a.publishArtifactChunks(ctx, lib.ArtifactProgress, progressParts(ev.Text, a.askKind), false)
 					case EventActivity:
 						a.seam(seamActivity, ev.Tool)
+						a.tools.started(ev)
 						a.cfg.Trajectory.Record(a.taskID, ev.Tool, ev.Input, nil, time.Now())
 						a.publishActivity(ctx, ev)
 					case EventResult:

@@ -124,6 +124,18 @@ readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 # the two equal.
 readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"
 
+# A second namespace under the same kind of rule: the seeded fleet's
+# seeded-reservation on seeded-a (bench/tf/fleet/defects-a.tf, role
+# missing-reservation-autoscaled). Its one pod stays Pending on a pool whose
+# every scale-up GKE refuses. FailedScheduling is on the watcher's reason
+# list, so without this rule the pod opens an incident and a triage card on
+# each eval install, which watches the fleet. The cluster stays in scope, and
+# the stockout audit still reads the pool and the pod. The stall watch has its
+# own opt-out, an annotation the stack sets on the namespace. Equal to the
+# role's namespace in bench/tf/fleet/fixtures.json;
+# tests/test_ci_deploy_a2a_stack.py holds the two equal.
+readonly EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE="seeded-reservation"
+
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
@@ -2537,6 +2549,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "profiles.cluster.enabled=true" \
     --set "profiles.tse.enabled=true" \
     --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \
+    --set-string "platformAgent.harness.eventWatcher.alertExclude[1].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_FLEET_NAMESPACE}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
