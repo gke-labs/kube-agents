@@ -3509,9 +3509,11 @@ every message through either stamps its own backend.
   serve. A task the door doesn't hold in memory (after a gateway restart, a failover to
   another replica, or an eviction) is read from its conversation's session record and the
   task's stream: a door task keeps a `doortasks.<id>` index entry, naming its conversation, for
-  as long as the conversation's record lists the task (its last 50), and the read answers only
+  as long as the conversation's record lists the task (its last 50 tasks, delegated work
+  included, until the session is reaped), and the read answers only
   the caller whose conversation it is. A terminal on the stream gives that terminal and the
-  result; no terminal gives `working` only while the record still holds the task as active.
+  result; with no terminal, the state the stream shows is given only while the record still
+  holds the task as active.
   Such a task carries `metadata.recovered: true`, and has no posts in its history. Past that
   (the record no longer lists it, or its end has left the stream) the door doesn't know the
   task. Every not-found answer (`-32001`, here and for `tasks/cancel` and a follow-up's `taskId`)
@@ -3522,7 +3524,7 @@ every message through either stamps its own backend.
   ago that the door no longer remembers it (it keeps 4096 such ids), and equally another caller's
   id or one no door minted, so the answer still confirms nothing. A client that resubmits with a
   new `messageId` starts the task again and should expect possible duplicate work: the
-  `messageId` dedupe lives in the same memory, so a repeated `messageId` doesn't dedupe across a
+  `messageId` dedupe lives in the gateway's memory, so a repeated `messageId` doesn't dedupe across a
   restart. On the same gateway a repeated `messageId` still names the original task, so
   resubmitting an evicted task with its original `messageId` doesn't start a new run.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope

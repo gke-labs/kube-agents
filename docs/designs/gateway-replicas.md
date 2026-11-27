@@ -33,7 +33,8 @@ The code assumes one process in four places, each of which would misbehave on it
   conversation lock).
 
 The HTTP doors (inject and A2A) keep their conversations in memory too, so a request and its
-follow-up have to reach the same replica.
+follow-up have to reach the same replica. (The A2A door reads a task back from its record after
+a handover, but not a turn in flight.)
 
 ## Decision: active-standby first
 
@@ -202,7 +203,7 @@ Process memory doesn't move, and the bus doesn't hold what nobody was subscribed
   it doesn't hold from its conversation's session record and the task's stream, through a
   `doortasks.<id>` index entry the record bounds, so `tasks/get`, `tasks/cancel` and a
   follow-up reach a task the old replica accepted. A task past that (out of its record's 50-task
-  history, or its end off the stream) still reads as not found, with the reason `not-held-since-serving`, the new replica's `servingSince` and `mayHaveRun: true`. The
+  history, its session reaped, or its end off the stream) still reads as not found, with the reason `not-held-since-serving`, the new replica's `servingSince` and `mayHaveRun: true`. The
   `messageId` dedupe doesn't survive a handover, so a client that resubmits should expect
   possible duplicate work, and the inject door's transcripts are lost. Both are follow-ups
   under #4206.

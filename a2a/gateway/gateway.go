@@ -3754,15 +3754,18 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if err := g.reg.IndexTask(ctx, taskID, rec.Key); err != nil {
 		g.log.Error("task index write failed", "taskId", taskID, "err", err)
 	}
-	door := isDoorSession(rec.Key)
-	if door {
-		if err := g.reg.IndexDoorTask(ctx, taskID, rec.Key); err != nil {
-			g.log.Error("door task index write failed", "taskId", taskID, "err", err)
-		}
-	}
 	if err := g.reg.Put(ctx, rec); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
-	} else if door {
+	} else if isDoorSession(rec.Key) {
+		// The door task entry, once the record lists the task: written
+		// before, a term-start sweep reading between the two would take it
+		// for an orphan. Only a chain's root, the one task the door knows
+		// (doorVisible): a child or a wake would be an entry nothing reads.
+		if ref.rootID() == taskID {
+			if err := g.reg.IndexDoorTask(ctx, taskID, rec.Key); err != nil {
+				g.log.Error("door task index write failed", "taskId", taskID, "err", err)
+			}
+		}
 		// The trimmed tasks left the record with this write, so their door
 		// entries would lead nowhere: dropped now rather than on a read.
 		for _, id := range trimmed {

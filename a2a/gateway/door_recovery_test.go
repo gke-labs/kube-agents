@@ -189,3 +189,37 @@ func TestARecoveryReadRefusesAnIDThatIsNotATaskID(t *testing.T) {
 		t.Errorf("the locator was asked about %q", asked)
 	}
 }
+
+// A caller signed in with a token is named with its provider's prefix
+// (":google:<email>", ":entra:<oid>"), which carries colons by design so no
+// eval caller can spell it. Recovery serves those callers too, and the
+// prefix still keeps every class to its own conversations.
+func TestATokenSignedCallerRecoversItsOwnTaskAndNoOneElses(t *testing.T) {
+	t.Parallel()
+	const taskID = "task-00000000000000bb"
+	for _, c := range []struct {
+		caller, owner string
+		want          bool
+	}{
+		{a2aGoogleCallerPrefix + "alice@example.com", a2aGoogleCallerPrefix + "alice@example.com", true},
+		{a2aEntraCallerPrefix + "0f8fad5b-d9cb-469f-a165-70867728950e", a2aEntraCallerPrefix + "0f8fad5b-d9cb-469f-a165-70867728950e", true},
+		// An eval caller named like the email does not reach the token
+		// caller's conversation, nor the other way round.
+		{"alice@example.com", a2aGoogleCallerPrefix + "alice@example.com", false},
+		{a2aGoogleCallerPrefix + "alice@example.com", "alice@example.com", false},
+		{a2aGoogleCallerPrefix + "bob@example.com", a2aGoogleCallerPrefix + "alice@example.com", false},
+	} {
+		d, err := NewA2ADoor("127.0.0.1:0", a2aTestToken, A2ADoorOptions{PublicURL: a2aTestPublicURL, DefaultAddressee: "platform"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := a2aConversationKey(c.owner, "ctx-00000000000000bb")
+		d.SetTaskLocator(func(context.Context, string) (string, error) { return key, nil })
+		d.SetProbe(func(context.Context, string, string) (ConversationState, error) {
+			return ConversationState{ContextID: "ctx-bus", TaskID: taskID, Final: true, ExecutorState: lib.StateCompleted, Result: "r"}, nil
+		})
+		if got := d.recoverTask(context.Background(), taskID, c.caller); got != c.want {
+			t.Errorf("caller %q on %q's conversation: recovered = %v, want %v", c.caller, c.owner, got, c.want)
+		}
+	}
+}

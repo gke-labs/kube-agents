@@ -1116,6 +1116,13 @@ func TestTheA2ADoorShowsADelegatingTurnAsOneTask(t *testing.T) {
 		if resp := r.rpc(t, a2aTestCaller, a2aMethodGet, map[string]any{"id": id}); resp.Error == nil {
 			t.Fatalf("the door knows the chain's inner task %s", id)
 		}
+		// Nor does the door task index: only the root gets an entry.
+		if doorKeyExists(t, r.g, id) {
+			t.Errorf("the chain's inner task %s has a door entry", id)
+		}
+	}
+	if !doorKeyExists(t, r.g, root.ID) {
+		t.Errorf("the chain's root %s has no door entry", root.ID)
 	}
 }
 

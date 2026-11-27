@@ -29,13 +29,15 @@ func (d *A2ADoor) SetTaskLocator(locate TaskLocator) {
 // rather than a task that reads as running forever.
 //
 // Ownership is the conversation key: the index must name one under caller's
-// own prefix (a2a:<caller>:) before anything of the task is read. A caller
-// never contains a colon (callerOf refuses one), which is what already keeps
-// two callers from spelling one conversation key, so the prefix is caller's
-// alone. The task's contextId is the rest of the key: the door's, which is
-// what the caller sent or was given, not the record's bus contextId. A miss
-// for any reason is the same miss, so the answer confirms nothing about
-// another caller's ids.
+// own prefix (a2a:<caller>:) before anything of the task is read. The
+// prefix is caller's alone for the reason the conversation key is: an eval
+// caller never contains a colon (callerOf), and a token-signed caller is
+// its provider's prefix (":google:", ":entra:", each opening with a colon no
+// eval caller has) and an identity with none, an email or an object id. The
+// task's contextId is the rest of the key: the door's, which is what the
+// caller sent or was given, not the record's bus contextId. A miss for any
+// reason is the same miss, so the answer confirms nothing about another
+// caller's ids.
 func (d *A2ADoor) recoverTask(ctx context.Context, taskID, caller string) bool {
 	if !lib.ValidSubjectToken(taskID) {
 		// Not a task id: nothing is formatted into a KV key or a subject.
@@ -58,7 +60,7 @@ func (d *A2ADoor) recoverTask(ctx context.Context, taskID, caller string) bool {
 		return false
 	}
 	contextID, own := strings.CutPrefix(key, a2aConversationKey(caller, ""))
-	if !own || contextID == "" || strings.ContainsRune(caller, ':') {
+	if !own || contextID == "" {
 		return false
 	}
 	st, err := probe(ctx, key, taskID)
@@ -86,7 +88,14 @@ func (d *A2ADoor) recoverTask(ctx context.Context, taskID, caller string) bool {
 		return false
 	}
 	if task == nil {
-		task = &a2aTask{id: taskID, created: time.Now()}
+		// Created when it was submitted, where the record says: a running
+		// task's conversation stays live (liveLocked) for the task deadline
+		// from then, not from this read.
+		created := time.Now()
+		if st.Active && !st.SubmittedAt.IsZero() {
+			created = st.SubmittedAt
+		}
+		task = &a2aTask{id: taskID, created: created}
 		d.taskOrder = append(d.taskOrder, taskID)
 		for len(d.taskOrder) > a2aMaxTasks {
 			d.evictOldestTaskLocked(task)

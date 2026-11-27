@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -187,5 +188,71 @@ func TestTheDoorIndexSweepDropsOrphansAndKeepsListedTasks(t *testing.T) {
 	}
 	if !doorKeyExists(t, r.g, "task-sweep-kept") || doorKeyExists(t, r.g, "task-sweep-orphan") {
 		t.Error("the sweep kept the wrong entry")
+	}
+}
+
+// A delegating turn is one task to the door: its children and the wakes
+// that continue it are listed on the same record, and never answered for.
+func TestLocateDoorTaskAnswersOnlyForAChainsRoot(t *testing.T) {
+	t.Parallel()
+	r := startRig(t)
+	ctx := context.Background()
+	key := a2aConversationKey(a2aTestCaller, "ctx-chain")
+	rec := doorRecord(key, "task-chain-root")
+	rec.Tasks = append(rec.Tasks,
+		TaskRef{ID: "task-chain-child", Addressee: "platform", ParentTaskID: "task-chain-root", RootTaskID: "task-chain-root"},
+		TaskRef{ID: "task-chain-wake", Addressee: "platform", RootTaskID: "task-chain-root"})
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"task-chain-root", "task-chain-child", "task-chain-wake"} {
+		if err := r.g.reg.IndexTask(ctx, id, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := r.g.reg.LocateDoorTask(ctx, "task-chain-root"); err != nil || got != key {
+		t.Errorf("root: LocateDoorTask = %q, %v; want %q", got, err, key)
+	}
+	for _, id := range []string{"task-chain-child", "task-chain-wake"} {
+		if got, err := r.g.reg.LocateDoorTask(ctx, id); err != nil || got != "" {
+			t.Errorf("%s: LocateDoorTask = %q, %v; want a miss", id, got, err)
+		}
+	}
+}
+
+// The door entry is written after the record lists the task, never before:
+// a term-start sweep reading between the two would take a fresh entry for
+// an orphan and drop it.
+func TestADoorTaskEntryIsWrittenOnlyOnceItsRecordListsIt(t *testing.T) {
+	t.Parallel()
+	r := startA2ADoorRig(t)
+	var mu sync.Mutex
+	var early []string
+	// Runs on the gateway's goroutine, so it touches nothing of t.
+	r.g.reg.beforePut = func(rec *SessionRecord) error {
+		if !isDoorSession(rec.Key) {
+			return nil
+		}
+		ctx := context.Background()
+		kv, err := r.g.reg.kv(ctx)
+		if err != nil {
+			return nil
+		}
+		stored, _ := r.g.reg.Get(ctx, rec.Key)
+		for _, ref := range rec.Tasks {
+			if _, err := kv.Get(ctx, doorTaskKey(ref.ID)); err == nil && (stored == nil || !stored.listsTask(ref.ID)) {
+				mu.Lock()
+				early = append(early, ref.ID)
+				mu.Unlock()
+			}
+		}
+		return nil
+	}
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("ordered", "m-order", "", false)))
+	waitFor(t, "the door entry", func() bool { return doorKeyExists(t, r.g, task.ID) })
+	mu.Lock()
+	defer mu.Unlock()
+	if len(early) != 0 {
+		t.Errorf("door entries written before their record listed them: %q", early)
 	}
 }

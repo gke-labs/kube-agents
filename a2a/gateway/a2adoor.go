@@ -351,9 +351,8 @@ type A2ADoor struct {
 
 	handlerMu sync.RWMutex
 	handler   func(InboundMessage)
-	// probe is the gateway's ConversationProbe (ProbeSink), set before Run
-	// and not read yet: the read that consults it, for a task the door
-	// stopped holding across a restart, is a later change.
+	// probe is the gateway's ConversationProbe (ProbeSink), set before Run:
+	// recoverTask's read of a task the door doesn't hold.
 	probe ConversationProbe
 	// locate is the gateway's door task index (TaskLocatorSink), under mu:
 	// how a task this door didn't see start is found (recoverTask).
@@ -1494,9 +1493,9 @@ func (d *A2ADoor) TaskTerminal(conversation, taskID string, state lib.TaskState,
 	if !ok {
 		// A task the door did not see start: a restart between the two
 		// ends. Recorded so the line edit and the conversation's log have
-		// somewhere to land; no caller can read it (the conversation knows
-		// no caller after a restart), which is the restart gap the read
-		// through the gateway's probe will close.
+		// somewhere to land. The conversation knows no caller after a
+		// restart, so no caller reads it as it stands: recoverTask adopts it
+		// for its owner, checked against the record, on the first read.
 		task = &a2aTask{id: taskID, key: conversation, contextID: conv.contextID, caller: conv.caller, created: time.Now()}
 		d.tasks[taskID] = task
 		d.taskOrder = append(d.taskOrder, taskID)
