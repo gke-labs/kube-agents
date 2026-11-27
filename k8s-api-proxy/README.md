@@ -61,6 +61,75 @@ followed only on `https://` to the host and port being fetched, a configured `Ke
 verified against instead of the system roots; it is re-read when it changes, like the server
 certificate below, and the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
+`pkg/mtlsauth` holds two authenticators for an embedder whose callers arrive over mutual TLS. The
+binary has no `--auth-mode` for them yet; its flags arrive in a following change. Neither imports
+`client-go`.
+
+```go
+// The caller is the certificate: a workload's SPIFFE X.509-SVID, for example.
+workloads, err := mtlsauth.NewClientCertAuthenticator(mtlsauth.ClientCertConfig{
+	ClientCAFile:      "/etc/proxy/workload-ca.crt",
+	IdentitySource:    mtlsauth.SourceURI, // or SourceDNS, SourceCN
+	RequiredURIPrefix: "spiffe://example.org/ns/agents/",
+})
+
+// The caller is whoever an allowed front proxy names in request headers.
+gateway, err := mtlsauth.NewFrontProxyAuthenticator(mtlsauth.FrontProxyConfig{
+	ClientCAFile:     "/etc/proxy/gateway-ca.crt",
+	NameSource:       mtlsauth.SourceURI,
+	AllowedNames:     []string{"spiffe://example.org/ns/gateways/sa/egress"},
+	UsernameHeaders:  []string{"X-Caller-User"},
+	GroupHeaders:     []string{"X-Caller-Group"},
+	PartitionHeaders: []string{"X-Caller-Tenant"},
+})
+
+handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+	Authenticator:      gateway,
+	ExtraCallerHeaders: gateway.HeaderNames(), // the identity headers stop at the proxy
+	// ...
+})
+```
+
+Both read the client certificate from `Request.TLS`, so the listener must ask for one:
+`tls.VerifyClientCertIfGiven` with `ClientCAs` from `certreload.NewCAPoolUnion` over every
+authenticator's bundle (set per handshake through `GetConfigForClient`, so a rotated bundle is
+advertised) keeps certificate-less requests such as health probes working. Each authenticator
+then verifies the certificate again on every request, against its own bundle only, for client
+authentication, at the current time: a certificate that expired or whose CA left the bundle is
+refused on the next request of a connection that is already open, HTTP/2 included, and a
+certificate issued under one authenticator's CA is nothing to the other. A certificate with no
+extended key usage extension is accepted, as `crypto/x509` accepts it; one that lists usages
+without client authentication is refused. Revocation (CRL, OCSP) is not checked. The bundle is
+reloaded like `Config.CAFile` above (`Reload` takes the `certreload.Options`); one that stops
+loading is reported and the last good one keeps verifying, so neither authenticator ever answers 503.
+
+The peer's name comes from the one certificate field the configuration names (`uri`, `dns` or
+`cn`). No other field is tried when it is missing, and a certificate with two values there (two
+URI SANs, two DNS SANs, two common names) is refused. Names are compared byte for byte.
+`ClientCertAuthenticator` uses the name as `CallerIdentity.Username` and fills nothing else;
+`AllowedIdentities` admits only the listed names and `RequiredURIPrefix` (with `uri` only) only
+names that start with it, so end the prefix at a `/`. Without either, every client certificate
+the CA issues is a caller.
+
+`FrontProxyAuthenticator` requires the peer's name in `AllowedNames` and then believes the
+request's headers. Each of `UsernameHeaders`, `UIDHeaders` and `PartitionHeaders` is an ordered
+list: the first header present in the request is read and must hold exactly one non-empty value,
+with no fallback to a later name. The username is always required, and the UID and the partition
+are required once their headers are configured, so a caller never lands in the empty partition.
+Every value of every `GroupHeaders` header is a group, not split at commas. `AllowedPartitions`
+admits only the listed partitions, with the rules of `jwtauth`'s. A header name may appear in one
+list only. Every peer in `AllowedNames` can name any caller, so give front proxies a CA of their
+own and list only the proxies that authenticate their callers and overwrite these headers.
+
+In a chain of authenticators the two refuse differently. No client certificate, a certificate
+that does not verify against the authenticator's bundle, one without a single name in the
+configured field, and a name the allowlist or prefix does not admit are plain errors: the next
+authenticator is tried, which is how a workload's certificate passes the front-proxy
+authenticator and reaches its own. An allowed front proxy whose headers are missing, empty,
+repeated or name a partition that is not allowed is refused with an error wrapping
+`k8sapiproxy.ErrCallerRefused`, which ends the chain: no later authenticator admits the request
+on a credential the proxy only forwarded.
+
 `upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
 Application Default Credentials): it describes the cluster through the Container API and picks its
@@ -146,6 +215,9 @@ not load, such as one read mid-rotation, is logged, counted in
 being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
 `Transport` verifies each new connection against the current bundle, with hostname and IP SAN
 checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+`certreload.NewCAPoolUnion` pools several bundles, such as the client CAs a listener advertises
+for more than one authenticator; each file reloads on its own, and one that stops loading keeps
+its last good certificates in the pool while the others follow their files.
 
 Cached responses and coalesced fetches are shared across callers, which is safe while the
 `UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
@@ -344,6 +416,6 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
 `AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
-`AuditEvent`, `proxyserver.Run` and `proxyserver.Options` may change in any release. The version moves with every
+`AuditEvent`, `proxyserver.Run`, `proxyserver.Options` and `pkg/mtlsauth` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

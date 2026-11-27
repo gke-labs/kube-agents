@@ -646,3 +646,101 @@ func TestServerCertificateReportsARepeatedFailureAfterRecovery(t *testing.T) {
 		t.Errorf("%d reload errors reported, want 2: the file went missing twice", n)
 	}
 }
+
+// trusts reports whether pool holds ca's certificate.
+func trusts(pool *CAPool, ca *authority) bool {
+	_, err := ca.cert.Verify(x509.VerifyOptions{Roots: pool.Pool()})
+	return err == nil
+}
+
+// wantTrust fails the test unless pool trusts exactly the authorities marked true.
+func wantTrust(t *testing.T, when string, pool *CAPool, want map[*authority]bool) {
+	t.Helper()
+	for ca, trusted := range want {
+		if got := trusts(pool, ca); got != trusted {
+			t.Errorf("%s: CA %q trusted = %t, want %t", when, ca.cert.Subject.CommonName, got, trusted)
+		}
+	}
+}
+
+func TestCAPoolUnionHoldsEveryBundleAndFollowsEachRotation(t *testing.T) {
+	first, second, third := newAuthority(t, "first-ca"), newAuthority(t, "second-ca"), newAuthority(t, "third-ca")
+	dir := t.TempDir()
+	firstFile, secondFile := filepath.Join(dir, caName), filepath.Join(dir, bundleName)
+	writeFile(t, firstFile, first.pem)
+	writeFile(t, secondFile, second.pem)
+
+	clock, log := newClock(), &errorLog{}
+	// A path listed twice is one bundle.
+	pool, err := NewCAPoolUnion([]string{firstFile, secondFile, firstFile}, testOptions(clock, log))
+	if err != nil {
+		t.Fatalf("NewCAPoolUnion: %v", err)
+	}
+	wantTrust(t, "after the first load", pool, map[*authority]bool{first: true, second: true, third: false})
+
+	writeFile(t, firstFile, third.pem)
+	wantTrust(t, "within the check interval", pool, map[*authority]bool{first: true, second: true, third: false})
+	clock.advance()
+	wantTrust(t, "after one bundle rotated", pool, map[*authority]bool{first: false, second: true, third: true})
+
+	// A bundle may hold several CAs during a rotation.
+	writeFile(t, secondFile, append(append([]byte{}, second.pem...), first.pem...))
+	clock.advance()
+	wantTrust(t, "after the other bundle grew", pool, map[*authority]bool{first: true, second: true, third: true})
+	if n := log.count(); n != 0 {
+		t.Errorf("%d reload errors reported, want none", n)
+	}
+}
+
+func TestCAPoolUnionKeepsABundleThatFailsToLoadAndFollowsTheOthers(t *testing.T) {
+	first, second, third := newAuthority(t, "first-ca"), newAuthority(t, "second-ca"), newAuthority(t, "third-ca")
+	dir := t.TempDir()
+	firstFile, secondFile := filepath.Join(dir, caName), filepath.Join(dir, bundleName)
+	writeFile(t, firstFile, first.pem)
+	writeFile(t, secondFile, second.pem)
+
+	clock, log := newClock(), &errorLog{}
+	pool, err := NewCAPoolUnion([]string{firstFile, secondFile}, testOptions(clock, log))
+	if err != nil {
+		t.Fatalf("NewCAPoolUnion: %v", err)
+	}
+
+	writeFile(t, firstFile, []byte("not PEM"))
+	writeFile(t, secondFile, third.pem)
+	clock.advance()
+	wantTrust(t, "with one bundle unreadable", pool, map[*authority]bool{first: true, second: false, third: true})
+	if n := log.count(); n != 1 {
+		t.Errorf("%d reload errors reported, want 1 for the bundle that did not load", n)
+	}
+
+	// The same bad version is not reported again.
+	clock.advance()
+	wantTrust(t, "at the next check", pool, map[*authority]bool{first: true, second: false, third: true})
+	if n := log.count(); n != 1 {
+		t.Errorf("%d reload errors reported after a second check, want still 1", n)
+	}
+
+	writeFile(t, firstFile, second.pem)
+	clock.advance()
+	wantTrust(t, "after the bundle recovered", pool, map[*authority]bool{first: false, second: true, third: true})
+}
+
+func TestNewCAPoolUnionFailsFast(t *testing.T) {
+	ca := newAuthority(t, "ca")
+	dir := t.TempDir()
+	good, bad := filepath.Join(dir, caName), filepath.Join(dir, bundleName)
+	writeFile(t, good, ca.pem)
+	writeFile(t, bad, []byte("not PEM"))
+	for name, files := range map[string][]string{
+		"no file":        nil,
+		"empty path":     {good, ""},
+		"missing file":   {good, filepath.Join(dir, "absent.pem")},
+		"bundle not PEM": {good, bad},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewCAPoolUnion(files, Options{}); err == nil {
+				t.Error("NewCAPoolUnion succeeded, want an error")
+			}
+		})
+	}
+}
