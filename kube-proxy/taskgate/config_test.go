@@ -3,6 +3,7 @@ package taskgate
 import (
 	"bytes"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,9 @@ import (
 const (
 	testIdentityMap = `{"` + testWorker + `": {"profile": "` + testProfile + `", "tier": "` + testTier + `"}}`
 	testEntry       = `{"profile":"a","tier":"b"}`
+	testAudience    = "kubeagents-profile-audience"
+	testSecondUser  = "system:serviceaccount:agents:fixer-write"
+	testThirdUser   = "system:serviceaccount:a-first:worker"
 )
 
 func envOf(values map[string]string) func(string) string {
@@ -101,6 +105,9 @@ func TestLoadConfig(t *testing.T) {
 		"a malformed key list alone":  {SigningKeysEnv: "not-a-key"},
 		"a malformed lifetime alone":  {MaxLifetimeEnv: "soon"},
 		"an empty map and a bad list": {IdentitiesEnv: "{}", SigningKeysEnv: "not-a-key"},
+		"a profile audience alone":    {ProfileAudienceEnv: testAudience},
+		"an empty map and audience":   {IdentitiesEnv: "{}", ProfileAudienceEnv: testAudience},
+		"a blank map and audience":    {IdentitiesEnv: " ", ProfileAudienceEnv: testAudience, SigningKeysEnv: pub},
 	} {
 		cfg, err := LoadConfig(envOf(env))
 		if err != nil || cfg != nil {
@@ -118,12 +125,12 @@ func TestLoadConfig(t *testing.T) {
 		keys     int
 		lifetime time.Duration
 	}{
-		"one key":         {map[string]string{IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub}, 1, taskcred.DefaultMaxLifetime},
-		"two keys":        {map[string]string{IdentitiesEnv: testIdentityMap, SigningKeysEnv: " " + pub + " , " + second + "\n"}, 2, taskcred.DefaultMaxLifetime},
-		"no key":          {map[string]string{IdentitiesEnv: testIdentityMap}, 0, taskcred.DefaultMaxLifetime},
-		"a lifetime":      {map[string]string{IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: " 2h30m\n"}, 1, 150 * time.Minute},
-		"the ceiling":     {map[string]string{IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "168h"}, 1, maxLifetimeCeiling},
-		"a blank ceiling": {map[string]string{IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "  "}, 1, taskcred.DefaultMaxLifetime},
+		"one key":         {map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub}, 1, taskcred.DefaultMaxLifetime},
+		"two keys":        {map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: " " + pub + " , " + second + "\n"}, 2, taskcred.DefaultMaxLifetime},
+		"no key":          {map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience}, 0, taskcred.DefaultMaxLifetime},
+		"a lifetime":      {map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: " 2h30m\n"}, 1, 150 * time.Minute},
+		"the ceiling":     {map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "168h"}, 1, maxLifetimeCeiling},
+		"a blank ceiling": {map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "  "}, 1, taskcred.DefaultMaxLifetime},
 	} {
 		cfg, err := LoadConfig(envOf(tc.env))
 		if err != nil || cfg == nil {
@@ -133,21 +140,27 @@ func TestLoadConfig(t *testing.T) {
 		if len(cfg.SigningKeys) != tc.keys || cfg.MaxLifetime != tc.lifetime || cfg.Identities[testWorker] != (Identity{Profile: testProfile, Tier: testTier}) {
 			t.Errorf("%s: config = %+v, want %d keys, lifetime %s and the worker's identity", name, *cfg, tc.keys, tc.lifetime)
 		}
+		if cfg.ProfileAudience != testAudience || !slices.Equal(cfg.WorkerUsernames(), []string{testWorker}) {
+			t.Errorf("%s: profile audience %q for %v, want %q for the map's one worker", name, cfg.ProfileAudience, cfg.WorkerUsernames(), testAudience)
+		}
 	}
 
 	// A startup error.
 	for name, env := range map[string]map[string]string{
-		"a malformed map":       {IdentitiesEnv: `{"alice": ` + testEntry + `}`, SigningKeysEnv: pub},
-		"a map that is a list":  {IdentitiesEnv: `[]`},
-		"a key that is not one": {IdentitiesEnv: testIdentityMap, SigningKeysEnv: "not-a-key"},
-		"an empty key element":  {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub + ",," + second},
-		"one key twice":         {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub + "," + pub},
-		"three keys":            {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub + "," + second + "," + third},
-		"a lifetime of words":   {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "soon"},
-		"a bare number":         {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "3600"},
-		"a zero lifetime":       {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "0s"},
-		"a negative lifetime":   {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "-1h"},
-		"past the ceiling":      {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, MaxLifetimeEnv: "169h"},
+		"a malformed map":       {IdentitiesEnv: `{"alice": ` + testEntry + `}`, SigningKeysEnv: pub, ProfileAudienceEnv: testAudience},
+		"a map that is a list":  {IdentitiesEnv: `[]`, ProfileAudienceEnv: testAudience},
+		"no profile audience":   {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub},
+		"a blank audience":      {IdentitiesEnv: testIdentityMap, SigningKeysEnv: pub, ProfileAudienceEnv: " \n"},
+		"no audience, no key":   {IdentitiesEnv: testIdentityMap},
+		"a key that is not one": {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: "not-a-key"},
+		"an empty key element":  {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub + ",," + second},
+		"one key twice":         {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub + "," + pub},
+		"three keys":            {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub + "," + second + "," + third},
+		"a lifetime of words":   {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "soon"},
+		"a bare number":         {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "3600"},
+		"a zero lifetime":       {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "0s"},
+		"a negative lifetime":   {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "-1h"},
+		"past the ceiling":      {IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience, SigningKeysEnv: pub, MaxLifetimeEnv: "169h"},
 	} {
 		if cfg, err := LoadConfig(envOf(env)); err == nil {
 			t.Errorf("%s: LoadConfig = %+v, want an error", name, cfg)
@@ -158,10 +171,48 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
+// A map that names workers needs the audience the proxy admits them for, and the error
+// names both variables; the audience is read with the whitespace around it dropped.
+func TestLoadConfigProfileAudience(t *testing.T) {
+	_, err := LoadConfig(envOf(map[string]string{IdentitiesEnv: testIdentityMap}))
+	if err == nil || !strings.Contains(err.Error(), ProfileAudienceEnv) || !strings.Contains(err.Error(), IdentitiesEnv) {
+		t.Errorf("LoadConfig with workers and no audience: err = %v, want one naming %s and %s", err, ProfileAudienceEnv, IdentitiesEnv)
+	}
+	cfg, err := LoadConfig(envOf(map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: " " + testAudience + "\n"}))
+	if err != nil || cfg == nil || cfg.ProfileAudience != testAudience {
+		t.Errorf("LoadConfig with a padded audience = %+v, %v; want the audience %q", cfg, err, testAudience)
+	}
+}
+
+// The usernames the proxy admits for the profile audience are the identity map's keys, all
+// of them, sorted, in a slice that is not the configuration's.
+func TestWorkerUsernames(t *testing.T) {
+	cfg := Config{Identities: map[string]Identity{
+		testWorker:     {Profile: testProfile, Tier: testTier},
+		testSecondUser: {Profile: "fixer", Tier: "write"},
+		testThirdUser:  {Profile: testProfile, Tier: testTier},
+	}}
+	want := []string{testThirdUser, testWorker, testSecondUser}
+	got := cfg.WorkerUsernames()
+	if !slices.Equal(got, want) {
+		t.Fatalf("WorkerUsernames = %v, want %v", got, want)
+	}
+	got[0] = testNonWorker
+	if again := cfg.WorkerUsernames(); !slices.Equal(again, want) {
+		t.Errorf("WorkerUsernames after the caller changed its slice = %v, want %v", again, want)
+	}
+	if _, named := cfg.Identities[testNonWorker]; named || len(cfg.Identities) != len(want) {
+		t.Errorf("the identity map changed: %v", cfg.Identities)
+	}
+	if got := (Config{}).WorkerUsernames(); len(got) != 0 {
+		t.Errorf("WorkerUsernames of no map = %v, want none", got)
+	}
+}
+
 // Workers named and no key: the binary starts, says so once, and refuses every worker.
 func TestFromEnvWithNoKeyStartsAndWarnsOnce(t *testing.T) {
 	var logs bytes.Buffer
-	hook, err := FromEnv(envOf(map[string]string{IdentitiesEnv: testIdentityMap}), slog.New(slog.NewJSONHandler(&logs, nil)))
+	hook, err := FromEnv(envOf(map[string]string{IdentitiesEnv: testIdentityMap, ProfileAudienceEnv: testAudience}), slog.New(slog.NewJSONHandler(&logs, nil)))
 	if err != nil || hook == nil {
 		t.Fatalf("FromEnv = (set=%v, %v); want a hook", hook != nil, err)
 	}
