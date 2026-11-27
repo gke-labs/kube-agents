@@ -54,7 +54,9 @@ func TestARefusedToolGrantLogsItsOwnMessage(t *testing.T) {
 			name:    "web search",
 			env:     with(map[string]string{"A2A_ALLOWED_TOOLS": "Read,WebSearch"}),
 			wantMsg: "the worker's tool grant is refused",
-			wantErr: "web search has no core-agent grant yet",
+			// The refusal's wording is coreAgentSessionGrant's; this pins
+			// only that it names web search.
+			wantErr: "web search",
 		},
 		{
 			name:    "unknown harness",
