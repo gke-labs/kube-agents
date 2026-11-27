@@ -507,5 +507,96 @@ class KccCollectorSoulRoutingTest(unittest.TestCase):
         self.assertIn("could not be read or is unserved/unestablished", cluster_soul)
 
 
+class KubeDnsAutoscalingDiagnosticsTest(unittest.TestCase):
+    """Pins #5736 DNS autoscaling and NodeLocal DNSCache diagnostics across cluster and platform skills."""
+
+    def test_service_connectivity_diagnoses_kube_dns_autoscaler_and_nodelocal(self):
+        for rel in (
+            "agents/cluster/skills/service-connectivity/SKILL.md",
+            "agents/cluster/persona/skills/service-connectivity/SKILL.md",
+        ):
+            content = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for expected in (
+                "lookup ... i/o timeout",
+                "Temporary failure in name resolution",
+                "SERVFAIL",
+                "Deployment/kube-dns",
+                "Deployment/kube-dns-autoscaler",
+                "ConfigMap/kube-dns-autoscaler",
+                "--ignore-not-found",
+                "nodesPerReplica",
+                "coresPerReplica",
+                "preventSinglePointFailure",
+                "includeUnschedulableNodes",
+                "DaemonSet/node-local-dns",
+                "kubectl top pods -n kube-system -l k8s-app=kube-dns",
+                "autopilot,networkConfig.dnsConfig,addonsConfig.dnsCacheConfig",
+                "GKE 1.36+",
+                "capped at `500`",
+                "NodeLocal DNSCache",
+                "CLOUD_DNS",
+                "do **not** propose `ConfigMap/kube-dns-autoscaler` edits",
+                "169.254.20.10",
+                "169.254.169.254",
+            ):
+                self.assertIn(expected, content, f"{rel} missing {expected!r}")
+
+    def test_triage_scan_soul_router_and_session_persona_do_not_skip_kube_system_for_dns(self):
+        cluster_soul = (REPO_ROOT / "agents/cluster/SOUL.md").read_text(encoding="utf-8")
+        section = cluster_soul[cluster_soul.index("## 3. Skill Discovery") : cluster_soul.index("## 4.")]
+        self.assertIn("DNS resolution symptoms", section)
+        self.assertIn("service-connectivity", section)
+
+        session_persona = (REPO_ROOT / "a2a/persona/session/persona.md").read_text(encoding="utf-8")
+        self.assertIn("DNS resolution timeouts", session_persona)
+        self.assertIn("kube-dns", session_persona)
+
+        for rel in (
+            "agents/cluster/skills/workload-triage-scan/SKILL.md",
+            "agents/cluster/persona/skills/workload-triage-scan/SKILL.md",
+        ):
+            content = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("DNS resolution symptoms", content, rel)
+            self.assertIn("kube-dns-autoscaler", content, rel)
+            self.assertIn("service-connectivity", content, rel)
+            step3 = content[content.index("3. If the scan ends") : content.index("4. Otherwise,")]
+            self.assertIn("do not stop on a healthy pod scan", step3, rel)
+            self.assertIn("system namespaces or DNS", step3, rel)
+
+        for rel in (
+            "agents/cluster/skills/gke-workload-troubleshooting/SKILL.md",
+            "agents/cluster/persona/skills/gke-workload-troubleshooting/SKILL.md",
+        ):
+            content = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("DNS resolution timeouts", content, rel)
+            self.assertIn("kube-dns-autoscaler", content, rel)
+            self.assertIn("node-local-dns", content, rel)
+
+    def test_gke_networking_appends_kube_dns_autoscaler_and_nodelocal_guidance(self):
+        for rel in (
+            "agents/platform/skills/gke-networking/SKILL.md",
+            "agents/platform/skill-overlays/gke-networking/append.md",
+        ):
+            content = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for expected in (
+                "autopilot,networkConfig.dnsConfig,addonsConfig.dnsCacheConfig",
+                "ConfigMap/kube-dns-autoscaler",
+                "nodesPerReplica",
+                "coresPerReplica",
+                "preventSinglePointFailure",
+                "includeUnschedulableNodes",
+                '"max":100',
+                "capped at `500`",
+                "NodeLocal DNSCache",
+                "hostNetwork: false",
+                "hostNetwork: true",
+                "ClusterIP/32",
+                "addonsConfig.dnsCacheConfig.enabled",
+                "networkConfig.dnsConfig.clusterDns: CLOUD_DNS",
+                "until manually scaled to 0",
+            ):
+                self.assertIn(expected, content, f"{rel} missing {expected!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

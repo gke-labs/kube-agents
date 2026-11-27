@@ -1142,6 +1142,14 @@
 # noop, read-only, no fixture, 200s default until it has a record.
 ./tasks/cluster-agent-kcc-audit-collector/task.yaml
 
+# DNS resolution timeout diagnosis during rapid node scale-outs (#5736):
+# verifies the Cluster Agent inspects kube-system DNS components (kube-dns,
+# kube-dns-autoscaler ConfigMap nodesPerReplica/coresPerReplica, node-local-dns)
+# without skipping kube-system and recommends kube-dns-autoscaler overrides plus
+# NodeLocal DNSCache / Cloud DNS (CLOUD_DNS) without mutating the cluster.
+# deployer: noop, read-only, no fixture, 200s default until it has a record.
+./tasks/cluster-agent-kube-dns-autoscaling-diagnosis/task.yaml
+
 # Pending pods with "Insufficient cpu" whose cause is that they name no
 # ComputeClass while the pool carries a compute-class label (#2528): the
 # pod-pending-scheduling skill names the pre-filter skip, states the server's
