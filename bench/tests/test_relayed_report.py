@@ -833,6 +833,38 @@ def test_inject_an_opening_whose_door_is_lost_after_a_read_still_cleans_up_its_s
     assert door.archived == ["card-1"] and door.purged == ["card-1"]
 
 
+def test_inject_a_graded_opening_that_lost_its_context_id_still_cleans_up_its_session(door, monkeypatch):
+    # Any exit of the turn whose result came out without the contextId (a
+    # deadline read with no probe, a last read whose probe had none) still
+    # carries the one the turn's reads reported.
+    built = harness._inject_result
+
+    def _without_context(*args, **kwargs):
+        result = built(*args, **kwargs)
+        result.metadata["context_id"] = None
+        return result
+
+    monkeypatch.setattr(harness, "_inject_result", _without_context)
+    door.relayed = []
+    got = _run(door)
+    assert _infra(got), got.errors
+    assert set(door.session_reads) == {board.api_session_id("ctx-a")}
+    assert door.archived == ["card-1"] and door.purged == ["card-1"]
+
+
+def test_merged_tokens_keep_usage_partial_a_flag_across_turns():
+    from kube_agents_bench.card_wake import _add_tokens
+
+    tokens: dict = {}
+    for _ in range(3):
+        _add_tokens(tokens, {"input": 10, "usage_partial": True})
+    assert tokens["usage_partial"] is True and tokens["input"] == 30
+    mixed: dict = {}
+    _add_tokens(mixed, {"usage_partial": False})
+    _add_tokens(mixed, {"usage_partial": True})
+    assert mixed["usage_partial"] is True
+
+
 def test_inject_the_cleanup_leaves_a_sibling_sessions_cards_alone(door, monkeypatch):
     # A sibling unit in the parallel phase filed a live card on the same
     # board in this run's window: only this conversation's session is

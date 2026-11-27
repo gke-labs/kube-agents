@@ -5449,7 +5449,28 @@ class KubeAgentsHarness(AgentHarness):
             _PINNED_EVAL_RUN_ID.reset(tag)
 
     def _execute_inject(self, prompt: str, *, follow_up: _InjectFollowUp | None = None) -> AgentResult:
+        """The inject transport (:meth:`_execute_inject_turn`), with the
+        conversation's session record on every result it returns.
+
+        The door reports the conversation's contextId on the reads the turn
+        polls, and a caller that cleans up after the turn by its session
+        (the relayed-report run's card cleanup) needs it whatever way the
+        turn ended: graded, infrastructure, or lost mid-wait. A result that
+        doesn't carry one gets the last contextId any read of the turn
+        reported (``InjectTask.last_context_id``), in this one place rather
+        than at each of the turn's exits.
+        """
+        tasks: list[inject.InjectTask] = []
+        result = self._execute_inject_turn(prompt, follow_up=follow_up, tasks=tasks)
+        return _with_context(result, _last_context_id(tasks[0]) if tasks else "")
+
+    def _execute_inject_turn(
+        self, prompt: str, *, follow_up: _InjectFollowUp | None = None, tasks: list[inject.InjectTask] | None = None
+    ) -> AgentResult:
         """The inject transport: send the prompt through the gateway's front door.
+
+        ``tasks`` receives the turn's :class:`inject.InjectTask` once it is
+        built, so :meth:`_execute_inject` can read what its reads reported.
 
         ``follow_up`` makes this a second message on a conversation an
         earlier turn of the same run opened (the reply of a
@@ -5788,6 +5809,8 @@ class KubeAgentsHarness(AgentHarness):
             message_id=message_id,
             **addressed,
         )
+        if tasks is not None:
+            tasks.append(task)
 
         # A stopped ask waits on nothing it filed: the stop is the point. Sent
         # after the opening turn ends, or, for a mid-turn stop, while it runs,
