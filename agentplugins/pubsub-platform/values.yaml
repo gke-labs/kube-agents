@@ -5,5 +5,6 @@ agentRef: "platform-agent"
 # OCI image holding the adapter. No default: it is published to whichever registry the
 # installing project can push to, so a default here would either name someone else's
 # registry or fail at pull time. install.sh builds it and derives the reference from the
-# Artifact Registry the agent's own image is in, unless PLUGIN_IMAGE says otherwise.
+# Artifact Registry the agent's own image is in when an install can push there, unless
+# PLUGIN_IMAGE says otherwise.
 image: ""
