@@ -1673,11 +1673,15 @@ class ChatMessageTests(unittest.TestCase):
         self.assertNotIn(watch.PLATFORM_MANAGED_PHRASE, watch.due_chat_item(chat_item(cause="unknown")))
 
     def test_a_long_platform_managed_item_keeps_the_phrase(self) -> None:
-        item = chat_item(name="n" * 60, namespace="s" * 50, cluster="p1/us-central1/" + "c" * 40, cause="unknown")
-        item["remediation"] = {"kind": "platform_managed"}
-        text = watch.due_chat_item(item)
-        self.assertLessEqual(len(text), watch.CHAT_ITEM_MAX_CHARS)
-        self.assertTrue(text.endswith("; the addon manager can undo edits to it"), text)
+        # leeway marks platform_managed only where it would offer a manifest
+        # patch, which follows these causes; with the longest names each must
+        # keep the whole phrase inside the item cap.
+        for cause in ("unknown", "constraint_ignored", "rollout_bias"):
+            item = chat_item(name="n" * 200, namespace="s" * 200, cluster="p1/us-central1/" + "c" * 200, cause=cause)
+            item["remediation"] = {"kind": "platform_managed"}
+            text = watch.due_chat_item(item)
+            self.assertLessEqual(len(text), watch.CHAT_ITEM_MAX_CHARS, cause)
+            self.assertTrue(text.endswith("; the addon manager can undo edits to it"), (cause, text))
 
     def test_leeways_platform_managed_finding_reaches_the_chat_line(self) -> None:
         # From leeway's own JSON (a v0.1.7 kube-dns finding), through
