@@ -115,6 +115,8 @@ A provider's connected and repository series are omitted once its last attempt i
 
 Two limits apply. A forge with no managed repository, such as one that holds only context repositories, is not attempted and has no series. The attempt reads the repository; it does not prove that the credential can write to it.
 
+The operator reads these series on its usage poll and sets the `ForgeConnected` condition on the PlatformAgent from them. The condition does not change `Ready`. The [CRD reference](/kube-agents/operator/platformagent-crd/#status) lists its reasons.
+
 The `kind` label of `kubeagents_broker_execution_failures_total`:
 
 | `kind`                 | Counted                                                                                                                              |
@@ -277,6 +279,8 @@ The origin fields (`proposalsFromChat` to `proposalsFromOther`) clear on the sam
 | `lastHumanActiveTime`                     | the poll in which a chat message last moved its counter                                                                                                                                                                                   | `lastActiveTime` moves on any counter, the stall-watch cron's commands and the fleet audits' proposals included                                                                                                                                                          |
 
 The same poll reads the watcher's `kubeagents_data_volume_bytes` into `status.storageStatus.capacityBytes` and `freeBytes` and the `DataVolumeNearlyFull` condition. It also reads the labels of the `k8s_event_watcher_cluster_up` series into the `ScopeUndeclared` condition, which names the clusters the reconcile adopted beyond the host while `spec.scope` declares no membership.
+
+The poll reads the broker's three `kubeagents_vcs_forge_` series into the `ForgeConnected` condition. It is `True` when every managed repository on every forge answered the last sweep. It is `False` when one did not, with the worst state as the reason. It is `Unknown` when a forge was last attempted over an hour ago and none reports a failure. [Forge connection](#forge-connection) says what the series cover.
 
 On Slack-enabled installs, the poll reads the A2A gateway's `kubeagents_a2a_gateway_slack_connected` gauge into the `SlackConnected` condition (`True` on the first `1`; `False` and `Degraded` with `SlackConnectionFailed` after two consecutive `0` polls, without changing `Ready` or `phase`; see the [CRD reference](/kube-agents/operator/platformagent-crd/#what-degraded-reports)).
 

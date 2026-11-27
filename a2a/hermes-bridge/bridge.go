@@ -501,6 +501,9 @@ type Bridge struct {
 	// answer's scrub, (*activityState).secrets.CollectToolResult when nil;
 	// a field so a test can make it panic (panic.go).
 	collectResult func(a *activityState, result json.RawMessage)
+	// routeHook, when a test sets it, is called at each stage of the door's
+	// routing ("in-flight", "session"), so a test can panic there.
+	routeHook func(stage string)
 	// usagePart builds a turn's usage part, lib.UsagePart when nil; a field
 	// so a test can make a usage publish panic with run.mu held (panic.go).
 	usagePart func(u lib.Usage) (lib.Part, error)

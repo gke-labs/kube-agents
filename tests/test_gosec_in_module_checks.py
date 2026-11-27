@@ -1,9 +1,9 @@
 """gosec scans every Go module in the check that tests it, and runs nowhere else.
 
-The Go modules in this tree are k8s-operator/, k8s-api-proxy/, a2a/ and
-hack/ghes-proxy/. The scan runs as a step of each module's own test workflow,
+The Go modules in this tree are k8s-operator/, k8s-api-proxy/, kube-proxy/, a2a/
+and hack/ghes-proxy/. The scan runs as a step of each module's own test workflow,
 under the gate its test step runs under (three filter in a step, ghes-proxy-test.yml
-at the trigger), built from k8s-operator/go.mod's pin, the one gosec this
+and kube-proxy-test.yml at the trigger), built from k8s-operator/go.mod's pin, the one gosec this
 repository declares, so that go.mod and go.sum are inputs of every scan: a pin
 bump runs it where its new findings would land. `make gosec` runs the same
 scan over every module locally.
@@ -47,6 +47,7 @@ _MODULE_CHECKS = {
     "k8s-api-proxy": ("k8sapiproxy-test.yml", "Test", "k8sapiproxy"),
     "a2a": ("a2a-test.yml", "Run Tests", "a2a"),
     "hack/ghes-proxy": ("ghes-proxy-test.yml", "Test", None),
+    "kube-proxy": ("kube-proxy-test.yml", "Test", None),
 }
 #: How the pin module's own step runs the scanner, with no build step.
 _PIN_MODULE_RUN = re.compile(r"^go run github\.com/securego/gosec/v2/cmd/gosec ")

@@ -60,7 +60,7 @@ paused away: the window is that call and no longer the pass.
 Records what it paused in `<home>/.ci-paused-audits.json`, and `--resume` resumes
 exactly those. ci-eval-pr.sh runs the resume from its EXIT trap: a Prow lease's
 teardown sweeps the volume anyway, but a developer's run against an install that
-outlives it would otherwise leave five audits off for good.
+outlives it would otherwise leave the audits it paused off for good.
 
 Prints one line naming what it did. Exit codes, which the caller's retry reads:
 0 done; 1 worth another try (a pause that timed out, a store it couldn't read
@@ -104,9 +104,12 @@ SHIPPED_ROSTER = os.environ.get("PLATFORM_ROSTER_SOURCE", "/opt/platform-templat
 # Absolute, as profile_scaffold.py runs it, so PATH order can't change which binary answers.
 HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
 # Per call. A stalled call is named here rather than cut off by the caller's
-# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS. Every call stalling in every round (5 jobs x
-# PAUSE_ROUNDS) would outlast that bound; the caller then reports the timeout and
-# tries again, which is the right answer to a wedged store anyway.
+# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS. A call that times out is not tried again in
+# the pass, so a pass whose calls all stall spends one timeout on each job it
+# touches. A pass over the stage's audits and the other model-run jobs together,
+# each call stalling, would outlast that bound: a pause once the stage is past
+# its audits, or the resume of all that were paused. The caller then reports the
+# timeout and tries again, which is the right answer to a wedged store anyway.
 HERMES_TIMEOUT_SECONDS = 30
 # Rounds of pause-then-read-back, and the gap between them, for a job a
 # concurrent writer un-paused (see pause()).

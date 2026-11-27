@@ -78,6 +78,9 @@ GRADER_PIN_FILES = (
     "hack/fleet-fixture-state.py",
     "scripts/installer/gke_dns_endpoint.sh",
 )
+# One file in each proxy module, which `k8s-api-proxy/OWNERS` and
+# `kube-proxy/OWNERS` give the same approvers on top of the root's.
+PROXY_MODULE_FILES = ("k8s-api-proxy/go.mod", "kube-proxy/go.mod")
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
 REVIEWERS = CONFIG["reviewers"]["groups"]["repository-reviewers"]
 EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
@@ -910,6 +913,12 @@ class OwnersTest(unittest.TestCase):
             self.assertEqual(rr.applicable_approvers([path], REPO_ROOT), root_approvers, path)
         self.assertEqual(rr.applicable_approvers(["scripts/installer/install.sh"], REPO_ROOT), root_approvers)
         self.assertNotIn(NON_APPROVER, root_approvers)
+        # The two proxy modules carry nested OWNERS that add to the root's, and
+        # kube-proxy/ is owned with k8s-api-proxy/: the same approvers for both.
+        proxy_approvers = rr.applicable_approvers([PROXY_MODULE_FILES[0]], REPO_ROOT)
+        self.assertTrue(root_approvers < proxy_approvers, proxy_approvers)
+        for path in PROXY_MODULE_FILES:
+            self.assertEqual(rr.applicable_approvers([path], REPO_ROOT), proxy_approvers, path)
         # OWNERS repeats every root approver under `reviewers`: Prow's reviewer
         # walk falls through hack/OWNERS (no_parent_owners, no reviewers of its
         # own) to the root list, which is therefore who may lgtm a roster-only

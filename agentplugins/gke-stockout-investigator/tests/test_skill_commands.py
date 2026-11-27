@@ -122,6 +122,24 @@ class SkillCommandsTest(unittest.TestCase):
         self.assertIn("- **Checks Performed**:", text)
         self.assertIn("platform-agent/remediate-stockout-<workload_name>", text)
 
+    def test_capacity_buffer_triage_step_is_present(self):
+        text = SKILL_MD.read_text(encoding="utf-8")
+        for expected in (
+            "kubectl get capacitybuffers.autoscaling.x-k8s.io -A",
+            "kubectl describe capacitybuffer.autoscaling.x-k8s.io <name> -n <namespace>",
+            "ReadyForProvisioning=False",
+            "LimitedByQuotas=True",
+            "Provisioning=False",
+            "Provisioning=True",
+            "FakePodsInjected",
+            "NotTriggerScaleUp",
+        ):
+            self.assertIn(expected, text)
+        non_negotiable = next(line for line in text.splitlines() if "NON-NEGOTIABLE RULE" in line)
+        self.assertIn("kubectl get capacitybuffers.autoscaling.x-k8s.io -A", non_negotiable)
+        notify = next(line for line in text.splitlines() if "GKE Capacity Remediation Proposed" in line)
+        self.assertIn("kubectl get capacitybuffers.autoscaling.x-k8s.io -A", notify)
+
 
 if __name__ == "__main__":
     unittest.main()

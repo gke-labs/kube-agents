@@ -278,8 +278,7 @@ var (
 	// post_feedback_total series per rating and kind;
 	// metricsAnswerRatedPlatforms are the ones that draw them on an answer,
 	// each given a zero answer_feedback_total series per rating and answer.
-	// Teams rates answers only: its home posts carry no controls.
-	metricsRatedPlatforms       = []string{platformGoogleChat, platformSlack}
+	metricsRatedPlatforms       = []string{platformGoogleChat, platformSlack, platformTeams}
 	metricsAnswerRatedPlatforms = []string{platformGoogleChat, platformSlack, platformTeams}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.

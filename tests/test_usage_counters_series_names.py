@@ -117,6 +117,33 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
                 self.assertTrue(families[0].endswith("_total"))
                 self.assertEqual(families[0], families[1] + "_total")
 
+    def test_the_brokers_forge_series_are_the_ones_the_poller_reads_into_forge_connected(self):
+        for py, go in (
+            ("VCS_FORGE_CONNECTED_METRIC", "vcsForgeConnectedSeries"),
+            ("VCS_FORGE_REPOSITORIES_METRIC", "vcsForgeRepositoriesSeries"),
+            ("VCS_FORGE_CHECKED_AGE_METRIC", "vcsForgeCheckedAgeSeries"),
+        ):
+            with self.subTest(series=go):
+                self.assertEqual(_py_const(py, _READINGS_PY), _go_const(_SCRAPE_GO, go))
+        self.assertEqual(_py_const("VCS_PROVIDER_LABEL"), _go_const(_SCRAPE_GO, "vcsProviderLabel"))
+        self.assertEqual(_py_const("VCS_READINGS_STATE_LABEL"), _go_const(_SCRAPE_GO, "vcsReadingsStateLabel"))
+        connected = re.search(r"^VCS_FORGE_CONNECTED\s*=\s*(\d+)$", _BROKER_PY.read_text(), re.M)
+        operator = re.search(r"^\s*vcsForgeConnectedValue\s*=\s*(\d+)$", _SCRAPE_GO.read_text(), re.M)
+        self.assertIsNotNone(connected, "VCS_FORGE_CONNECTED not found")
+        self.assertIsNotNone(operator, "vcsForgeConnectedValue not found")
+        self.assertEqual(connected.group(1), operator.group(1))
+
+    def test_the_brokers_connection_states_are_the_ones_the_poller_reads_worst_first(self):
+        # The order is the severity: the operator's reason is the first state
+        # with a repository in it, as the broker's own order has it.
+        body = re.search(r"^CONNECTION_STATES\s*=\s*\(([^)]*)\)", _READINGS_PY.read_text(), re.M | re.S)
+        self.assertIsNotNone(body, "CONNECTION_STATES not found")
+        broker = [_py_const(name, _READINGS_PY) for name in re.findall(r"\bCONNECTION_[A-Z_]+\b", body.group(1))]
+        literal = re.search(r"vcsConnectionStates\s*=\s*\[\]string\{([^}]*)\}", _SCRAPE_GO.read_text())
+        self.assertIsNotNone(literal, "vcsConnectionStates not found")
+        self.assertEqual(broker, _go_words(_SCRAPE_GO, literal.group(1)))
+        self.assertEqual(len(broker), len(set(broker)))
+
     def test_the_brokers_vcs_counter_is_the_one_the_poller_sums_for_proposals(self):
         self.assertEqual(_py_const("VCS_REQUESTS_METRIC"), _go_const(_SCRAPE_GO, "vcsRequestsSeries"))
         self.assertEqual(_py_const("VCS_VERB_LABEL"), _go_const(_SCRAPE_GO, "vcsVerbLabel"))

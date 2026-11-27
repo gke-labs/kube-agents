@@ -68,7 +68,8 @@ infrastructure:
   variables:
     # The lane's own bound for a full audit (unit_delegation_timeout in
     # hack/ci-eval-pr.sh, and why): a run on a CI install has reached 2739s.
-    # The fired run took 11 to 13 minutes on two dev installs. The stack's
+    # The fired run took 11 to 13 minutes on two dev installs, and 329 to 539s
+    # on the nightlies of 2026-11-25 and 11-26. The stack's
     # default waits 80 minutes, which a run that never ends would spend on
     # each repetition.
     run_wait: 3000

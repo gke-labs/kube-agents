@@ -605,6 +605,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 				Dispatcher:     reading.Dispatcher,
 				ToolPairs:      reading.ToolPairs,
 				SlackConnected: reading.SlackConnected,
+				Forges:         reading.Forges,
 			})
 		}
 	}
@@ -625,6 +626,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
 	dispatcher := usageDispatcherForPoll(scraped)
+	forges := usageForgesForPoll(scraped)
 	clusterRefs, clusterRefsKnown := usageClusterRefsForPoll(cached, scraped, gatewayRead, watcherDown)
 	misses := p.noteReadings(cached, scraped)
 	readings, readingsKnown := usageReadingsForPoll(cached, scraped, misses)
@@ -687,6 +689,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 		return err
 	}
 	if err := p.projectKanbanDispatcher(ctx, agent, dispatcher); err != nil {
+		return err
+	}
+	if err := p.projectForgeConnection(ctx, agent, forges); err != nil {
 		return err
 	}
 	if err := p.projectScope(ctx, agent, clusterRefs, clusterRefsKnown); err != nil {

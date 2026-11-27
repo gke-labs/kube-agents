@@ -7,7 +7,7 @@ import { Aside, Steps } from "@astrojs/starlight/components";
 
 The installer (`install.sh`) bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and, for a GitOps repository on GitHub, the token minter. It drives the Terraform composition [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which owns every GCP resource and installs the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents), which owns every Kubernetes resource.
 
-Prefer declarative IaC over the interview? Apply the same composition by hand with your own `terraform.tfvars` — see [the composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) for the hand-driven path. Both paths run the same Terraform, so they create the same resources.
+Prefer declarative IaC over the interview? Apply the same composition by hand with your own `terraform.tfvars` — see [the composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) for the hand-driven path. Both paths run the same Terraform, so they create the same resources. If your team reconciles Kubernetes workloads through Flux or Argo CD with separate Google Cloud IAM Terraform and an existing `cert-manager`, follow [Enterprise Helm & GitOps](/kube-agents/install/enterprise-gitops/) instead of running `install.sh`.
 
 <Aside type="note">
 
