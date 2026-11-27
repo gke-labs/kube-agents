@@ -46,6 +46,15 @@ _REPORT_DEFAULT_FILE = "/tmp/kube-agents-upgrade-report.json"
 # on the PATH. A test whose PATH has no gcloud reads it as the sign that main
 # went on to its tool check.
 _TOOL_CHECK_REFUSAL = "Required CLI tool"
+# A helm that prints its arguments. `helm_retag` pipes the values that retag_values kept into
+# `helm upgrade --values -`, as real helm reads them. A stub that exits without
+# reading leaves the writer a closed pipe when the writer is the later of the two
+# to run: the writer gets SIGPIPE, and the function returns 141 under pipefail.
+# So the stub reads stdin when it is asked to, as helm does, and only then.
+_HELM_ECHO_STUB = """#!/usr/bin/env bash
+case " $* " in *" --values - "*) cat >/dev/null ;; esac
+echo "HELM:$*"
+"""
 
 
 class ReportFileTest(unittest.TestCase):
@@ -4408,7 +4417,7 @@ class UpgradeSizingProfileAndScanTest(unittest.TestCase):
                 k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(crd_json)}\nexit {crd_rc}\n")
                 k.chmod(0o755)
                 helm = bin_dir / "helm"
-                helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                helm.write_text(_HELM_ECHO_STUB)
                 helm.chmod(0o755)
                 script = (
                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
@@ -4473,7 +4482,7 @@ class UpgradeSizingProfileAndScanTest(unittest.TestCase):
                     k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(with_field)}\nexit 0\n")
                     k.chmod(0o755)
                     helm = bin_dir / "helm"
-                    helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                    helm.write_text(_HELM_ECHO_STUB)
                     helm.chmod(0o755)
                     schema_dir = pathlib.Path(tmp) / "charts" / "kube-agents"
                     schema_dir.mkdir(parents=True)
@@ -4528,7 +4537,7 @@ class UpgradeSizingProfileAndScanTest(unittest.TestCase):
                     k.write_text(f"#!/usr/bin/env bash\nprintf '%s' {shlex.quote(crd_json)}\nexit {k_rc}\n")
                     k.chmod(0o755)
                     helm = bin_dir / "helm"
-                    helm.write_text('#!/usr/bin/env bash\necho "HELM:$*"\n')
+                    helm.write_text(_HELM_ECHO_STUB)
                     helm.chmod(0o755)
                     schema_dir = pathlib.Path(tmp) / "charts" / "kube-agents"
                     schema_dir.mkdir(parents=True)
