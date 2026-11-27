@@ -661,6 +661,89 @@ func TestInsightsDisplayNameIsNotTakenForARecord(t *testing.T) {
 	}
 }
 
+// An openai_compatible install's gateway names its provider hosted_vllm.
+// The Helm values the console shows name openai_compatible, the chart value
+// that keeps the endpoint settings; the target stays the gateway's.
+func TestOpenAICompatibleInstallKeepsItsChartProvider(t *testing.T) {
+	var tested []string
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/model/info" {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			m, _ := body["model"].(string)
+			tested = append(tested, m)
+		}
+		if r.URL.Path == "/model/info" {
+			_, _ = w.Write([]byte(`{"data":[
+				{"model_name":"model-default","litellm_params":{"model":"hosted_vllm/qwen-coder"},"model_info":{"litellm_provider":"hosted_vllm"}},
+				{"model_name":"other","litellm_params":{"model":"hosted_vllm/llama-70b"},"model_info":{}}
+			]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	}))
+	defer gw.Close()
+	s := modelsServer(gw.URL, nil)
+	s.cfg.ModelProvider = "openai_compatible"
+
+	res := getModels(t, s)
+	if res.ActiveProvider != "openai_compatible" || res.ActiveTarget != "hosted_vllm/qwen-coder" {
+		t.Errorf("got provider %q, target %q; want openai_compatible, hosted_vllm/qwen-coder", res.ActiveProvider, res.ActiveTarget)
+	}
+	if !strings.Contains(res.HelmValuesYAML, "modelProvider: openai_compatible\n") || strings.Contains(res.HelmValuesYAML, "modelProvider: hosted_vllm") {
+		t.Errorf("Helm values for the model in use:\n%s", res.HelmValuesYAML)
+	}
+	for _, m := range res.Models {
+		if m.Provider != "openai_compatible" {
+			t.Errorf("model %q: provider %q, want openai_compatible", m.ID, m.Provider)
+		}
+	}
+
+	// A listed pick sends the listed provider, with or without the target;
+	// a custom pick names the gateway's. Each is tested under the gateway's
+	// target and comes back under the chart's provider.
+	for _, body := range []string{
+		`{"model":"llama-70b","provider":"openai_compatible","model_target":"hosted_vllm/llama-70b"}`,
+		`{"model":"llama-70b","provider":"openai_compatible"}`,
+		`{"model":"hosted_vllm/llama-70b"}`,
+	} {
+		tested = nil
+		rec := httptest.NewRecorder()
+		s.handleModelsPost(rec, httptest.NewRequest(http.MethodPost, "/api/models", strings.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code %d: %s", body, rec.Code, rec.Body.String())
+		}
+		var picked ModelsResponse
+		if err := json.NewDecoder(rec.Body).Decode(&picked); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(picked.HelmValuesYAML, "modelProvider: openai_compatible\n  modelDefaultName: llama-70b\n") {
+			t.Errorf("%s: Helm values:\n%s", body, picked.HelmValuesYAML)
+		}
+		if len(tested) == 0 || tested[0] != "hosted_vllm/llama-70b" || picked.ActiveTarget != "hosted_vllm/llama-70b" {
+			t.Errorf("%s: gateway tested %q, target %q; want hosted_vllm/llama-70b for both", body, tested, picked.ActiveTarget)
+		}
+	}
+
+	// A recorded pick carries no provider; the one read from the gateway
+	// for it is renamed too.
+	kube, _ := recordedAgent(t, map[string]string{
+		activeModelAnnotation:  "llama-70b",
+		activeTargetAnnotation: "hosted_vllm/llama-70b",
+	})
+	recorded := modelsServer(gw.URL, kube)
+	recorded.cfg.ModelProvider = "openai_compatible"
+	if res := getModels(t, recorded); !strings.Contains(res.HelmValuesYAML, "modelProvider: openai_compatible\n  modelDefaultName: llama-70b\n") {
+		t.Errorf("a recorded pick: Helm values:\n%s", res.HelmValuesYAML)
+	}
+
+	// On any other install hosted_vllm is a provider slug of its own.
+	if res := getModels(t, modelsServer(gw.URL, nil)); res.ActiveProvider != "hosted_vllm" {
+		t.Errorf("an install that is not openai_compatible: provider %q, want hosted_vllm", res.ActiveProvider)
+	}
+}
+
 // A model picked earlier in this process and no longer served is dropped
 // like a recorded one.
 func TestPickHeldInMemoryIsDroppedWhenNoLongerServed(t *testing.T) {

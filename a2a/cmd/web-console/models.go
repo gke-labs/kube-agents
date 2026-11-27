@@ -42,6 +42,11 @@ const (
 	// geminiModelMarker is in the name of every Gemini model, which all
 	// take a reasoning level.
 	geminiModelMarker = "gemini"
+	// The chart routes litellm.modelProvider openai_compatible through
+	// LiteLLM's hosted_vllm handler, so the gateway names the provider
+	// hosted_vllm where the chart's value is openai_compatible.
+	chartOpenAICompatibleProvider = "openai_compatible"
+	liteLLMHostedVLLMProvider     = "hosted_vllm"
 )
 
 var errNoServedModels = errors.New("LiteLLM reported no models")
@@ -499,6 +504,27 @@ func parseServedModels(body []byte) (servedModels, error) {
 	return out, nil
 }
 
+// chartProvider returns the litellm.modelProvider value that selects the
+// provider the gateway names: the same name, except on an install whose
+// MODEL_PROVIDER is openai_compatible, where the gateway's hosted_vllm is
+// that value. Helm values naming hosted_vllm would render, and drop the
+// endpoint, credentials and egress the chart sets for openai_compatible.
+func (s *server) chartProvider(gatewayProvider string) string {
+	if gatewayProvider == liteLLMHostedVLLMProvider && s.cfg.ModelProvider == chartOpenAICompatibleProvider {
+		return chartOpenAICompatibleProvider
+	}
+	return gatewayProvider
+}
+
+// gatewayProvider is chartProvider's inverse: the provider name the gateway
+// routes a chart provider under, which is what a model target starts with.
+func (s *server) gatewayProvider(chartProvider string) string {
+	if chartProvider == chartOpenAICompatibleProvider && s.cfg.ModelProvider == chartOpenAICompatibleProvider {
+		return liteLLMHostedVLLMProvider
+	}
+	return chartProvider
+}
+
 // readServedModels asks the inference gateway which models it serves. It
 // reports false when no gateway is configured or it did not answer with a
 // list naming a model, in which case nothing can be said about any model.
@@ -528,6 +554,10 @@ func (s *server) readServedModels(ctx context.Context) (servedModels, bool) {
 	if err != nil {
 		return servedModels{}, false
 	}
+	for i := range served.options {
+		served.options[i].Provider = s.chartProvider(served.options[i].Provider)
+	}
+	served.inUse.Provider = s.chartProvider(served.inUse.Provider)
 	return served, true
 }
 
@@ -644,6 +674,7 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 			}
 		}
 	}
+	activeProvider = s.chartProvider(activeProvider)
 	if reasoningLevel == "" {
 		reasoningLevel = liveInfo.ReasoningLevel
 	}
@@ -676,7 +707,7 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 
 	if !foundActive && activeModel != "" {
 		if activeTarget == "" {
-			activeTarget = activeProvider + "/" + activeModel
+			activeTarget = s.gatewayProvider(activeProvider) + "/" + activeModel
 		}
 		catOpt, found := findCatalogOption(activeModel, activeTarget)
 		name := activeModel
@@ -714,7 +745,7 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 	}
 
 	if activeTarget == "" {
-		activeTarget = activeProvider + "/" + activeModel
+		activeTarget = s.gatewayProvider(activeProvider) + "/" + activeModel
 	}
 	if reasoningLevel == "" {
 		reasoningLevel = "dynamic"
@@ -904,8 +935,9 @@ func (s *server) handleModelsPost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if target == "" {
-		target = provider + "/" + modelID
+		target = s.gatewayProvider(provider) + "/" + modelID
 	}
+	provider = s.chartProvider(provider)
 	if !validModelTokenPattern.MatchString(modelID) || !validModelTokenPattern.MatchString(provider) || !validModelTokenPattern.MatchString(target) {
 		writeError(w, http.StatusBadRequest, "invalid_model", "Model, provider, or target contains invalid characters.")
 		return
