@@ -2293,6 +2293,14 @@ type managedDatabaseConfig struct {
 	JournalMode string `json:"journal_mode"`
 }
 
+// managedSecurityConfig is the `security` block rendered into the managed scope.
+// Every required dependency ships in the sealed image, so Hermes' runtime
+// package downloads (`tools/lazy_deps.py` into /opt/data/lazy-packages) are
+// pinned off unconditionally without exposing a Hermes-specific CRD knob.
+type managedSecurityConfig struct {
+	AllowLazyInstalls bool `json:"allow_lazy_installs"`
+}
+
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	return renderConfigYAMLWith(agent, agentPlugins, agentPlaceholderAPIKey)
 }
@@ -2388,6 +2396,11 @@ func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*ag
 		// its own retention would keep conversation history past the period the
 		// install promises to delete it after.
 		Sessions managedSessionsConfig `json:"sessions"`
+		// Security pins Hermes' `security.allow_lazy_installs` to false unconditionally.
+		// Every required dependency ships in the sealed image, so no profile needs
+		// runtime PyPI downloads into /opt/data/lazy-packages and no Hermes-specific
+		// CRD knob is exposed. No omitempty so `false` is always rendered and pinned.
+		Security managedSecurityConfig `json:"security"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -2467,6 +2480,10 @@ func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*ag
 	// reconcile.
 	cfg.Kanban.Admission = resolveKanbanAdmission(agent)
 	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
+	// Security. Pin runtime package downloads off across every profile: every
+	// required dependency ships in the sealed image, and pinning this directly
+	// avoids exposing a Hermes-specific CRD knob.
+	cfg.Security = managedSecurityConfig{AllowLazyInstalls: false}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
