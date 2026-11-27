@@ -2876,6 +2876,13 @@ def test_a_card_worker_s_calls_stay_out_of_the_router_trajectory() -> None:
     marker, *calls = trace_block(fold.trajectory)
     assert [c["name"] for c in calls] == ["kanban_create", "kanban_list", "kanban_show"]
     assert marker["args"] == {"calls": 3, "dropped": 0, "malformed": 1, inject.ACTIVITY_INPUT_ABSENT_ARG: 2}
+    # A labelled router part names the bridge as its origin; the unlabelled
+    # one carries no origin, so it reads as the worker adapter's.
+    assert [c.get(inject.ENTRY_ORIGIN_FIELD) for c in calls] == [
+        inject.ORIGIN_HERMES_BRIDGE,
+        None,
+        inject.ORIGIN_HERMES_BRIDGE,
+    ]
     transcript.set("answer", fold.trajectory)
     try:
         # The safeguard's inner check: ``fail`` is no worker verb in the

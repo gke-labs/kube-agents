@@ -302,6 +302,16 @@ ACTIVITY_DROPPED_KEY = "dropped"
 ACTIVITY_CALL_ID_KEY = "callId"
 # The trajectory entry's field for the part's ``callId`` (above).
 ENTRY_CALL_ID_FIELD = "call_id"
+# The trajectory entry's field naming where a router call came from, written
+# only on a part the hermes bridge labelled with the router's session
+# (:data:`ACTIVITY_WORKER_KEY`): ``hermes-bridge``. A part with no label is
+# the worker adapter's, a session or profile pod's, whose harness spells
+# tools its own way; the verifier reads such a call under either harness's
+# names (``session_tools``). The hermes bridge's cli executor leaves its
+# parts unlabelled too; the api executor, its default, labels every part.
+# The verifier and the scorer duplicate the literals.
+ENTRY_ORIGIN_FIELD = "origin"
+ORIGIN_HERMES_BRIDGE = "hermes-bridge"
 # The trajectory entry's mark, ``true``, for a call that arrived with no
 # ``input`` and took none from the session pod's capture
 # (:meth:`Fold.fill_inputs`). Its ``args`` are then ``{}`` because the
@@ -1012,7 +1022,8 @@ class Fold:
         marker and no entry is written for it, and a part with no tool name
         is counted as malformed rather than written as a call to nothing.
         A part the bridge labels with a card worker's session is left out as
-        the worker's call, not the router's (:data:`ACTIVITY_WORKER_KEY`).
+        the worker's call, not the router's (:data:`ACTIVITY_WORKER_KEY`); one
+        it labels as the router's carries :data:`ENTRY_ORIGIN_FIELD`.
         Empty when no read carried the key.
         """
         mapped = self._map_activity()
@@ -1091,6 +1102,8 @@ class Fold:
             if raw_input is None:
                 entry[ENTRY_INPUT_ABSENT_FIELD] = True
                 input_absent += 1
+            if worker:
+                entry[ENTRY_ORIGIN_FIELD] = ORIGIN_HERMES_BRIDGE
             call_id = part.get(ACTIVITY_CALL_ID_KEY)
             if isinstance(call_id, str) and call_id:
                 entry[ENTRY_CALL_ID_FIELD] = call_id
