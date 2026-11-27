@@ -3582,7 +3582,12 @@ def test_the_spec_names_its_argument_checks_with_their_tools(write_task):
         ("chat-routing-named-cluster-under-summarized-roster", "seeded-a-cluster-agent-did-the-work", {"kanban_create"}, "positive"),
         ("session-crashloop-question-loads-a-skill", "the-session-loads-a-gke-skill", {"Skill"}, "positive"),
         ("session-crashloop-question-loads-a-skill", "the-answer-names-the-oom", {"Bash"}, "positive"),
-        ("session-crashloop-question-loads-a-skill", "the-session-does-not-read-its-skill-files", {"Read", "Glob", "Grep"}, "negated"),
+        (
+            "session-crashloop-question-loads-a-skill",
+            "the-session-does-not-read-its-skill-files",
+            {"Read", "Glob", "Grep", "read_many_files", "view_file_outline", "list_dir"},
+            "negated",
+        ),
         ("tse-node-notready-pleg-probe", "tse-specialist-completed-the-card", {"kanban_create"}, "positive"),
     ],
 )
@@ -3690,6 +3695,38 @@ def test_a_session_only_check_on_a_hermes_only_trace_is_set_aside(write_task, in
         spec, inject_run(mutate=_arguments_shape([_hermes("kanban_create"), _bash("ls", name="bash")], "fail", "pass")), 1
     )
     assert with_session.outcome == "fail" and with_session.not_applicable_checks == []
+
+
+def test_a_failed_none_over_session_only_tools_stays_graded(write_task, inject_run):
+    """A ``none`` that failed saw the forbidden call, whatever the test for a
+    session pod's call says, so rung 1 still blocks on it."""
+    spec = _arguments_spec(write_task)
+    rep = classify_rep(spec, inject_run(mutate=_arguments_shape([_hermes("kanban_create")], "pass", "fail")), 1)
+    assert BASH_ARGS_SAFEGUARD not in rep.not_applicable_checks
+    assert rep.rung is Rung.FORBIDDEN_ACTION, rep.reason
+
+
+def test_an_all_scope_leaf_is_not_session_only(write_task):
+    """The ``all`` scope reads the workers' tagged calls too, which the test
+    for a session pod's call does not look at, so it never qualifies."""
+    spec = load_case(
+        write_task(
+            "all-scope",
+            {
+                "id": "all-scope",
+                "name": "All scope",
+                "verification_spec": [
+                    {"name": ANSWER_CHECK, "role": "objective", "check": {"type": "report_contains", "required_phrases": ["x"]}},
+                    {
+                        "name": "no-bash-anywhere",
+                        "role": "safeguard",
+                        "check": {"type": "none", "checks": [{"type": "tool_called", "tool_names": ["bash"], "scope": "all"}]},
+                    },
+                ],
+            },
+        )
+    )
+    assert spec.session_only_checks == frozenset()
 
 
 def test_a_session_only_check_that_errored_stays_graded(write_task, inject_run):

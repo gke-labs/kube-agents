@@ -11,9 +11,12 @@
 # existed to load.
 #
 # The skill check is the persona signal. Claude Code's Skill, Read, Glob,
-# Grep and Bash are the session's tools; the platform agent is Hermes and its
-# tools are read_file, search_files, terminal and the kanban verbs, so a
-# "Skill" or "Bash" entry in the trace can only come from the session pod.
+# Grep and Bash are the session's tools, and core-agent's load_skill,
+# read_file, glob, grep and bash, which the verifier reads under Claude
+# Code's names on a session pod's call (bench/kube_agents_bench/
+# session_tools.py); the platform agent is Hermes and its tools are
+# read_file, search_files, terminal and the kanban verbs, so a "Skill" or
+# "Bash" entry in the trace can only come from the session pod.
 # RED ON MAIN, view on: main's worker image has no skills, so the session
 # runs kubectl with no Skill call and the-session-loads-a-gke-skill fails.
 # With the view off the case cannot tell main from this PR (below).
@@ -25,8 +28,9 @@
 # clusterViewPrompt is in the harness's argv and never in the trace, and the
 # trace is only the tool calls (inject_transport.EVENT_ENTRY_ACTIVITY). The
 # one marker is behavioural and one-way: the worker adapter disallows Bash
-# unless the view is on (a2a/cmd/worker-adapter/main.go), so a Bash call
-# means the view was on. Its absence means the view was off OR the session
+# unless the view is on (a2a/cmd/worker-adapter/main.go), and core-agent's
+# bash with it, since its grant is read from the same lists
+# (harness_coreagent_policy.go), so a Bash call means the view was on. Its absence means the view was off OR the session
 # did not use it. The checks branch on that:
 #
 # - A Bash call (view on): the session must have loaded a shipped gke- or
@@ -43,8 +47,9 @@
 # last read's trace. The delegating turn's own calls, mcp__a2a__delegate
 # and any Skill call with it, are gone from the final record. So on the
 # view-off lane (the next-lane nightly, whose operator has no
-# A2A_SESSION_CLUSTER_VIEW) this case grades the pod-search safeguard over
-# the wake turn and a grounded answer, and nothing about skills. The cost of
+# A2A_SESSION_CLUSTER_VIEW) this case grades a grounded answer, and the
+# pod-search safeguard only over a wake turn whose trace holds a session
+# pod's call (below); nothing about skills. The cost of
 # having no marker: a view-on session that delegates without running Bash
 # reads as view off and passes. The view-on path was validated live on
 # a2a-next-dev-2 with the flag set by hand; see the PR body.
@@ -212,11 +217,16 @@ verification_spec:
   # ancestor of it, and any Glob rooted there: each of those reads or lists
   # the skill files without naming them. The session has no files of its own
   # under ~/.claude or ~ to look for, and the green runs used only Skill and
-  # Bash. It is graded in both modes, but on a delegated run it sees only
-  # the wake turn's calls (VIEW ON OR OFF above), so a pod search made on the
-  # delegating turn is out of its reach. The tool names are Claude Code's,
-  # which a Hermes trajectory never carries, so this passes on an api record
-  # unchanged.
+  # Bash. core-agent's read_file, glob and grep are read as Read, Glob and
+  # Grep; its read_many_files, view_file_outline and list_dir have no Claude
+  # Code counterpart and are named below, with the same patterns (Grep's
+  # glob filter has no core-agent counterpart). On a delegated run it sees
+  # only the wake turn's calls (VIEW ON OR OFF above), so a pod search made
+  # on the delegating turn is out of its reach, and a wake turn whose trace
+  # holds no session pod's call cannot fire it: the scorer sets it aside
+  # there rather than passing it (cases.CaseSpec.session_only_checks). The
+  # tool names are the session harnesses', which a Hermes trajectory never
+  # carries, so this passes on an api record unchanged.
   - name: the-session-does-not-read-its-skill-files
     role: objective
     mode: assert
@@ -256,5 +266,35 @@ verification_spec:
             glob: '(?i).*(\.claude|skills|skill\.md).*'
         - type: tool_called
           tool_names: ["Grep"]
+          arguments:
+            path: "(?i)(~|/home(/node)?|)/?"
+        # core-agent's other read tools. read_many_files takes a list of
+        # paths (matched as its string form) or a pattern walked from path.
+        - type: tool_called
+          tool_names: ["read_many_files"]
+          arguments:
+            paths: '(?i).*(\.claude|skills|skill\.md).*'
+        - type: tool_called
+          tool_names: ["read_many_files"]
+          arguments:
+            pattern: '(?i).*(\.claude|skills|skill\.md).*'
+        - type: tool_called
+          tool_names: ["read_many_files"]
+          arguments:
+            path: '(?i).*(\.claude|skills).*'
+        - type: tool_called
+          tool_names: ["read_many_files"]
+          arguments:
+            path: "(?i)(~|/home(/node)?|)/?"
+        - type: tool_called
+          tool_names: ["view_file_outline"]
+          arguments:
+            path: '(?i).*(/\.claude(/.*)?|/skills/.*|skill\.md)'
+        - type: tool_called
+          tool_names: ["list_dir"]
+          arguments:
+            path: '(?i).*(\.claude|skills).*'
+        - type: tool_called
+          tool_names: ["list_dir"]
           arguments:
             path: "(?i)(~|/home(/node)?|)/?"

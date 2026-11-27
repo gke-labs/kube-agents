@@ -267,10 +267,27 @@ def test_a_core_agent_session_is_graded_by_the_same_leaves():
         _call("read_file", {"path": "/home/node/.claude/skills/pod-crashloop-oom/SKILL.md"}),
         _call("glob", {"pattern": "SKILL.md", "path": "/home/node/.claude/skills"}),
         _call("grep", {"pattern": "OOMKilled", "path": "/home/node/.claude"}),
+        _call("read_many_files", {"paths": ["/home/node/.claude/skills/pod-crashloop-oom/SKILL.md"]}),
+        _call("read_many_files", {"pattern": "SKILL.md", "path": "/home/node"}),
+        _call("view_file_outline", {"path": "/home/node/.claude/skills/pod-crashloop-oom/SKILL.md"}),
+        _call("list_dir", {"path": "/home/node/.claude/skills"}),
+        _call("list_dir", {"path": "~"}),
     ],
 )
 def test_a_core_agent_session_reading_its_skill_files_by_hand_fails(call: dict[str, Any]):
     assert _status(NO_SKILL_READ, ANSWER, _inject(CORE_SKILL, call)) == "fail"
+
+
+def test_other_core_agent_reads_do_not_trip_the_skill_file_check():
+    record = _inject(
+        CORE_SKILL,
+        _call("read_file", {"path": "/scratch/notes.txt"}),
+        _call("read_many_files", {"paths": ["/scratch/a.yaml", "/scratch/b.yaml"]}),
+        _call("view_file_outline", {"path": "/scratch/main.go"}),
+        _call("list_dir", {"path": "/scratch"}),
+        CORE_KUBECTL,
+    )
+    assert _status(NO_SKILL_READ, ANSWER, record) == "pass"
 
 
 def test_the_platform_agent_reading_its_own_skills_does_not_trip_the_check():

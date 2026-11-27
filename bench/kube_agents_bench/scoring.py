@@ -1428,8 +1428,10 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     empty args can't flip still grade. On a record whose trace the door
     vouched for and that holds no session or profile pod's call
     (:func:`_inject_session_calls_present`), an entry in
-    :attr:`CaseSpec.session_only_checks` that passed or failed is set aside:
-    it names only tools no Hermes turn has, so it could not have fired.
+    :attr:`CaseSpec.session_only_checks` is set aside when it passed, or
+    when it failed and is not ``none``-wrapped: it names only tools no
+    Hermes turn has, so it could not have fired. A ``none`` that failed saw
+    the call and stays graded.
 
     None on the api transport, on a record with no blind entry in its report
     (the set is matched by name, so a task with no such check or a report
@@ -1465,12 +1467,18 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     if spec.session_only_checks and not trace_blind and not _inject_session_calls_present(record.trajectory):
         # The trace the door vouched for holds no session or profile pod's
         # call, so a check over tools only such a pod has could not fire:
-        # its fail says nothing and its pass, a ``none`` over them, tested
-        # nothing. Set aside rather than graded; an error stays for rung 2.
+        # a positive one's fail says nothing and a ``none``'s pass tested
+        # nothing. Set aside rather than graded. A ``none`` that failed saw
+        # the call whatever this test says, and stays for rung 1; an error
+        # stays for rung 2.
         set_aside |= {
             str(e.get("name"))
             for e in record.verification_report
-            if str(e.get("name")) in spec.session_only_checks and (_entry_passed(e) or _entry_failed(e))
+            if str(e.get("name")) in spec.session_only_checks
+            and (
+                _entry_passed(e)
+                or (_entry_failed(e) and str(e.get("name")) not in spec.negated_trace_blind_checks)
+            )
         }
     uncertain = _inputless_argument_checks(spec, record)
     if uncertain:

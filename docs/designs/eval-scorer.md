@@ -233,12 +233,14 @@ entry can carry the only grade of the answer (a phrase beside the call in one co
 entry is set aside this way, every objective of the repetition is too, and it reports not graded on
 the transport instead of passing on what remains; safeguards the empty args can't flip still grade.
 #7453 tracks a precise version that re-grades the entry instead. An entry that can fire only on a
-session or profile pod's call (`CaseSpec.session_only_checks`: a lone router- or all-scope
+session or profile pod's call (`CaseSpec.session_only_checks`: a lone router-scope
 `tool_called`, or a `none` of only such leaves, naming only tools no Hermes turn has) is set aside
-when it passed or failed on a vouched trace that holds no call the worker adapter published, so a
-`none` over tools nothing could have called does not pass. A call is the worker adapter's when the
-hermes bridge did not label it as the router's (`origin` on the entry). The bridge's cli executor
-leaves its calls unlabelled too, which can only turn such a check red. A leaf like these nested in an
+on a vouched trace that holds no call the worker adapter published, when it passed or, not being a
+`none`, failed. So a `none` over tools nothing could have called does not pass, and a `none` that
+failed, having seen the call, stays graded. A call is the worker adapter's when the hermes bridge did
+not label it as the router's (`origin` on the entry). The bridge's cli executor leaves its calls
+unlabelled too; such a call is then read as a session pod's, so the check grades as it did before
+this rule. A leaf like these nested in an
 `any` or `all` keeps grading, since a case can use one as a switch beside a check on the answer. The worker
 half is keyed on what the record carries (`_inject_workers_carried()`). The delegation wait for
 this path reads the workers' calls from the pod and puts them on the trajectory tagged with their

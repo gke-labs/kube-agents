@@ -317,15 +317,14 @@ class CaseSpec:
 
     session_only_checks: frozenset[str] = frozenset()
     """The entries that can fire on nothing but a session or profile pod's
-    call: a lone ``tool_called`` in the ``router`` or ``all`` scope, or a
-    ``none`` whose every leaf is one, naming only tools no Hermes record
-    carries (``session_tools.SESSION_ONLY_TOOL_NAMES``: Claude Code's and
-    core-agent's names for the tools the verifier reads under either, bar
-    ``read_file``, which Hermes has too). On an inject record whose trace
-    holds no call the worker adapter published -- the turn the trace shows
-    ran on Hermes -- such an entry is set aside rather than graded, so a
-    ``none`` over tools that could not have been called does not pass
-    (``scoring._inject_lane_view``). A leaf like these nested in an
+    call: a lone router-scope ``tool_called``, or a ``none`` whose every
+    leaf is one, naming only tools no Hermes record carries
+    (``session_tools.SESSION_ONLY_TOOL_NAMES``). On an inject record whose
+    trace holds no call the worker adapter published -- the turn the trace
+    shows ran on Hermes -- such an entry is set aside rather than graded, so
+    a ``none`` over tools that could not have been called does not pass
+    (``scoring._inject_lane_view``). A ``none`` that failed stays graded:
+    it saw the call. A leaf like these nested in an
     ``any`` or ``all`` is left as it grades: a case may use one as a
     switch beside a check that still grades the answer."""
 
@@ -571,14 +570,16 @@ def _trace_argument_checks(spec: Any) -> tuple[tuple[str, frozenset[str], str], 
 
 
 def _session_only_leaf(leaf: Any) -> bool:
-    """Whether a leaf is a router- or all-scope ``tool_called`` naming only
-    session-only tools (:attr:`CaseSpec.session_only_checks`)."""
+    """Whether a leaf is a router-scope ``tool_called`` naming only
+    session-only tools (:attr:`CaseSpec.session_only_checks`). Not the
+    ``all`` scope: it reads the workers' tagged calls too, which the scorer's
+    test for a session pod's call does not look at."""
     if not isinstance(leaf, dict) or str(leaf.get("type") or "") not in TRACE_GRADABLE_CHECK_TYPES:
         return False
     scope = leaf.get(_TOOL_CALLED_SCOPE_KEY) or _TOOL_CALLED_ROUTER_SCOPE
     names = leaf.get(_TOOL_CALLED_NAMES_KEY)
     return (
-        scope in (_TOOL_CALLED_ROUTER_SCOPE, _TOOL_CALLED_ALL_SCOPE)
+        scope == _TOOL_CALLED_ROUTER_SCOPE
         and isinstance(names, list)
         and bool(names)
         and {str(n) for n in names} <= session_tools.SESSION_ONLY_TOOL_NAMES
