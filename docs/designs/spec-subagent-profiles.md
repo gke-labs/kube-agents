@@ -635,6 +635,29 @@ deliverable is decided (the one-line "delegated to" result), and the gateway ret
 pod for the wake is expected, so the adapter publishes `completed` with that result
 and exits 0 instead.
 
+**A panic while the adapter handles one task.** It is recovered, and the process keeps
+serving: a session pod or a profile pod takes its next task in the same process. Three places
+are guarded: one task's run, from the terminal check to the terminal (the adapter's
+`execute`, which every caller goes through); the harness's start, between the process
+starting and the run loop taking it over; and each harness stdout line's decode, on the
+goroutine that reads the harness's output. The task ends `failed` with
+`reason: internal-panic` and no answer: no result, no partial output, no stderr tail, no
+delegation, and nothing more on its stream artifacts. A decode panic fails the task closed
+from that moment, whichever way it then ends (a cancel, a SIGTERM, a result line read
+earlier). The harness is killed, and reaped before the terminal, so nothing of the task is
+running when the next one starts. If the reap doesn't finish within the kill grace plus the
+leftover-reap bound (a process outside the harness's group can hold its output open), the
+terminal goes out anyway and a reused pod exits instead of taking another task. What went out
+before the panic stays. A panic before the task's execution exists publishes nothing; the run
+returns an error, and a reused pod exits on it. Each recovery is logged at Error with the
+message `recovered a panic`, the panic's type or runtime error, and the stack, never the line
+or text being handled. The count is kept in the process with no endpoint, so alert on the log
+message or the reason. A panic in pod-level work, rather than one task's handling, still ends
+the process: the gateway proxy, the delegate listener's goroutines, a profile worker's
+dispatch loop and its workspace-reset and lease-renewal goroutines, the script runner's
+goroutines, the task's in-subject consumer callback, and the reaper goroutine. The orphan
+path below finalizes its task.
+
 **Orphaned.** A worker can die without a terminal event - OOM, node loss, image bug.
 The dispatcher doubles as the janitor: it watches the Jobs it created, and when a Job
 reaches a terminal phase (or vanishes) while the task's event stream has no `final`
