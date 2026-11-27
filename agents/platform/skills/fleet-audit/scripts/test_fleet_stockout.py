@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -1481,7 +1482,7 @@ class SingleZoneNodepoolTest(unittest.TestCase):
 
 
 class GpuPoolMissingTaintTest(unittest.TestCase):
-    """§3.14. The shapes are the ones read from two throwaway clusters (GKE
+    """§3.15. The shapes are the ones read from two throwaway clusters (GKE
     1.36.4) on 2026-11-23: a GPU pool added beside a pool without GPUs carries
     `nvidia.com/gpu=present:NO_SCHEDULE` in its settings, and the default GPU
     pool of a cluster created with one carried no taint, also when read 300
@@ -2061,6 +2062,9 @@ class CollectClusterTest(unittest.TestCase):
                 return run_of(0)
             if argv[:3] == ["kubectl", "get", "computeclasses"]:
                 return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["kubectl", "get", fs.CAPACITY_BUFFER_RESOURCE]:
+                self.assertIn(fs.KUBECTL_CHUNK_SIZE_ARG, argv)
+                return run_of(0, json.dumps(dump_of()))
             if argv[:3] == ["kubectl", "get", "--raw"]:
                 return run_of(0, json.dumps({"metadata": {}, "items": []}))
             if argv[:2] == ["kubectl", "get"]:
@@ -2117,6 +2121,10 @@ class CollectClusterTest(unittest.TestCase):
         advice_rc=0,
         advice_stderr="denied",
         advice_stdout=None,
+        capacity_buffers=None,
+        capacity_buffers_rc=0,
+        capacity_buffers_stderr="denied",
+        capacity_buffers_stdout=None,
     ):
         target = cluster or self.CLUSTER
         self.issued = []
@@ -2125,6 +2133,17 @@ class CollectClusterTest(unittest.TestCase):
             self.issued.append(argv)
             if "get-credentials" in argv:
                 return run_of(0)
+            if argv[:3] == ["kubectl", "get", fs.CAPACITY_BUFFER_RESOURCE]:
+                if capacity_buffers_rc:
+                    return run_of(capacity_buffers_rc, "", capacity_buffers_stderr)
+                if capacity_buffers_stdout is not None:
+                    return run_of(0, capacity_buffers_stdout, capacity_buffers_stderr)
+                items = (
+                    list(capacity_buffers)
+                    if capacity_buffers is not None
+                    else [i for i in dump_items if i.get("kind") == fs.CAPACITY_BUFFER_KIND]
+                )
+                return run_of(0, json.dumps(dump_of(*items)))
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of(*dump_items)))
             if argv[:3] == ["gcloud", "container", "node-pools"]:
@@ -5326,6 +5345,579 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         ):
             text = f"{class_read}; {pools_read}"
             self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", self.SLUG))
+
+
+def capacity_buffer(
+    name,
+    namespace="serving",
+    *,
+    conditions=(),
+    strategy="buffer.x-k8s.io/active-capacity",
+    pod_template_ref="serving-buffer-template",
+    scalable_ref=None,
+    replicas=3,
+    status_replicas=None,
+    ready_replicas=None,
+    labels=None,
+    owner_references=None,
+):
+    metadata = {"name": name, "namespace": namespace}
+    if labels:
+        metadata["labels"] = labels
+    if owner_references:
+        metadata["ownerReferences"] = owner_references
+    spec = {}
+    if pod_template_ref is not None:
+        spec["podTemplateRef"] = {"name": pod_template_ref}
+    if scalable_ref is not None:
+        spec["scalableRef"] = scalable_ref
+    if replicas is not None:
+        spec["replicas"] = replicas
+    if strategy:
+        spec["provisioningStrategy"] = strategy
+    status = {}
+    if conditions is not None:
+        status["conditions"] = list(conditions)
+    if strategy:
+        status["provisioningStrategy"] = strategy
+    if status_replicas is not None:
+        status["replicas"] = status_replicas
+    if ready_replicas is not None:
+        status["readyReplicas"] = ready_replicas
+    return {
+        "apiVersion": "autoscaling.x-k8s.io/v1beta1",
+        "kind": "CapacityBuffer",
+        "metadata": metadata,
+        "spec": spec,
+        "status": status,
+    }
+
+
+class CapacityBufferNotReadyCheckTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 14, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_healthy_v1beta1_steady_state_provisioning_true_over_24h_is_clean(self):
+        """Upstream v1beta1 emits ReadyForProvisioning, LimitedByQuotas, and
+        Provisioning only; every healthy buffer stays Provisioning=True
+        (FakePodsInjected) with no Ready condition and no readyReplicas field
+        forever."""
+        old_ts = (self.NOW - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cb = capacity_buffer(
+            "healthy-v1beta1",
+            namespace="serving",
+            status_replicas=3,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok", "lastTransitionTime": old_ts},
+                {"type": "LimitedByQuotas", "status": "False", "reason": "ok", "lastTransitionTime": old_ts},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "message": "capacity buffer 3 fake pods injected",
+                    "lastTransitionTime": old_ts,
+                },
+            ],
+        )
+        self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_ready_for_provisioning_false_flags_major_with_verbatim_message(self):
+        message = 'Buffer not ready for provisioning: failed to resolve podTemplateRef "serving-buffer-template": not found'
+        cb = capacity_buffer(
+            "serving-buf",
+            namespace="serving",
+            conditions=[
+                {
+                    "type": "ReadyForProvisioning",
+                    "status": "False",
+                    "reason": "error",
+                    "message": message,
+                    "lastTransitionTime": "2026-10-14T11:59:50Z",
+                }
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "serving")
+        self.assertEqual(hit["object"], "CapacityBuffer/serving-buf")
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("ReadyForProvisioning=False (error): " + message, hit["excerpt"])
+        self.assertIn("provisioningStrategy=buffer.x-k8s.io/active-capacity", hit["excerpt"])
+        self.assertIn("podTemplateRef=serving-buffer-template", hit["excerpt"])
+
+    def test_ready_false_flags_critical_with_verbatim_message(self):
+        message = "Scale-up failed: ZONE_RESOURCE_POOL_EXHAUSTED in us-central1-a"
+        cb = capacity_buffer(
+            "gpu-buf",
+            namespace="inference",
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok"},
+                {"type": "Ready", "status": "False", "reason": "ScaleUpFailed", "message": message},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "inference")
+        self.assertEqual(hit["object"], "CapacityBuffer/gpu-buf")
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("Ready=False (ScaleUpFailed): " + message, hit["excerpt"])
+
+    def test_ready_false_and_ready_for_provisioning_false_both_appear_at_critical(self):
+        cb = capacity_buffer(
+            "broken-buf",
+            conditions=[
+                {"type": "Ready", "status": "False", "reason": "NotReady", "message": "buffer not ready"},
+                {"type": "ReadyForProvisioning", "status": "False", "reason": "error", "message": "missing limits"},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("buffer not ready", hit["excerpt"])
+        self.assertIn("missing limits", hit["excerpt"])
+
+    def test_limited_by_quotas_true_with_zero_replicas_flags_critical(self):
+        message = "Buffer replicas capped at 0 by namespace ResourceQuota ns-quota"
+        cb = capacity_buffer(
+            "quota-zero-buf",
+            namespace="payments",
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok"},
+                {"type": "LimitedByQuotas", "status": "True", "reason": "QuotaExceeded", "message": message},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "0 replicas"},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "payments")
+        self.assertEqual(hit["object"], "CapacityBuffer/quota-zero-buf")
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("LimitedByQuotas=True (QuotaExceeded): " + message, hit["excerpt"])
+        self.assertIn("(status.replicas=0)", hit["excerpt"])
+
+    def test_limited_by_quotas_true_partial_or_absent_replicas_flags_major(self):
+        message = "Buffer replicas reduced from 5 to 2 by namespace ResourceQuota"
+        for status_replicas in (2, None):
+            cb = capacity_buffer(
+                "quota-partial-buf",
+                namespace="payments",
+                replicas=5,
+                status_replicas=status_replicas,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "LimitedByQuotas", "status": "True", "reason": "QuotaExceeded", "message": message},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected"},
+                ],
+            )
+            with self.subTest(status_replicas=status_replicas):
+                hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["severity"], "major")
+                self.assertIn("LimitedByQuotas=True (QuotaExceeded): " + message, hit["excerpt"])
+                if status_replicas is not None:
+                    self.assertIn(f"(status.replicas={status_replicas})", hit["excerpt"])
+                else:
+                    self.assertNotIn("status.replicas=", hit["excerpt"])
+
+    def test_provisioning_false_failure_reasons_flag_major(self):
+        for reason, message in (
+            ("FailedToMakeFakePods", "cannot construct fake pod from template"),
+            ("FailedToGetPodTemplate", 'PodTemplate "serving-buffer-template" not found'),
+        ):
+            cb = capacity_buffer(
+                "prov-fail-buf",
+                namespace="serving",
+                status_replicas=0,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "LimitedByQuotas", "status": "False"},
+                    {"type": "Provisioning", "status": "False", "reason": reason, "message": message},
+                ],
+            )
+            with self.subTest(reason=reason):
+                hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["severity"], "major")
+                self.assertIn(f"Provisioning=False ({reason}): {message}", hit["excerpt"])
+
+    def test_provisioning_false_buffer_is_empty_on_fixed_nonzero_spec_flags_major(self):
+        cb = capacity_buffer(
+            "fixed-empty-buf",
+            namespace="serving",
+            replicas=3,
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "buffer has 0 replicas"},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("Provisioning=False (BufferIsEmpty): buffer has 0 replicas", hit["excerpt"])
+
+    def test_provisioning_false_benign_buffer_is_empty_is_clean(self):
+        zero_spec = capacity_buffer(
+            "scaled-zero-fixed",
+            replicas=0,
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "0 replicas"},
+            ],
+        )
+        dynamic_empty = capacity_buffer(
+            "scaled-zero-dynamic",
+            replicas=None,
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "serving-frontend"},
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "0 replicas"},
+            ],
+        )
+        dynamic_no_quota_cond = capacity_buffer(
+            "scaled-zero-dynamic-no-quota-cond",
+            replicas=None,
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "serving-frontend"},
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty"},
+            ],
+        )
+        for cb in (zero_spec, dynamic_empty, dynamic_no_quota_cond):
+            with self.subTest(name=cb["metadata"]["name"]):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_ready_replicas_shortfall_past_grace_flags_critical_with_stable_excerpt(self):
+        # 15m01s = 901s past lastTransitionTime -> strictly past 900s grace window.
+        past_grace = (self.NOW - timedelta(seconds=fs.CAPACITY_BUFFER_PROVISIONING_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cb = capacity_buffer(
+            "starved-buf",
+            namespace="payments",
+            status_replicas=3,
+            ready_replicas=1,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok"},
+                {"type": "LimitedByQuotas", "status": "False", "reason": "ok"},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "message": "capacity buffer 3 fake pods triggered scale-up",
+                    "lastTransitionTime": past_grace,
+                },
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "payments")
+        self.assertEqual(hit["object"], "CapacityBuffer/starved-buf")
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("Provisioning=True (FakePodsInjected): capacity buffer 3 fake pods triggered scale-up", hit["excerpt"])
+        self.assertIn(f"since {past_grace} (past 15m grace)", hit["excerpt"])
+        self.assertIn("readyReplicas=1/3", hit["excerpt"])
+        # Stability invariant: running a day later against the unchanged object must
+        # emit the exact same excerpt so audit_report.carry_unchanged_findings holds.
+        hit_next_day = fs.check_capacity_buffer_not_ready(cb, now=self.NOW + timedelta(hours=24))
+        self.assertIsNotNone(hit_next_day)
+        self.assertEqual(hit_next_day["excerpt"], hit["excerpt"])
+
+    def test_ready_replicas_shortfall_within_grace_window_is_not_flagged(self):
+        for age_s in (0, 60, fs.CAPACITY_BUFFER_PROVISIONING_GRACE_S - 1, fs.CAPACITY_BUFFER_PROVISIONING_GRACE_S):
+            ts = (self.NOW - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cb = capacity_buffer(
+                "fresh-buf",
+                status_replicas=3,
+                ready_replicas=0,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": ts},
+                ],
+            )
+            with self.subTest(age_s=age_s):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_ready_replicas_met_or_non_int_or_ready_true_is_healthy(self):
+        old_ts = (self.NOW - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cases = [
+            capacity_buffer(
+                "fully-ready-replicas",
+                status_replicas=3,
+                ready_replicas=3,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                ],
+            ),
+            capacity_buffer(
+                "explicit-ready-true",
+                status_replicas=3,
+                ready_replicas=0,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                    {"type": "Ready", "status": "True", "reason": "Ready"},
+                ],
+            ),
+            capacity_buffer(
+                "bool-ready-replicas-ignored",
+                status_replicas=3,
+                ready_replicas=False,
+                conditions=[
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                ],
+            ),
+            capacity_buffer(
+                "string-ready-replicas-ignored",
+                status_replicas=3,
+                ready_replicas="1",
+                conditions=[
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                ],
+            ),
+        ]
+        for cb in cases:
+            with self.subTest(name=cb["metadata"]["name"]):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_nanosecond_and_offset_timestamps_parse_cleanly(self):
+        for ts in ("2026-10-14T11:30:00.123456789Z", "2026-10-14T13:30:00+02:00"):
+            cb = capacity_buffer(
+                "ts-buf",
+                status_replicas=3,
+                ready_replicas=0,
+                conditions=[
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": ts},
+                ],
+            )
+            with self.subTest(ts=ts):
+                hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["severity"], "critical")
+
+    def test_missing_or_unparseable_transition_time_or_empty_status_is_not_flagged(self):
+        for cb in (
+            capacity_buffer("no-status", conditions=None),
+            capacity_buffer("empty-conds", conditions=[]),
+            capacity_buffer("no-ts", status_replicas=3, ready_replicas=0, conditions=[{"type": "Provisioning", "status": "True"}]),
+            capacity_buffer("bad-ts", status_replicas=3, ready_replicas=0, conditions=[{"type": "Provisioning", "status": "True", "lastTransitionTime": "not-a-time"}]),
+        ):
+            with self.subTest(name=cb["metadata"]["name"]):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_scalable_ref_context_is_included(self):
+        cb = capacity_buffer(
+            "dyn-buf",
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "serving-frontend"},
+            replicas=None,
+            conditions=[{"type": "ReadyForProvisioning", "status": "False", "reason": "error", "message": "bad ref"}],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIn("scalableRef=Deployment/serving-frontend", hit["excerpt"])
+
+    def test_the_procedure_carries_the_collector_s_impact_sentence(self):
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.CAPACITY_BUFFER_CHECK}`)")[1]
+        impact_line = next(line for line in section.splitlines() if line.startswith("- **Impact:**"))
+        self.assertIn(fs.IMPACT[fs.CAPACITY_BUFFER_CHECK], impact_line)
+
+
+class CapacityBufferCollectTest(unittest.TestCase):
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    SLUG = fs.CAPACITY_BUFFER_CHECK
+
+    def test_served_crd_with_failing_buffers_records_command_and_candidates(self):
+        bad_config = capacity_buffer(
+            "bad-template",
+            namespace="team-a",
+            conditions=[
+                {
+                    "type": "ReadyForProvisioning",
+                    "status": "False",
+                    "reason": "error",
+                    "message": "Buffer not ready for provisioning: missing podTemplateRef",
+                }
+            ],
+        )
+        quota_blocked = capacity_buffer(
+            "quota-blocked",
+            namespace="team-b",
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "True", "reason": "QuotaExceeded", "message": "capped at 0"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty"},
+            ],
+        )
+        prov_failed = capacity_buffer(
+            "fake-pods-failed",
+            namespace="team-c",
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "FailedToMakeFakePods", "message": "pod template error"},
+            ],
+        )
+        shortfall = capacity_buffer(
+            "starved-headroom",
+            namespace="team-d",
+            status_replicas=3,
+            ready_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "lastTransitionTime": "2020-01-01T00:00:00Z",
+                },
+            ],
+        )
+        healthy_v1beta1 = capacity_buffer(
+            "healthy-v1beta1-buf",
+            namespace="team-a",
+            status_replicas=3,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "lastTransitionTime": "2020-01-01T00:00:00Z",
+                },
+            ],
+        )
+        benign_dynamic_empty = capacity_buffer(
+            "idle-dynamic-buf",
+            namespace="team-a",
+            replicas=None,
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty"},
+            ],
+        )
+        entry = self.run_with(
+            capacity_buffers=[bad_config, quota_blocked, prov_failed, shortfall, healthy_v1beta1, benign_dynamic_empty]
+        )
+        self.assertEqual(entry["outcome"], "collected")
+        cb_cmds = [c for c in entry["commands"] if c["check"] == self.SLUG]
+        self.assertEqual(len(cb_cmds), 1)
+        self.assertIn(f"kubectl get {fs.CAPACITY_BUFFER_RESOURCE} -A {fs.KUBECTL_CHUNK_SIZE_ARG} -o json", cb_cmds[0]["command"])
+        filed = {c["object"]: c for c in entry["candidates"] if c["check"] == self.SLUG}
+        self.assertEqual(
+            set(filed),
+            {
+                "CapacityBuffer/bad-template",
+                "CapacityBuffer/quota-blocked",
+                "CapacityBuffer/fake-pods-failed",
+                "CapacityBuffer/starved-headroom",
+            },
+        )
+        self.assertEqual((filed["CapacityBuffer/bad-template"]["namespace"], filed["CapacityBuffer/bad-template"]["severity"]), ("team-a", "major"))
+        self.assertEqual((filed["CapacityBuffer/quota-blocked"]["namespace"], filed["CapacityBuffer/quota-blocked"]["severity"]), ("team-b", "critical"))
+        self.assertEqual((filed["CapacityBuffer/fake-pods-failed"]["namespace"], filed["CapacityBuffer/fake-pods-failed"]["severity"]), ("team-c", "major"))
+        self.assertEqual((filed["CapacityBuffer/starved-headroom"]["namespace"], filed["CapacityBuffer/starved-headroom"]["severity"]), ("team-d", "critical"))
+        for candidate in filed.values():
+            self.assertEqual(candidate["command"], cb_cmds[0]["command"])
+
+    def test_served_crd_with_no_buffers_records_check_as_run(self):
+        entry = self.run_with(capacity_buffers=[])
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+        self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_not_applicable", [])})
+        self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+
+    def test_standard_exclusions_apply_while_dynamic_buffers_are_checked(self):
+        cond = [{"type": "Ready", "status": "False", "reason": "Failed", "message": "stockout"}]
+        excluded = [
+            capacity_buffer("sys-buf", namespace="kube-system", conditions=cond),
+            capacity_buffer("addon-buf", labels={fs.ADDON_MANAGER_LABEL: "Reconcile"}, conditions=cond),
+            capacity_buffer("owned-buf", owner_references=[{"kind": "App", "name": "x"}], conditions=cond),
+            capacity_buffer("optout-buf", labels={fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE}, conditions=cond),
+            capacity_buffer("zero-buf", replicas=0, conditions=cond),
+        ]
+        dynamic = capacity_buffer(
+            "dynamic-buf",
+            namespace="prod",
+            replicas=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+            conditions=cond,
+        )
+        entry = self.run_with(capacity_buffers=[*excluded, dynamic])
+        filed = [c["object"] for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual(filed, ["CapacityBuffer/dynamic-buf"])
+
+    def test_unserved_crd_maps_to_checks_not_applicable_without_failing_dump_gate(self):
+        for stderr in (
+            'error: the server doesn\'t have a resource type "capacitybuffers"',
+            'no matches for kind "CapacityBuffer" in version "autoscaling.x-k8s.io/v1beta1"',
+        ):
+            with self.subTest(stderr=stderr):
+                entry = self.run_with(capacity_buffers_rc=1, capacity_buffers_stderr=stderr)
+                self.assertEqual(entry["outcome"], "collected")
+                [reason] = [e["reason"] for e in entry.get("checks_not_applicable", []) if e["check"] == self.SLUG]
+                self.assertEqual(reason, fs.CAPACITY_BUFFER_NOT_APPLICABLE_REASON)
+                self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+                self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+                # Other stockout checks still evaluated cleanly.
+                self.assertIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
+
+    def test_read_failures_and_bad_json_map_to_checks_unevaluated(self):
+        cases = [
+            {"capacity_buffers_rc": 1, "capacity_buffers_stderr": "Error from server (Forbidden): cannot list resource"},
+            {"capacity_buffers_rc": fs.TIMEOUT_RC, "capacity_buffers_stderr": "the server doesn't have a resource type (timed out)"},
+            {"capacity_buffers_rc": 0, "capacity_buffers_stdout": ""},
+            {"capacity_buffers_rc": 0, "capacity_buffers_stdout": "{}"},
+            {"capacity_buffers_rc": 0, "capacity_buffers_stdout": "{truncated"},
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                entry = self.run_with(**kwargs)
+                self.assertEqual(entry["outcome"], "collected")
+                [reason] = [e["reason"] for e in entry.get("checks_unevaluated", []) if e["check"] == self.SLUG]
+                self.assertIn(fs.CAPACITY_BUFFER_RESOURCE, reason)
+                self.assertIn(self.SLUG, entry.get("limitations", ""))
+                self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+                self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_not_applicable", [])})
+
+    def test_typed_list_items_without_per_item_kind_are_evaluated(self):
+        item = capacity_buffer(
+            "typed-list-buf",
+            namespace="serving",
+            conditions=[{"type": "Ready", "status": "False", "reason": "InsufficientCapacity", "message": "zone out of stock"}],
+        )
+        del item["kind"]
+        other_kind = {
+            "kind": "ConfigMap",
+            "metadata": {"name": "not-a-buffer", "namespace": "serving"},
+            "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+        }
+        entry = self.run_with(capacity_buffers=[item, other_kind])
+        filed = [c["object"] for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual(filed, ["CapacityBuffer/typed-list-buf"])
+
+    def test_command_stays_under_published_command_cap(self):
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        cb_argv = ["kubectl", "get", fs.CAPACITY_BUFFER_RESOURCE, "-A", fs.KUBECTL_CHUNK_SIZE_ARG, "-o", "json"]
+        text = f"KUBECONFIG={kubeconfig} {shlex.join(cb_argv)}"
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", self.SLUG))
 
 
 if __name__ == "__main__":

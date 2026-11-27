@@ -26,6 +26,23 @@
 # lone late edit and a late kubectl edit are more likely a person's change made
 # just before a restart than part of an install's burst.
 #
+# Step 1 of the prompt names the card by who changed what. On an install
+# where the runner is a person, the fixture's own kubectl writes (the
+# namespace, two applies of the Deployment, the verdict ConfigMap) get triage
+# cards too. The verdict ConfigMap is written last, and its triage report can
+# name the workload; under the earlier wording, "the most recent one
+# concerning" the workload, the agent could reproduce that card, whose text
+# says nothing of the memory limit. Such a run is broken, not red. The kind
+# alone would not single the card out, because the late records that must be
+# carded name other Deployments, and the object alone would not either,
+# because the fixture's two applies are cards about the same Deployment. So
+# the step names the live record's principal as well (live_principal above;
+# the fixture requires the principals to differ). Neither the principal nor
+# the kind is graded, and the prompt named the workload before. A CI runner is
+# a service account, which the classifier drops, so the fixture's own writes
+# make no cards there. gitops-drift-load-bearing-change-triage also names its
+# card by subject, by kind alone, against the event watcher's Pod cards.
+#
 # The eval installs run with the drift alert ceiling off and chat off, so the
 # digest becomes one unassigned board card there (backlog = 3), which the
 # fixture checks for; on an install with chat it is posted (backlog = 2) and
@@ -65,8 +82,15 @@ prompt: |
   1. Find the card. Call kanban_list separately for status 'running', 'done'
      and 'blocked'. Do not call kanban_list without a status filter -- it
      returns the oldest tasks first and stops at a page, so the newest card is
-     not in the default response. The card you want is the most recent one
-     concerning 'eval-drift-backlog-api'.
+     not in the default response.
+
+     More than one card concerns this namespace, and only one of them is the
+     one to report. The card you want is the most recent one about a change
+     that 'ada@example.com' made to the Deployment 'eval-drift-backlog-api'.
+     Cards about another object in the namespace (another Deployment, a
+     ConfigMap, the namespace itself), and cards about a change that someone
+     else made to this Deployment, are other changes; ignore them, even where
+     their text names this workload.
   2. If it has not finished, wait for it. Call kanban_show on its id, and keep
      re-checking until its status is 'done', 'blocked' or 'archived'.
   3. Reproduce the finished card's result in your reply in full and verbatim.

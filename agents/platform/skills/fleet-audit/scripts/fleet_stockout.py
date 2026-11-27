@@ -9,13 +9,14 @@ governance/stockout_prevention_sop.md.
 
 **All fourteen checks are converted.** Twelve read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
-`StatefulSet`/`StorageClass`/`Node` dump, the node pools (the discovery
+`StatefulSet`/`StorageClass`/`Node` dump, a separate chunked `CapacityBuffer`
+read (`capacitybuffers.autoscaling.x-k8s.io`), the node pools (the discovery
 `clusters list` item's `nodePools`, else `gcloud container node-pools list`),
 `gcloud compute reservations list`, `gcloud compute regions describe
 --format=json(quotas)`: `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`,
 `ccc-large-vm-scarcity`, `ccc-priority-starvation`,
 `ccc-mixed-disk-generations`, `ccc-hyperdisk-incompatible`,
-`ccc-unbacked-manual-fallback`,
+`ccc-unbacked-manual-fallback`, `capacity-buffer-not-ready`,
 `quota-exhaustion-risk`, `single-zone-nodepool`, `reservation-mismatch-risk`,
 `dangling-compute-class`, `gpu-pool-missing-taint`.
 
@@ -88,7 +89,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -278,10 +279,10 @@ NO_CHECKED_OPTION = "no option that was checked"
 PODS_WAIT = "Pods that use this class wait."
 NO_NODE_ADDED = "GKE adds no node for {options}."
 OPTIONS_UNCHECKED = "{options} could not be checked: {names} no node pool and no machine type."
-# §3.14: a node pool with accelerators that no taint keeps other pods off, in
+# §3.15: a node pool with accelerators that no taint keeps other pods off, in
 # a cluster that also has an untainted node pool without accelerators.
 GPU_POOL_MISSING_TAINT = "gpu-pool-missing-taint"
-# §3.14 reads the pods on at most this many nodes of an unprotected pool, one
+# §3.15 reads the pods on at most this many nodes of an unprotected pool, one
 # server-filtered read each, and names at most this many workloads and this
 # many of the cluster's other pools.
 GPU_POOL_NODES_READ_MAX = 5
@@ -289,7 +290,7 @@ GPU_POOL_WORKLOADS_NAMED_MAX = 5
 GPU_POOL_PLAIN_POOLS_NAMED_MAX = 3
 FIELD_SELECTOR_KEY = "fieldSelector"
 PODS_ON_NODE_SELECTOR = "spec.nodeName={node}"
-# What stands for a node's name in a §3.14 finding's command: the read is one
+# What stands for a node's name in a §3.15 finding's command: the read is one
 # for each node, and a command that named the nodes would change with every
 # replaced node, and the run's digest with it. The query is built with a
 # plain token, which the URL encoding leaves as it is; the command that is
@@ -313,10 +314,10 @@ EXCERPT_SEPARATOR = "; "
 # How a failed read is written to the log.
 READ_FAILURE = "rc={rc}: {stderr}"
 NO_STDERR = "no stderr"
-# §3.14's grade when pods that request no GPU run on the pool now; without
+# §3.15's grade when pods that request no GPU run on the pool now; without
 # one it is the configuration alone, `SEVERITY`'s entry.
 GPU_POOL_IN_USE_SEVERITY = "major"
-# The sentences of a §3.14 finding's excerpt. The pods sentence comes before
+# The sentences of a §3.15 finding's excerpt. The pods sentence comes before
 # the list of other pools, so a long list is what a cut excerpt loses.
 GPU_POOL_ACCELERATOR = "{count} x {kind}"
 GPU_POOL_ACCELERATOR_COUNT_UNKNOWN = "?"
@@ -340,7 +341,7 @@ GPU_POOL_STRAY_PODS = (
 )
 GPU_POOL_AND_MORE = " and {count} more"
 UNKNOWN_MACHINE_TYPE = "an unknown machine type"
-# Why §3.14 does not apply on Autopilot, and the one `limitations` sentence
+# Why §3.15 does not apply on Autopilot, and the one `limitations` sentence
 # for a cluster whose pods read failed. The sentence carries no exit code, no
 # tool output and no list of pools: it is read in chat, on a line the chat
 # card caps, and in a cell of the ledger, which is the shorter of the two,
@@ -349,10 +350,46 @@ UNKNOWN_MACHINE_TYPE = "an unknown machine type"
 # detail goes to the log.
 GPU_POOL_AUTOPILOT_REASON = "GKE Autopilot: GKE creates and manages the nodes, and exposes no user node pool whose taints could be missing."
 GPU_POOL_PODS_UNREAD_LIMITATION = "pods on a GPU node pool with no taint could not be read, so such a pool's finding is graded on its settings alone"
-# What a failed node pools read adds for §3.14 to that read's `limitations` sentence.
+# What a failed node pools read adds for §3.15 to that read's `limitations` sentence.
 GPU_POOL_POOLS_UNREAD_CLAUSE = f"and {GPU_POOL_MISSING_TAINT} read no node pool's taints"
 # The name GKE gives the cluster-level default ComputeClass.
 CLUSTER_DEFAULT_CLASS = "default"
+# §3.14: CapacityBuffer readiness check (autoscaling.x-k8s.io/v1beta1, GKE 1.35.2+).
+# Queried outside the main dump gate so clusters earlier than 1.35.2 without the CRD
+# map cleanly to `checks_not_applicable` instead of failing the dump gate.
+CAPACITY_BUFFER_CHECK = "capacity-buffer-not-ready"
+CAPACITY_BUFFER_RESOURCE = "capacitybuffers.autoscaling.x-k8s.io"
+CAPACITY_BUFFER_KIND = "CapacityBuffer"
+KUBECTL_CHUNK_SIZE_ARG = "--chunk-size=500"
+RESOURCE_TYPE_ABSENT_MARKERS = ("doesn't have a resource type", "no matches for kind")
+CAPACITY_BUFFER_READY_FOR_PROVISIONING = "ReadyForProvisioning"
+CAPACITY_BUFFER_LIMITED_BY_QUOTAS = "LimitedByQuotas"
+CAPACITY_BUFFER_READY = "Ready"
+CAPACITY_BUFFER_PROVISIONING = "Provisioning"
+# Upstream kubernetes/autoscaler v1beta1 sets Provisioning=False (BufferIsEmpty)
+# when desired replicas resolve to 0 (spec.replicas == 0, or a dynamic
+# scalableRef buffer whose target is scaled to 0 with LimitedByQuotas != True).
+CAPACITY_BUFFER_EMPTY_REASON = "BufferIsEmpty"
+# Upstream v1beta1 emits ReadyForProvisioning, LimitedByQuotas, and Provisioning
+# with no Ready condition in steady state (healthy buffers remain
+# Provisioning=True / FakePodsInjected). When a controller also reports an
+# integer status.readyReplicas below status.replicas (>0), wait 15 minutes from
+# Provisioning's lastTransitionTime before flagging sustained shortfall.
+CAPACITY_BUFFER_PROVISIONING_GRACE_S = 900
+SECONDS_PER_MINUTE = 60
+CAPACITY_BUFFER_MESSAGE_MAX_CHARS = 500
+CAPACITY_BUFFER_SEVERITY_MAJOR = "major"
+CAPACITY_BUFFER_SEVERITY_CRITICAL = "critical"
+CAPACITY_BUFFER_NOT_APPLICABLE_REASON = (
+    "Cluster API server does not serve capacitybuffers.autoscaling.x-k8s.io (requires GKE 1.35.2+)."
+)
+CAPACITY_BUFFER_IMPACT = (
+    "CapacityBuffer cannot hold pre-warmed node headroom, so incoming workloads "
+    "face cold scale-up delays or capacity exhaustion when traffic spikes."
+)
+RFC3339_UTC_SUFFIX = "Z"
+RFC3339_UTC_OFFSET = "+00:00"
+RFC3339_FRACTIONAL_RE = re.compile(r"(\.\d{6})\d+")
 # What `_priority_family` returns for the N1 machine types whose names do not
 # lead with the family (`custom-4-8192`, `f1-micro`, `g1-small`), and the family they are.
 N1_TYPE_PREFIXES = frozenset({"custom", "f1", "g1"})
@@ -646,6 +683,7 @@ IMPACT = {
     "dangling-compute-class": "Workload cannot be scheduled due to dangling class references, invalid CRD configuration, or missing node tolerations, causing permanent Pending state.",
     "spot-scarcity-risk": "Spot machine shapes have high historical preemption rates and severe obtainability constraints, putting workload uptime at extreme risk.",
     "autoscaler-out-of-resources": "Autoscaler has actively failed scale-up attempts due to physical cloud stockouts, quota exhaustion, or pod subnet IP exhaustion.",
+    CAPACITY_BUFFER_CHECK: CAPACITY_BUFFER_IMPACT,
 }
 SEVERITY = {
     "ccc-missing-fallbacks": "critical",
@@ -662,6 +700,7 @@ SEVERITY = {
     "dangling-compute-class": "critical",
     "spot-scarcity-risk": "major",
     "autoscaler-out-of-resources": "critical",
+    CAPACITY_BUFFER_CHECK: CAPACITY_BUFFER_SEVERITY_CRITICAL,  # overridden to major for ReadyForProvisioning=False, partial LimitedByQuotas=True, and Provisioning=False
 }
 
 
@@ -1906,7 +1945,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
 
 
 # --------------------------------------------------------------------------- #
-# 3.14 gpu-pool-missing-taint
+# 3.15 gpu-pool-missing-taint
 # --------------------------------------------------------------------------- #
 
 
@@ -1960,7 +1999,7 @@ def pod_requests_gpu(pod: dict) -> bool:
 
 
 def pods_without_gpu(pods: Sequence[dict], node_names: Sequence[str]) -> list[dict]:
-    """The pods on these nodes that §3.14 counts: on one of the nodes, not
+    """The pods on these nodes that §3.15 counts: on one of the nodes, not
     finished, not a DaemonSet's (every node runs those), not in a system
     namespace, requesting no GPU, and holding no resource claim. A pod with a
     resource claim may take its GPU through the claim, which this read cannot
@@ -2546,6 +2585,192 @@ def check_spot_scarcity(
     }, None
 
 
+def _is_resource_type_absent(stderr: str) -> bool:
+    """Whether kubectl stderr reports an unserved CRD rather than a read error."""
+    lower = (stderr or "").lower()
+    return any(marker in lower for marker in RESOURCE_TYPE_ABSENT_MARKERS)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_rfc3339(value: object) -> datetime | None:
+    """Parse an RFC 3339 Kubernetes timestamp to UTC, tolerating nanosecond precision."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith(RFC3339_UTC_SUFFIX):
+        raw = raw[: -len(RFC3339_UTC_SUFFIX)] + RFC3339_UTC_OFFSET
+    raw = RFC3339_FRACTIONAL_RE.sub(r"\1", raw)
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _format_capacity_buffer_condition(condition: dict) -> str:
+    """Format one CapacityBuffer status condition with its message preserved verbatim."""
+    cond_type = str(condition.get("type") or "")
+    status = str(condition.get("status") or "")
+    reason = str(condition.get("reason") or "").strip()
+    message = " ".join(str(condition.get("message") or "").split())[:CAPACITY_BUFFER_MESSAGE_MAX_CHARS]
+    head = f"{cond_type}={status}" + (f" ({reason})" if reason else "")
+    return f"{head}: {message}" if message else head
+
+
+def _capacity_buffer_context(cb: dict) -> str:
+    """Optional strategy and template context from a CapacityBuffer for remediation routing."""
+    spec = cb.get("spec") or {}
+    status = cb.get("status") or {}
+    parts: list[str] = []
+    strategy = status.get("provisioningStrategy") or spec.get("provisioningStrategy")
+    if strategy:
+        parts.append(f"provisioningStrategy={strategy}")
+    pod_template_name = (spec.get("podTemplateRef") or {}).get("name")
+    if pod_template_name:
+        parts.append(f"podTemplateRef={pod_template_name}")
+    scalable_ref = spec.get("scalableRef") or {}
+    if scalable_ref.get("name"):
+        ref_kind = scalable_ref.get("kind") or ""
+        parts.append(f"scalableRef={f'{ref_kind}/' if ref_kind else ''}{scalable_ref['name']}")
+    return f" [{', '.join(parts)}]" if parts else ""
+
+
+def _int_field(mapping: dict, key: str) -> int | None:
+    """Return an integer field value, rejecting booleans and non-integers."""
+    value = mapping.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def check_capacity_buffer_not_ready(cb: dict, *, now: datetime | None = None) -> dict | None:
+    """§3.14: flag a CapacityBuffer that failed provisioning or is quota-limited.
+
+    Upstream `autoscaling.x-k8s.io/v1beta1` emits `ReadyForProvisioning`,
+    `LimitedByQuotas`, and `Provisioning`; healthy steady-state buffers remain
+    `Provisioning=True` (`reason: FakePodsInjected`) with no `Ready` condition,
+    so `Provisioning=True` alone is not a failure. Precedence:
+    1. `Ready=False` (defensive fallback) -> `critical`, quoting `condition.message`.
+    2. `ReadyForProvisioning=False` -> `major`, quoting `condition.message`.
+    3. `LimitedByQuotas=True` -> `critical` when `status.replicas == 0`, else
+       `major`, quoting `condition.message`.
+    4. `Provisioning=False` -> `major`, quoting `condition.message`, excluding
+       benign `reason == "BufferIsEmpty"` when `spec.replicas == 0` or a dynamic
+       `scalableRef` buffer with `LimitedByQuotas != True` and `status.replicas == 0`.
+    5. Optional `status.readyReplicas` shortfall (integer `readyReplicas < status.replicas`
+       with `status.replicas > 0`) while `Provisioning=True` persists strictly past
+       `CAPACITY_BUFFER_PROVISIONING_GRACE_S` (900s) -> `critical` with a stable
+       `since {ts} (past 15m grace)` excerpt.
+    """
+    meta = cb.get("metadata") or {}
+    namespace = meta.get("namespace") or ""
+    name = meta.get("name") or ""
+    if not name:
+        return None
+    spec = cb.get("spec") or {}
+    status = cb.get("status") or {}
+    conditions = [c for c in (status.get("conditions") or []) if isinstance(c, dict)]
+    if not conditions:
+        return None
+    by_type = {str(c.get("type")): c for c in conditions if c.get("type")}
+    ready = by_type.get(CAPACITY_BUFFER_READY)
+    ready_for_prov = by_type.get(CAPACITY_BUFFER_READY_FOR_PROVISIONING)
+    limited_by_quotas = by_type.get(CAPACITY_BUFFER_LIMITED_BY_QUOTAS)
+    provisioning = by_type.get(CAPACITY_BUFFER_PROVISIONING)
+    status_replicas = _int_field(status, "replicas")
+    ready_replicas = _int_field(status, "readyReplicas")
+    spec_replicas = _int_field(spec, "replicas")
+    context = _capacity_buffer_context(cb)
+
+    if ready is not None and ready.get("status") == CONDITION_FALSE:
+        parts = [_format_capacity_buffer_condition(ready)]
+        if ready_for_prov is not None and ready_for_prov.get("status") == CONDITION_FALSE:
+            parts.append(_format_capacity_buffer_condition(ready_for_prov))
+        if limited_by_quotas is not None and limited_by_quotas.get("status") == CONDITION_TRUE:
+            parts.append(_format_capacity_buffer_condition(limited_by_quotas))
+        return {
+            "namespace": namespace,
+            "object": f"{CAPACITY_BUFFER_KIND}/{name}",
+            "severity": CAPACITY_BUFFER_SEVERITY_CRITICAL,
+            "excerpt": f"{CCC_CONDITION_JOINER.join(parts)}{context}",
+        }
+
+    if ready_for_prov is not None and ready_for_prov.get("status") == CONDITION_FALSE:
+        return {
+            "namespace": namespace,
+            "object": f"{CAPACITY_BUFFER_KIND}/{name}",
+            "severity": CAPACITY_BUFFER_SEVERITY_MAJOR,
+            "excerpt": f"{_format_capacity_buffer_condition(ready_for_prov)}{context}",
+        }
+
+    if limited_by_quotas is not None and limited_by_quotas.get("status") == CONDITION_TRUE:
+        severity = (
+            CAPACITY_BUFFER_SEVERITY_CRITICAL
+            if status_replicas == 0
+            else CAPACITY_BUFFER_SEVERITY_MAJOR
+        )
+        replicas_note = f" (status.replicas={status_replicas})" if status_replicas is not None else ""
+        return {
+            "namespace": namespace,
+            "object": f"{CAPACITY_BUFFER_KIND}/{name}",
+            "severity": severity,
+            "excerpt": f"{_format_capacity_buffer_condition(limited_by_quotas)}{replicas_note}{context}",
+        }
+
+    if provisioning is not None and provisioning.get("status") == CONDITION_FALSE:
+        reason = str(provisioning.get("reason") or "").strip()
+        has_scalable_ref = bool((spec.get("scalableRef") or {}).get("name"))
+        quota_limited = (
+            limited_by_quotas is not None and limited_by_quotas.get("status") == CONDITION_TRUE
+        )
+        benign_empty = reason == CAPACITY_BUFFER_EMPTY_REASON and (
+            spec_replicas == 0
+            or (has_scalable_ref and not quota_limited and status_replicas == 0)
+        )
+        if not benign_empty:
+            return {
+                "namespace": namespace,
+                "object": f"{CAPACITY_BUFFER_KIND}/{name}",
+                "severity": CAPACITY_BUFFER_SEVERITY_MAJOR,
+                "excerpt": f"{_format_capacity_buffer_condition(provisioning)}{context}",
+            }
+
+    if (
+        (ready is None or ready.get("status") != CONDITION_TRUE)
+        and ready_replicas is not None
+        and status_replicas is not None
+        and status_replicas > 0
+        and ready_replicas < status_replicas
+        and provisioning is not None
+        and provisioning.get("status") == CONDITION_TRUE
+    ):
+        transition = _parse_rfc3339(provisioning.get("lastTransitionTime"))
+        if transition is None:
+            return None
+        current = now if now is not None else _utcnow()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        else:
+            current = current.astimezone(timezone.utc)
+        elapsed_s = (current - transition).total_seconds()
+        if elapsed_s > CAPACITY_BUFFER_PROVISIONING_GRACE_S:
+            ts = str(provisioning.get("lastTransitionTime") or "").strip()
+            detail = _format_capacity_buffer_condition(provisioning)
+            grace_m = CAPACITY_BUFFER_PROVISIONING_GRACE_S // SECONDS_PER_MINUTE
+            return {
+                "namespace": namespace,
+                "object": f"{CAPACITY_BUFFER_KIND}/{name}",
+                "severity": CAPACITY_BUFFER_SEVERITY_CRITICAL,
+                "excerpt": (
+                    f"{detail} since {ts} (past {grace_m}m grace)"
+                    f" with readyReplicas={ready_replicas}/{status_replicas}{context}"
+                ),
+            }
+
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Assembly
 # --------------------------------------------------------------------------- #
@@ -2946,7 +3171,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                         # reads.
                         hit["command"] = f"{pools_record['command']}; {pods_command_text}"
                     candidates.append(_emit("single-zone-nodepool", hit))
-        # §3.14. Zero pools is an answer here too. The pod read is issued only
+        # §3.15. Zero pools is an answer here too. The pod read is issued only
         # for a pool the settings already name, and only for nodes it has.
         commands[GPU_POOL_MISSING_TAINT] = pools_record
         taints_of = {name: record.get("taints", []) for name, record in taint_records.items()}
@@ -3000,7 +3225,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             limitations.append(GPU_POOL_PODS_UNREAD_LIMITATION)
     else:
         unevaluated["single-zone-nodepool"] = pools_failure
-        # §3.14 starts from the node pools, so it did not run either.
+        # §3.15 starts from the node pools, so it did not run either.
         unevaluated[GPU_POOL_MISSING_TAINT] = pools_failure
         if any(_reads_pool_labels(w, compute_classes_by_name) for w in workloads):
             # The nodePoolAutoCreation arm needs the pool labels this read
@@ -3322,6 +3547,40 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 "`capacity-history` about."
             )
         not_applicable.append({"check": "spot-scarcity-risk", "reason": reason})
+
+    # §3.14: separate chunked CapacityBuffer read outside the main dump gate so
+    # clusters earlier than GKE 1.35.2 without the CRD map cleanly to
+    # `checks_not_applicable` instead of failing the cluster dump gate.
+    cb_argv = ["kubectl", "get", CAPACITY_BUFFER_RESOURCE, "-A", KUBECTL_CHUNK_SIZE_ARG, "-o", "json"]
+    cb_parsed, cb_result = run_and_gate(cb_argv, run=run, env=env)
+    cb_command = f"KUBECONFIG={kubeconfig} {shlex.join(cb_argv)}"
+    if isinstance(cb_parsed, dict) and isinstance(cb_parsed.get("items"), list):
+        commands[CAPACITY_BUFFER_CHECK] = _record(cb_command, cb_result)
+        now_utc = _utcnow()
+        for item in cb_parsed["items"]:
+            if not isinstance(item, dict) or item.get("kind") not in (None, CAPACITY_BUFFER_KIND):
+                continue
+            if standard_excluded(item):
+                continue
+            hit = check_capacity_buffer_not_ready(item, now=now_utc)
+            if hit:
+                candidates.append(_emit(CAPACITY_BUFFER_CHECK, {**hit, "command": cb_command}))
+    elif cb_result.rc != TIMEOUT_RC and cb_result.rc != 0 and _is_resource_type_absent(cb_result.stderr):
+        not_applicable.append(
+            {
+                "check": CAPACITY_BUFFER_CHECK,
+                "reason": CAPACITY_BUFFER_NOT_APPLICABLE_REASON,
+            }
+        )
+    else:
+        cb_stderr = cb_result.stderr.strip()[:STDERR_EXCERPT_CHARS] or "no stderr"
+        cb_failure = (
+            f"`kubectl get {CAPACITY_BUFFER_RESOURCE} -A` returned output that is not a JSON list of {CAPACITY_BUFFER_KIND} objects (rc=0) — {cb_stderr}"
+            if cb_result.rc == 0
+            else f"`kubectl get {CAPACITY_BUFFER_RESOURCE} -A` failed (rc={cb_result.rc}) — {cb_stderr}"
+        )
+        unevaluated[CAPACITY_BUFFER_CHECK] = cb_failure
+        limitations.append(f"{CAPACITY_BUFFER_CHECK} could not be measured on this cluster: {cb_failure}")
 
     entry = {
         "name": target, "project": project, "location": location, **mode,

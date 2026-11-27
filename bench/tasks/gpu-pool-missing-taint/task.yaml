@@ -5,7 +5,7 @@
 # cluster", and "does not retroactively apply this taint to existing GPU
 # nodes" when a non-GPU pool comes later, so such a pool can stay without a
 # taint. Pods that request no GPU can then run on its GPU machines, and GPU
-# pods can be left waiting. The stockout audit's 3.14
+# pods can be left waiting. The stockout audit's 3.15
 # `gpu-pool-missing-taint` files the pool from the node pools list: a pool
 # with accelerators and no NoSchedule or NoExecute taint in its settings,
 # graded `major` when pods that request no GPU run on its nodes now and

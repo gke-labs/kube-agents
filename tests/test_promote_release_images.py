@@ -15,6 +15,7 @@ from tests.testing.common import (
 )
 from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
+    MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX,
     MOCK_AR_REGISTRY_PREFIX,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
@@ -367,7 +368,10 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
     def _candidate_sources(self):
         return {self._candidate_ref(img, self.candidate): self._SOURCE_DIGEST for img in MOCK_REQUIRED_RELEASE_IMAGES}
 
-    def _promote(self, candidate_registry, images):
+    def _additional_ref(self, img):
+        return f"{MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX}/{img}:{MOCK_TARGET_RELEASE_TAG}"
+
+    def _promote(self, candidate_registry, images, additional_registry=None):
         """Runs the script against a registry holding `images`; returns the
         process and the (target, source) pair of each tag it created, in order."""
         _, log_path = create_mock_docker_binary(self.bin_dir, image_digests=images)
@@ -377,6 +381,8 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
         env = {"CI": "true", "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX}
         if candidate_registry is not None:
             env["CANDIDATE_REGISTRY_PREFIX"] = candidate_registry
+        if additional_registry is not None:
+            env["ADDITIONAL_RELEASE_REGISTRY_PREFIX"] = additional_registry
         proc = subprocess.run(
             ["bash", str(_PROMOTE_RELEASE_IMAGES_SH), MOCK_TARGET_RELEASE_TAG],
             capture_output=True,
@@ -458,6 +464,54 @@ class PromoteFromCandidateRegistryTest(unittest.TestCase):
             created,
             [(self._candidate_ref(first, MOCK_TARGET_RELEASE_TAG), self._candidate_ref(first, self.candidate))],
         )
+
+    def test_an_additional_release_registry_gets_the_same_images_last(self):
+        """Three tags per image from one source. Every image is in the
+        candidate registry and the registry prefix before the first is written
+        to the additional release registry, so a failure there leaves the
+        registry prefix whole."""
+        proc, created = self._promote(
+            MOCK_AR_REGISTRY_PREFIX, self._candidate_sources(), additional_registry=MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX + "/"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        expected = []
+        for img in MOCK_REQUIRED_RELEASE_IMAGES:
+            source = self._candidate_ref(img, self.candidate)
+            expected.append((self._candidate_ref(img, MOCK_TARGET_RELEASE_TAG), source))
+            expected.append((self._release_ref(img), source))
+        for img in MOCK_REQUIRED_RELEASE_IMAGES:
+            expected.append((self._additional_ref(img), self._candidate_ref(img, self.candidate)))
+        self.assertEqual(created, expected)
+
+    def test_an_additional_release_registry_without_a_candidate_registry(self):
+        """The source is then the registry prefix's own commit tag."""
+        proc, created = self._promote(None, {}, additional_registry=MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sources = [f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{self.candidate}" for img in MOCK_REQUIRED_RELEASE_IMAGES]
+        expected = [(self._release_ref(img), source) for img, source in zip(MOCK_REQUIRED_RELEASE_IMAGES, sources)]
+        expected += [(self._additional_ref(img), source) for img, source in zip(MOCK_REQUIRED_RELEASE_IMAGES, sources)]
+        self.assertEqual(created, expected)
+
+    def test_an_additional_release_registry_naming_the_registry_prefix_adds_nothing(self):
+        for additional in ("", MOCK_DEFAULT_REGISTRY_PREFIX, MOCK_DEFAULT_REGISTRY_PREFIX + "/"):
+            with self.subTest(additional=additional):
+                proc, created = self._promote(None, {}, additional_registry=additional)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(len(created), len(MOCK_REQUIRED_RELEASE_IMAGES))
+                (self.bin_dir / "docker.log").unlink()
+
+    def test_a_version_on_another_image_in_the_additional_registry_is_refused(self):
+        images = self._candidate_sources()
+        first = MOCK_REQUIRED_RELEASE_IMAGES[0]
+        images[self._additional_ref(first)] = self._OTHER_DIGEST
+        proc, created = self._promote(
+            MOCK_AR_REGISTRY_PREFIX, images, additional_registry=MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does NOT match source image", proc.stderr)
+        self.assertIn(self._additional_ref(first), proc.stderr)
+        self.assertEqual(len(created), 2 * len(MOCK_REQUIRED_RELEASE_IMAGES), "the registry prefix is whole")
+        self.assertNotIn(MOCK_ADDITIONAL_RELEASE_REGISTRY_PREFIX, " ".join(target for target, _ in created))
 
     def test_the_source_commit_is_found_by_its_images_in_the_candidate_registry(self):
         """A tag whose commit is not a stamp commit resolves by where the

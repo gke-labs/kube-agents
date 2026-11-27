@@ -420,6 +420,7 @@ AUDITS: dict[str, AuditSpec] = {
             "autoscaler-out-of-resources",
             "dangling-compute-class",
             "ccc-unbacked-manual-fallback",
+            "capacity-buffer-not-ready",
             "gpu-pool-missing-taint",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
@@ -442,6 +443,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "autoscaler-out-of-resources",
                     "dangling-compute-class",
                     "ccc-unbacked-manual-fallback",
+                    "capacity-buffer-not-ready",
                     "gpu-pool-missing-taint",
                 ),
             ),
@@ -1379,6 +1381,7 @@ CHECK_PHRASES = {
     "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
     "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
+    "capacity-buffer-not-ready": "{object} capacity buffer cannot provision warm headroom",
     "gpu-pool-missing-taint": "Node pool `{object}` lets workloads without a GPU take its GPU machines",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",

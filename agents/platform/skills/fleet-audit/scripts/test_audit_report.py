@@ -7914,7 +7914,7 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         # Pinned as a literal: the catalogue test only checks the set is a
         # subset of the roster, and a fault slipping in would pass it.
         self.assertEqual(audit_report.audit_declarable_checks(self.STOCKOUT), frozenset({"single-zone-nodepool"}))
-        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk"):
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk", "capacity-buffer-not-ready"):
             self.assertNotIn(fault, audit_report.audit_declarable_checks(self.STOCKOUT))
 
     def test_a_declaration_moves_the_zone_locked_pool_and_not_one_at_its_ceiling(self):
