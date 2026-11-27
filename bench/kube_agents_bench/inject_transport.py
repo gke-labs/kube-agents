@@ -309,7 +309,7 @@ ENTRY_CALL_ID_FIELD = "call_id"
 # tools its own way; the verifier reads such a call under either harness's
 # names (``session_tools``). The hermes bridge's cli executor leaves its
 # parts unlabelled too; the api executor, its default, labels every part.
-# The verifier and the scorer duplicate the literals.
+# ``session_tools`` duplicates the literals for the verifier and the scorer.
 ENTRY_ORIGIN_FIELD = "origin"
 ORIGIN_HERMES_BRIDGE = "hermes-bridge"
 # The trajectory entry's mark, ``true``, for a call that arrived with no

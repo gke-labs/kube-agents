@@ -348,7 +348,7 @@ transport. `tool_called` reads the trajectory, which on this path carries tool-c
 when the executor publishes `activity` artifacts and the door's probe carries them: the relay
 never posts `activity` to a conversation, so the harness reads the trace off the read route when
 the probe body carries an `activity` key (`[]` for a run that called nothing), maps each entry
-the bridge does not label with a card worker's session to a trajectory item in the api path's shape (plus the entry's `callId` as `call_id`, beside `args`, when it carries one), and writes one `a2a.activity` marker whenever the key
+the bridge does not label with a card worker's session to a trajectory item in the api path's shape (plus the entry's `callId` as `call_id`, beside `args`, when it carries one, and `origin: hermes-bridge` on an entry the bridge labels as the router's), and writes one `a2a.activity` marker whenever the key
 was present at all; a probe without the key leaves the record with no marker and no calls. Which
 executor publishes `activity`, and whether the door carries it, is each component's own to state
 (the payload spec reserves the artifact; `a2a/gateway/inject.go` defines the probe body); the

@@ -1,7 +1,8 @@
 """Tool names that a session or profile pod's harness spells its own way.
 
 The worker adapter runs session and profile pods under Claude Code or under
-core-agent, and the two name the same tool differently (``Bash`` and
+core-agent (and Antigravity, whose tools this does not map: its calls are
+read as named, as before), and the two name the same tool differently (``Bash`` and
 ``bash``) and key its arguments differently (``Read``'s ``file_path`` and
 ``read_file``'s ``path``). Cases name the tools of the harness they were
 written against. On an inject record, a router call the worker adapter
@@ -18,9 +19,11 @@ recorded them, are never re-read. Hermes has its own ``read_file``, keyed
 ``Read`` would trip a skill-files safeguard when the platform agent reads its
 own skills. The hermes bridge's cli executor publishes its parts unlabelled,
 so such a call would be re-read too. The api executor is the bridge's default
-and labels every part. Re-reading only ever adds matches: a positive check can
-pass on a call that is not the session's, or a ``none`` safeguard can fail on
-one, which is a red, never a false pass.
+and labels every part. Re-reading only adds matches. Under the cli executor
+that could pass a positive check on a call that was not the session's, or
+fail a ``none`` safeguard on one; and such a call counts as a session pod's,
+so the scorer would grade a session-only check it would otherwise set aside,
+as every check graded before this mapping existed.
 
 An argument with no counterpart is dropped from the re-read, so a pattern
 on it rules the call out, the way a call that lacks the argument already
@@ -66,11 +69,15 @@ for _claude, _core, _keys in _PAIRS:
     _COUNTERPART[_core] = (_claude, {key: (source,) for key, source in _keys.items()})
 del _claude, _core, _keys, _to_core, _claude_key, _core_key
 
+# core-agent's other read tools (``toolgrant.go`` classes them with
+# ``read_file``), which Claude Code has no single counterpart for and cases
+# name as they are.
+CORE_AGENT_ONLY_READ_NAMES = frozenset({"read_many_files", "view_file_outline", "list_dir"})
 # Names that a Hermes record never carries: every name above except
 # core-agent's ``read_file``, which Hermes has too. A leaf naming only these
 # can fire on nothing but a call the worker adapter published.
 HERMES_SHARED_NAMES = frozenset({"read_file"})
-SESSION_ONLY_TOOL_NAMES = frozenset(_COUNTERPART) - HERMES_SHARED_NAMES
+SESSION_ONLY_TOOL_NAMES = (frozenset(_COUNTERPART) | CORE_AGENT_ONLY_READ_NAMES) - HERMES_SHARED_NAMES
 
 
 def is_inject_trajectory(trajectory: list[Any]) -> bool:

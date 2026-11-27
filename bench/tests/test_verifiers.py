@@ -3184,6 +3184,20 @@ def test_tool_called_reads_a_hermes_call_as_named():
     assert _calls_under([_INJECT_TASK, hermes_read], **leaf).status == "pass"
 
 
+def test_session_tools_names_only_core_agent_tools_the_grant_table_knows():
+    """The core-agent names are copied from its builtins and ADK's skill
+    toolset; toolgrant.go classifies every builtin the pinned core-agent
+    has and lists the skill tools, so a rename there fails here."""
+    from kube_agents_bench import session_tools
+
+    table = (Path(__file__).resolve().parents[2] / "a2a" / "lib" / "persona" / "toolgrant" / "toolgrant.go").read_text(
+        encoding="utf-8"
+    )
+    core_agent = {session_tools.counterpart(name) for name in ("Bash", "Skill", "Read", "Glob", "Grep")}
+    for name in sorted(core_agent | session_tools.CORE_AGENT_ONLY_READ_NAMES):
+        assert f'"{name}"' in table, name
+
+
 def test_tool_called_drops_an_argument_with_no_counterpart():
     """Claude Code's Grep filters by ``glob``; core-agent's grep has no such
     argument, so a pattern on it rules core-agent's call out."""
