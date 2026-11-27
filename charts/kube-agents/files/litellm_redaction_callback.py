@@ -17,23 +17,44 @@ walked whole with the key-aware walk the audit hooks use, so a value is
 redacted wherever it sits -- a tool's input, what a tool returned, a
 per-message field. A tool call's arguments held as JSON in a string (and an
 Anthropic tool input sent as a string) are decoded, walked as a document and
-re-encoded only if a rule changed them, so they stay valid JSON.
+re-encoded only if a rule changed them, so they stay valid JSON. A tool's
+output that is a whole JSON object or array (a chat tool message's string
+content, an Anthropic tool result's string or text parts, a Responses function
+call output, up to 64 top-level strings of a Gemini function response's
+response) is decoded the same way, up to 256 KiB and 64 levels deep, and so is
+whole JSON inside it, two levels in and 32 strings at most. The text rules
+run first, over the string as it came, and what is decoded is their result,
+so decoding only adds to what is masked; a string the structure rules mask
+whole where it sits is not opened. One with a repeated key, past the bounds,
+or not whole JSON is matched as text. A changed one keeps its indent
+width and compact or spaced separators; numbers, escapes and other spacing are
+normalised.
 
 Left exactly as they came, and only at the positions the provider APIs
-define (content parts, a tool result's own content list, `system`,
-`thinking_blocks`, Gemini parts; never inside a tool's input or output or a
+define (content parts, including a Responses `input` item's and a Responses
+function call output's, a tool result's own content list, `system`,
+`thinking_blocks`, Gemini parts and the parts inside a Gemini function
+response; beyond those parts, never inside a tool's input or output or a
 function's arguments): in an assistant's or the model's own turn, a thinking
 block's text and signature (the provider checks the text against the
 signature, and the model wrote it from input this hook had already redacted),
-redacted thinking's data and a thought signature; and, anywhere a part may
+redacted thinking's data and a thought signature; provider-encrypted
+content the provider checks byte for byte (a Responses reasoning item's
+`encrypted_content`, and in the assistant's turn a web search result's
+`encrypted_content`, `reasoning_details` data and signature, and the
+`thought_signature` LiteLLM carries on the message and its tool calls); and,
+anywhere a part may
 carry one, a binary payload of a listed binary media type (images, PDF,
 audio, video) that decodes as base64 and starts the way that media does; a
 payload of any other type is refused. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
-`messages` or `contents` that is not a list of objects, or anything at a
-payload position that is not binary base64. Responses are not touched; the limitation is documented
-on the site's inference-gateway page.
+`messages` or `contents` that is not a list of objects, anything at a
+payload position that is not binary base64, or nesting the hook can't follow
+(tool-call arguments too deep to decode, or any value too deep to copy and
+walk: the copy and walk take about two frames a level, so roughly half the
+interpreter's recursion limit, less the caller's stack), answered with 400
+since the same request is refused every time. Model responses are not touched.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
@@ -60,6 +81,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fastapi import HTTPException
 from litellm.integrations.custom_logger import CustomLogger
 
 logger = logging.getLogger("kube_agents.litellm_redaction")
@@ -118,7 +140,8 @@ CONTROL_KEY_PREFIXES = ("litellm_", "langfuse_", "_")
 # - a binary payload (base64 image, document, audio or video, as a source, a
 #   `data:` URL or Gemini inline data): no text rule applies, and a
 #   substitution would corrupt it. It is kept only if its media type is a
-#   known binary one and its data is strict base64; anything else in that
+#   known binary one and its data is base64 (standard or URL-safe, padding
+#   optional) that starts the way that type does; anything else in that
 #   position is refused, since it may carry text the walk cannot read.
 TYPE_KEY = "type"
 THINKING_TYPE = "thinking"
@@ -141,12 +164,43 @@ PROVIDER_FIELDS_KEY = "provider_specific_fields"
 PROVIDER_THOUGHT_SIGNATURE_KEY = "thought_signature"
 TOOL_CALLS_KEY = "tool_calls"
 RESPONSES_INPUT_KEY = "input"
+# A Responses input part whose base64 payload sits at the part's own file_data.
+RESPONSES_INPUT_FILE_TYPE = "input_file"
+RESPONSES_FUNCTION_CALL_OUTPUT_TYPE = "function_call_output"
+RESPONSES_OUTPUT_KEY = "output"
 # A media type the refusal message may name: anything else is reported in
 # fixed words, since the value comes from the request.
 NAMEABLE_MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}/[a-z0-9][a-z0-9.+-]{0,63}$")
 GEMINI_INLINE_KEYS = ("inlineData", "inline_data")
 GEMINI_MIME_KEYS = ("mimeType", "mime_type")
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
+# A function response may carry parts of its own (an image a tool returned).
+GEMINI_FUNCTION_RESPONSE_KEYS = ("functionResponse", "function_response")
+GEMINI_RESPONSE_KEY = "response"
+# Tool output that is a whole JSON object or array is walked as the document
+# it encodes, within these bounds; past either it is matched as text.
+TOOL_OUTPUT_MAX_BYTES = 256 * 1024
+TOOL_OUTPUT_MAX_DEPTH = 64
+# A string inside a decoded tool output that is itself whole JSON (a shell
+# result's stdout, say) is decoded too: this many documents deep in all, the
+# tool output itself and two levels inside it.
+TOOL_OUTPUT_MAX_NESTING = 3
+# How many nested strings one tool output may have decoded; past that the
+# rest stay strings inside it.
+TOOL_OUTPUT_MAX_NESTED = 32
+# How many top-level strings of one Gemini function response are decoded.
+TOOL_OUTPUT_MAX_FIELDS = 64
+# Stands in for a string while asking whether the structure rules would mask
+# it whole where it sits (a credential key, a Secret's data, an env value).
+MASK_PROBE = "kube-agents-redaction-probe"
+# A text rule's marker (a mask or a pseudonym) standing as a bare JSON value,
+# where a number was.
+BARE_MARKER = re.compile(r"\[(?:REDACTED_[A-Z0-9_]+|[A-Za-z0-9_.\-]+:[0-9a-f]{12})\](?=\s*[,}\]])")
+# A string that is one marker and nothing else.
+WHOLE_MARKER = re.compile(r"\[(?:REDACTED_[A-Z0-9_]+|[A-Za-z0-9_.\-]+:[0-9a-f]{12})\]\Z")
+TOOL_ROLE = "tool"
+TEXT_TYPE = "text"
+TEXT_KEY = "text"
 # The binary media types a payload may claim, each with how its bytes start:
 # a payload is kept only if its bytes start that way, so text labelled as one
 # of these is refused rather than kept unread. A type not listed here is
@@ -158,6 +212,9 @@ _MPEG_AUDIO = (lambda d: d[:3] == b"ID3" or (len(d) > 1 and d[0] == 0xFF and d[1
 MEDIA_SIGNATURES = {
     "image/png": lambda d: d[:8] == b"\x89PNG\r\n\x1a\n",
     "image/jpeg": lambda d: d[:3] == b"\xff\xd8\xff",
+    # A common mislabel of JPEG, checked as JPEG. Gemini takes the label; a
+    # provider that doesn't still refuses the request itself.
+    "image/jpg": lambda d: d[:3] == b"\xff\xd8\xff",
     "image/gif": lambda d: d[:6] in (b"GIF87a", b"GIF89a"),
     "image/webp": _RIFF(b"WEBP"),
     "image/heic": _FTYP,
@@ -201,13 +258,16 @@ PARTS_KEY = "parts"
 # Tool calls whose arguments are JSON held in a string: a chat tool call's
 # `function.arguments`, a legacy `function_call.arguments`, and an Anthropic
 # `tool_use.input` sent as a string.
-TOOL_CALLS_KEY = "tool_calls"
 FUNCTION_KEY = "function"
 FUNCTION_CALL_KEY = "function_call"
 ARGUMENTS_KEY = "arguments"
 TOOL_USE_TYPE = "tool_use"
 TOOL_USE_INPUT_KEY = "input"
 DATA_KEY = "data"
+
+# What a refusal says about JSON nested too deeply for the hook to follow;
+# it names no key or value.
+DEEP_NESTING_REFUSAL = "JSON nested too deeply to walk"
 
 
 def _is_data_url(value: Any) -> bool:
@@ -295,8 +355,21 @@ class KubeAgentsRedactionCallback(CustomLogger):
             raise self._refuse("a payload whose media type is not a media type name")
         if not isinstance(data, str):
             raise self._refuse(f"a {media} payload that is not a string")
+        # Providers take the URL-safe alphabet and unpadded base64 too; both
+        # are normalised before the strict decode. The payload is kept as it
+        # came either way.
+        # Whitespace only as an encoder wraps lines: a line break, with
+        # every line but the last the same length. Anything else (a space,
+        # a tab, uneven lines) is not a payload as encoded.
+        lines = data.strip("\r\n").replace("\r\n", "\n").split("\n")
+        if any(not line or any(c.isspace() for c in line) for line in lines) or (
+            len(lines) > 1 and (len({len(line) for line in lines[:-1]}) != 1 or len(lines[-1]) > len(lines[0]))
+        ):
+            raise self._refuse(f"a {media} payload that is not base64")
+        text = "".join(lines).replace("-", "+").replace("_", "/")
+        text += "=" * (-len(text) % 4)
         try:
-            decoded = base64.b64decode("".join(data.split()), validate=True)
+            decoded = base64.b64decode(text, validate=True)
         except (binascii.Error, ValueError):
             raise self._refuse(f"a {media} payload that is not base64") from None
         if not starts(decoded):
@@ -343,6 +416,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
         filed = part.get(FILE_KEY)
         if isinstance(filed, dict) and isinstance(filed.get(FILE_DATA_KEY), str):
             self._keep_data_url(filed[FILE_DATA_KEY], path + (FILE_KEY, FILE_DATA_KEY), kept)
+        # A Responses input_file holds its data URL on the part itself;
+        # input_image's image_url string is the data-URL case above.
+        if kind == RESPONSES_INPUT_FILE_TYPE and isinstance(part.get(FILE_DATA_KEY), str):
+            self._keep_data_url(part[FILE_DATA_KEY], path + (FILE_DATA_KEY,), kept)
         # A tool result's own content list holds parts too (an image a tool
         # returned); one level only, since deeper is the tool's own output.
         if kind == TOOL_RESULT_TYPE and not nested and isinstance(part.get(CONTENT_KEY), list):
@@ -381,11 +458,22 @@ class KubeAgentsRedactionCallback(CustomLogger):
             for key in GEMINI_OPAQUE_PART_KEYS:
                 if model and isinstance(part.get(key), str):
                     kept.append((path + (i, key), part[key]))
-            for key in GEMINI_INLINE_KEYS:
-                inline = part.get(key)
-                if isinstance(inline, dict):
-                    mime = next((inline[k] for k in GEMINI_MIME_KEYS if k in inline), None)
-                    self._keep_payload(mime, inline.get(DATA_KEY), path + (i, key, DATA_KEY), kept)
+            self._carve_gemini_inline(part, path + (i,), kept)
+            # A function response's own parts: one level, inline payloads only
+            # (a thought signature is never the tool's).
+            for key in GEMINI_FUNCTION_RESPONSE_KEYS:
+                response = part.get(key)
+                inner = response.get(PARTS_KEY) if isinstance(response, dict) else None
+                for j, sub in enumerate(inner if isinstance(inner, list) else []):
+                    if isinstance(sub, dict):
+                        self._carve_gemini_inline(sub, path + (i, key, PARTS_KEY, j), kept)
+
+    def _carve_gemini_inline(self, part: Dict[str, Any], path: tuple, kept: List[tuple]) -> None:
+        for key in GEMINI_INLINE_KEYS:
+            inline = part.get(key)
+            if isinstance(inline, dict):
+                mime = next((inline[k] for k in GEMINI_MIME_KEYS if k in inline), None)
+                self._keep_payload(mime, inline.get(DATA_KEY), path + (key, DATA_KEY), kept)
 
     def _carve(self, data: Dict[str, Any]) -> List[tuple]:
         """The fields to leave as they are, as (path from the request, value)."""
@@ -401,6 +489,13 @@ class KubeAgentsRedactionCallback(CustomLogger):
         for i, item in enumerate(data.get(RESPONSES_INPUT_KEY) if isinstance(data.get(RESPONSES_INPUT_KEY), list) else []):
             if isinstance(item, dict) and item.get(TYPE_KEY) == REASONING_ITEM_TYPE and isinstance(item.get(ENCRYPTED_CONTENT_KEY), str):
                 kept.append(((RESPONSES_INPUT_KEY, i, ENCRYPTED_CONTENT_KEY), item[ENCRYPTED_CONTENT_KEY]))
+            # An input item's content parts (input_image, input_file): carved as
+            # chat parts are, never as an assistant's (no thinking exemption).
+            if isinstance(item, dict) and isinstance(item.get(CONTENT_KEY), list):
+                self._carve_parts(item[CONTENT_KEY], (RESPONSES_INPUT_KEY, i, CONTENT_KEY), kept)
+            # A function_call_output's output may be a list of the same parts.
+            if isinstance(item, dict) and item.get(TYPE_KEY) == RESPONSES_FUNCTION_CALL_OUTPUT_TYPE and isinstance(item.get(RESPONSES_OUTPUT_KEY), list):
+                self._carve_parts(item[RESPONSES_OUTPUT_KEY], (RESPONSES_INPUT_KEY, i, RESPONSES_OUTPUT_KEY), kept)
         if isinstance(data.get(SYSTEM_KEY), list):
             self._carve_parts(data[SYSTEM_KEY], (SYSTEM_KEY,), kept)
         for i, content in enumerate(data.get(CONTENTS_KEY) or []):
@@ -434,35 +529,52 @@ class KubeAgentsRedactionCallback(CustomLogger):
 
     def _redact_field(self, value: Any, kept: List[tuple], arguments: List[tuple], counts: Dict[str, int]) -> Any:
         """One top-level field: every string redacted, key names counted, the
-        kept fields put back as they came. Tool-call arguments held as JSON in
-        a string are walked as the document they encode and re-encoded only if
-        a rule changed it. The original is left unchanged (the walk returns a
+        kept fields put back as they came. Tool-call arguments and tool output
+        held as JSON in a string are walked as the document they encode and
+        re-encoded only if a rule changed it. The original is left unchanged (the walk returns a
         copy)."""
         if (kept or arguments) and isinstance(value, (dict, list)):
             placeholder = copy.deepcopy(value)
             for path, _ in kept:
                 self._put(placeholder, path, None)
-            for path, _, document in arguments:
+            for path, _, document, _ in arguments:
                 self._put(placeholder, path, copy.deepcopy(document))
         else:
             placeholder = value
         redacted, made = AuditRedactor.redact_counted(placeholder, self._rules)
         for name, count in made.items():
             counts[name] = counts.get(name, 0) + count
-        for path, source, document in arguments:
+        # Innermost first: a document decoded inside another goes back to its
+        # string before the outer one is compared, so an unchanged inner one
+        # leaves the outer one unchanged too.
+        for path, source, document, style in reversed(arguments):
             walked = self._get(redacted, path)
             # Compared, not counted: a substitution that swaps one marker for
             # another nets zero on the counts but still changed the payload.
             keep = source is not None and walked == document
-            self._put(redacted, path, source if keep else json.dumps(walked, ensure_ascii=False))
+            # For a tool output, source is already the text rules' result
+            # over the string it came as (see _decode_output).
+            text = source if keep else self._encode(walked, style)
+            # A re-encoded tool output gets the text rules once more, over
+            # its decoded form (a key name the walk leaves as it is, say).
+            # Only adds: the text it starts from is already masked.
+            if not keep and style is not None:
+                text, made = AuditRedactor.redact_counted(text, self._rules)
+                # A marker written in place of a bare value is quoted, as
+                # before decoding. Text a rule matched across JSON syntax
+                # stays masked even if it no longer parses: masked wins.
+                text = self._quote_bare_markers(text)
+                for name, count in made.items():
+                    counts[name] = counts.get(name, 0) + count
+            self._put(redacted, path, text)
         for path, original in kept:
             self._put(redacted, path, original)
         return redacted
 
     @staticmethod
     def _tool_arguments(data: Dict[str, Any]) -> List[tuple]:
-        """(path from the request, string, decoded document) for each tool
-        call's arguments held as JSON in a string: a chat tool call's and a
+        """(path from the request, string, decoded document, None) for each
+        tool call's arguments held as JSON in a string: a chat tool call's and a
         legacy function call's `arguments`, and an Anthropic tool input sent
         as a string. Arguments that are not a JSON object, array or string
         stay a string, walked as text."""
@@ -489,7 +601,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 # A repeated key: the decoder kept one value and the walk never
                 # sees the other, so the string is re-encoded from the document
                 # rather than sent as it came.
-                found.append((path, None if repeated else value, document))
+                found.append((path, None if repeated else value, document, None))
 
         for i, message in enumerate(data.get(MESSAGES_KEY) or []):
             for j, call in enumerate(message.get(TOOL_CALLS_KEY) or []):
@@ -504,6 +616,257 @@ class KubeAgentsRedactionCallback(CustomLogger):
                 for j, part in enumerate(content):
                     if isinstance(part, dict) and part.get(TYPE_KEY) == TOOL_USE_TYPE:
                         take((MESSAGES_KEY, i, CONTENT_KEY, j, TOOL_USE_INPUT_KEY), part.get(TOOL_USE_INPUT_KEY))
+        return found
+
+    @staticmethod
+    def _encode(document: Any, style: Optional[tuple]) -> str:
+        """A changed document back to a string: in the style it came in when
+        that was noted (indent, separators, a trailing line break), else as
+        tool-call arguments always have been."""
+        if style is None:
+            return json.dumps(document, ensure_ascii=False)
+        indent, separators, newline = style
+        return json.dumps(document, ensure_ascii=False, indent=indent, separators=separators) + newline
+
+    @staticmethod
+    def _style(text: str) -> tuple:
+        """How a JSON text is laid out: its indent (None for one line, else
+        the first indented line's leading whitespace), the separators that go
+        with it, and whether it ends with a line break."""
+        body = text.strip()
+        indent: Any = None
+        if "\n" in body:
+            for line in body.split("\n")[1:]:
+                lead = line[: len(line) - len(line.lstrip(" \t"))]
+                if lead:
+                    indent = lead if "\t" in lead else len(lead)
+                    break
+        if indent is not None:
+            separators = (",", ": ")
+        else:
+            # Space or tab only: the whitespace JSON allows, so the separators
+            # chosen always give valid JSON.
+            colon = re.search(r'"[ \t]*:([ \t]?)', body)
+            comma = re.search(r'[\]}"0-9el],([ \t]?)', body)
+            separators = ("," + (comma.group(1) if comma else " "), ":" + (colon.group(1) if colon else " "))
+        return indent, separators, "\n" if text.endswith("\n") else ""
+
+    @staticmethod
+    def _quote_bare_markers(text: str) -> str:
+        """Quote each marker that stands where a JSON value goes, outside any
+        string (after a colon, a comma or an opening bracket), so the text
+        rules' result over JSON is JSON again. A marker inside a string,
+        escaped JSON included, is left alone."""
+        if "[" not in text:
+            return text
+        out: List[str] = []
+        in_string = escaped = False
+        last = ""
+        i = 0
+        while i < len(text):
+            c = text[i]
+            if in_string:
+                out.append(c)
+                if escaped:
+                    escaped = False
+                elif c == "\\":
+                    escaped = True
+                elif c == '"':
+                    in_string = False
+                    last = c
+                i += 1
+                continue
+            if c == '"':
+                in_string = True
+            elif c == "[" and last in (":", ",", "["):
+                match = BARE_MARKER.match(text, i)
+                if match:
+                    out.append('"' + match.group(0) + '"')
+                    last = '"'
+                    i = match.end()
+                    continue
+            if not c.isspace():
+                last = c
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _depth(document: Any, limit: int) -> bool:
+        """Whether document nests no deeper than limit, without recursion."""
+        stack = [(document, 1)]
+        while stack:
+            node, level = stack.pop()
+            if isinstance(node, (dict, list)):
+                if level > limit:
+                    return False
+                stack.extend((child, level + 1) for child in (node.values() if isinstance(node, dict) else node))
+        return True
+
+    @staticmethod
+    def _context_keys() -> tuple:
+        """The sibling keys the structure rules read beside a value: a
+        mapping's kind (a Secret) and an env entry's name."""
+        module = sys.modules.get(AuditRedactor.__module__)
+        return (getattr(module, "KIND_KEY", "kind"), getattr(module, "ENV_NAME_KEY", "name"))
+
+    def _masked_whole(self, root: Any, path: tuple, outer: Optional[tuple] = None) -> bool:
+        """Whether the structure rules would mask the string at path in root
+        whole (it sits under a credential key, in a Secret's data, as a
+        credential env value). Such a string is never decoded: it stays a
+        string and is masked as one. outer is (mapping, key) for where root
+        itself sits when root was decoded from a string, so a value one level
+        into root still sees its grandparent."""
+        # The structure rules look at most two levels up from a value: its
+        # key, its mapping (an env entry's name), and that mapping's own
+        # mapping (a Secret's kind beside data). So the probe is that much
+        # context only, a fixed cost whatever the size of root, and it runs
+        # the structure walk alone: no text rule can rewrite the probe.
+        try:
+            parent = self._get(root, path[:-1])
+            if len(path) >= 2:
+                grand, grand_key = self._get(root, path[:-2]), path[-2]
+            elif outer is not None:
+                grand, grand_key = outer
+            else:
+                grand, grand_key = None, None
+        except (KeyError, IndexError, TypeError):
+            return True
+        context = self._context_keys()
+        key = path[-1]
+        if isinstance(parent, dict):
+            mini: Any = {k: parent[k] for k in context if k != key and isinstance(parent.get(k), str)}
+            mini[key] = MASK_PROBE
+            where: tuple = (key,)
+        else:
+            mini, where = [MASK_PROBE], (0,)
+        if isinstance(grand, dict) and isinstance(grand_key, str):
+            wrapper = {k: grand[k] for k in context if k != grand_key and isinstance(grand.get(k), str)}
+            wrapper[grand_key] = mini
+            mini, where = wrapper, (grand_key,) + where
+        elif isinstance(grand, list):
+            mini, where = [mini], (0,) + where
+        walked = AuditRedactor.redact(mini)
+        try:
+            return self._get(walked, where) != MASK_PROBE
+        except (KeyError, IndexError, TypeError):
+            return True
+
+    def _decode_output(self, path: tuple, value: Any, found: List[tuple], counts: Dict[str, int], level: int = 0,
+                       budget: Optional[List[int]] = None, outer: Optional[tuple] = None) -> bool:
+        """Note value as a document to walk when it is a whole JSON object or
+        array within the bounds, then the same for whole-JSON strings inside
+        it. Anything else is left a string and matched as text. Returns
+        whether value was decoded."""
+        if not isinstance(value, str) or level >= TOOL_OUTPUT_MAX_NESTING:
+            return False
+        body = value.strip()
+        if not body or body[0] not in "{[" or len(value.encode("utf-8", "replace")) > TOOL_OUTPUT_MAX_BYTES:
+            return False
+        # The text rules run first, over the string as it came, exactly as
+        # they would without decoding; what is decoded is their result. The
+        # structure rules can then only add to it, whatever the escapes or
+        # layout of the original, and a re-encode only reformats text that
+        # is already masked.
+        masked, made = AuditRedactor.redact_counted(value, self._rules)
+        # A text rule writes its marker in place of a bare value (a number
+        # under a credential key) without quotes; quoted, the result is JSON
+        # again. A marker this lands on inside a string breaks the parse, and
+        # the output keeps the text rules' result.
+        masked = self._quote_bare_markers(masked)
+        repeated = False
+
+        def pairs(items: List[tuple]) -> Dict[str, Any]:
+            nonlocal repeated
+            keys = [key for key, _ in items]
+            repeated = repeated or len(keys) != len(set(keys))
+            return dict(items)
+
+        try:
+            document = json.loads(masked, object_pairs_hook=pairs)
+        except (ValueError, RecursionError):
+            return False
+        if not isinstance(document, (dict, list)) or not self._depth(document, TOOL_OUTPUT_MAX_DEPTH):
+            return False
+        # A repeated key: the decoder keeps one value, so what the structure
+        # rules would see differs from the text. Such output stays a string
+        # and gets the text rules only, as before.
+        if repeated:
+            return False
+        found.append((path, masked, document, self._style(masked)))
+        for name, count in made.items():
+            counts[name] = counts.get(name, 0) + count
+        if level + 1 >= TOOL_OUTPUT_MAX_NESTING:
+            return True
+        # One budget per tool output, shared down the nesting.
+        budget = budget if budget is not None else [TOOL_OUTPUT_MAX_NESTED]
+        stack: List[tuple] = [((), document)]
+        while stack:
+            rel, node = stack.pop()
+            items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+            for key, child in items:
+                if isinstance(child, str):
+                    body = child.strip()
+                    # A text rule's marker ([REDACTED_...], [ip:...]) and other
+                    # strings that aren't JSON never use the budget: it counts
+                    # only strings that decode.
+                    if not body or body[0] not in "{[" or WHOLE_MARKER.match(body) or budget[0] <= 0:
+                        continue
+                    if self._masked_whole(document, rel + (key,), outer):
+                        continue
+                    if self._decode_output(path + rel + (key,), child, found, counts, level + 1, budget, (node, key)):
+                        budget[0] -= 1
+                elif isinstance(child, (dict, list)):
+                    stack.append((rel + (key,), child))
+        return True
+
+    def _tool_outputs(self, data: Dict[str, Any], counts: Dict[str, int]) -> List[tuple]:
+        """(path, string, document, style) for each tool output that is a
+        whole JSON object or array: a chat tool message's content, an
+        Anthropic tool result's content (a string or its text parts), a
+        Responses function call output, and each string in a Gemini function
+        response's response object. The structure rules (key names, Secret
+        data, env pairs) then apply to it as to any mapping."""
+        found: List[tuple] = []
+        for i, message in enumerate(data.get(MESSAGES_KEY) or []):
+            if not isinstance(message, dict):
+                continue
+            content = message.get(CONTENT_KEY)
+            if message.get(ROLE_KEY) == TOOL_ROLE:
+                self._decode_output((MESSAGES_KEY, i, CONTENT_KEY), content, found, counts)
+            for j, part in enumerate(content if isinstance(content, list) else []):
+                if not isinstance(part, dict) or part.get(TYPE_KEY) != TOOL_RESULT_TYPE:
+                    continue
+                inner = part.get(CONTENT_KEY)
+                where = (MESSAGES_KEY, i, CONTENT_KEY, j, CONTENT_KEY)
+                self._decode_output(where, inner, found, counts)
+                for k, sub in enumerate(inner if isinstance(inner, list) else []):
+                    if isinstance(sub, dict) and sub.get(TYPE_KEY) == TEXT_TYPE:
+                        self._decode_output(where + (k, TEXT_KEY), sub.get(TEXT_KEY), found, counts)
+        items = data.get(RESPONSES_INPUT_KEY)
+        for i, item in enumerate(items if isinstance(items, list) else []):
+            if isinstance(item, dict) and item.get(TYPE_KEY) == RESPONSES_FUNCTION_CALL_OUTPUT_TYPE:
+                self._decode_output((RESPONSES_INPUT_KEY, i, RESPONSES_OUTPUT_KEY), item.get(RESPONSES_OUTPUT_KEY), found, counts)
+        for i, content in enumerate(data.get(CONTENTS_KEY) or []):
+            parts = content.get(PARTS_KEY) if isinstance(content, dict) else None
+            for j, part in enumerate(parts if isinstance(parts, list) else []):
+                for key in GEMINI_FUNCTION_RESPONSE_KEYS:
+                    response = part.get(key) if isinstance(part, dict) else None
+                    body = response.get(GEMINI_RESPONSE_KEY) if isinstance(response, dict) else None
+                    # Each top-level string is a tool output of its own, with its
+                    # own nesting budget; the probe below is a fixed cost. Past
+                    # TOOL_OUTPUT_MAX_FIELDS of them the rest stay strings and
+                    # are walked as before (the key-name rules still see them).
+                    fields = 0
+                    for name, value in (body.items() if isinstance(body, dict) else ()):
+                        if not isinstance(value, str) or value.strip()[:1] not in ("{", "[") or fields >= TOOL_OUTPUT_MAX_FIELDS:
+                            continue
+                        fields += 1
+                        # A string the structure rules mask whole where it
+                        # sits stays a string.
+                        if self._masked_whole(body, (name,)):
+                            continue
+                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found, counts, outer=(body, name))
         return found
 
     @staticmethod
@@ -532,15 +895,26 @@ class KubeAgentsRedactionCallback(CustomLogger):
         and never their values.
         """
         self._check_shape(data)
-        kept = self._carve(data)
-        arguments = self._tool_arguments(data)
+        # The text rules' counts for each decoded tool output are taken when
+        # it is masked before decoding. Counts are rule applications: a value
+        # a text rule masked in part and a structure rule then masked whole
+        # counts once for each.
         counts: Dict[str, int] = {}
-        for key in list(data):
-            if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
-                continue
-            mine = [(path[1:], value) for path, value in kept if path[0] == key]
-            args = [(path[1:], source, document) for path, source, document in arguments if path[0] == key]
-            data[key] = self._redact_field(data[key], mine, args, counts)
+        try:
+            kept = self._carve(data)
+            arguments = self._tool_arguments(data) + self._tool_outputs(data, counts)
+            for key in list(data):
+                if key in CONTROL_KEYS or str(key).startswith(CONTROL_KEY_PREFIXES):
+                    continue
+                mine = [(path[1:], value) for path, value in kept if path[0] == key]
+                args = [(path[1:], source, document, style) for path, source, document, style in arguments if path[0] == key]
+                data[key] = self._redact_field(data[key], mine, args, counts)
+        except RecursionError:
+            # Nesting the decoder, the copy or the walk can't follow. Refused
+            # rather than walked as text: the request is not forwarded, so the
+            # fields already rewritten in place go nowhere. `from None` keeps
+            # the thousands of frames out of the log.
+            raise self._refuse(DEEP_NESTING_REFUSAL) from None
         return counts
 
 
@@ -551,7 +925,14 @@ class KubeAgentsRedactionCallback(CustomLogger):
         data: dict,
         call_type: str,
     ) -> Optional[dict]:
-        counts = self.redact_request(data)
+        try:
+            counts = self.redact_request(data)
+        except UnwalkableRequestError as exc:
+            # A refused shape is the request's, and the same request is
+            # refused every time: 400, so a caller doesn't retry it as it
+            # would a 5xx. Any other exception stays a 500, a fault in the
+            # hook rather than in the request.
+            raise HTTPException(status_code=400, detail=str(exc)) from None
         if counts:
             logger.info(
                 "redacted %s request: %s",

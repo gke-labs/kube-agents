@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import gc
 import hashlib
 import http.server
 import json
@@ -12,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone
 import time
 import unittest
 import urllib.error
@@ -716,20 +718,26 @@ class HardeningTests(StoreTestCase):
         (directory / "latest.json").mkdir()
         # Warm up: the first request opens sockets and threads of its own.
         self.call("GET", f"{STREAM}/latest")
+        self.call("GET", "/v1/audit-reports")
+        self.api.stop()
+        gc.collect()
         before = len(os.listdir("/dev/fd"))
         for _ in range(5):
             self.assertEqual(409, self.call("GET", f"{STREAM}/latest").status_code)
             listed = self.call("GET", "/v1/audit-reports")
             self.assertEqual(200, listed.status_code)
             self.assertEqual(STAMP_1, listed.json()[0]["newest_run"])
+        gc.collect()
         self.assertEqual(before, len(os.listdir("/dev/fd")))
         # And directly.
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
+            gc.collect()
             before = len(os.listdir("/dev/fd"))
             with self.assertRaises(store.Refused) as caught:
                 store._read_at(fd, "latest.json")
             self.assertEqual(409, caught.exception.status)
+            gc.collect()
             self.assertEqual(before, len(os.listdir("/dev/fd")))
         finally:
             os.close(fd)
@@ -1359,6 +1367,208 @@ class WriterTests(StoreTestCase):
         with mock.patch.object(store, "_locked", side_effect=recording):
             self.assertEqual(204, self.call("DELETE", f"{STREAM}/latest").status_code)
         self.assertEqual(1, len(held))
+
+
+class RunStartTests(StoreTestCase):
+    """The run-start record (#6812): `runs/started-<run>` on the run routes alone, kept beside the ring."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store_dir = self.root / "compliance-audit" / "acme" / "gitops"
+        self.starts = self.store_dir / store.RUN_STARTS_DIR
+        # This listener's clock moves a millisecond a reading, so each record
+        # is received after the one before it, whatever its `started_at` says.
+        self.ticks = [FIXED_NOW]
+        fixed = store._now
+
+        def clock() -> float:
+            self.ticks[0] += 0.001
+            return self.ticks[0]
+
+        store._now = clock
+        self.addCleanup(setattr, store, "_now", fixed)
+        # A run published before: the store exists.
+        self.assertEqual(204, self.put_run(STAMP_1).status_code)
+
+    @staticmethod
+    def record(run_id: str, started: str = "2026-12-01T00:00:00+00:00", **extra) -> bytes:
+        return json.dumps({"run_id": run_id, "started_at": started, "scheduled": True, **extra}).encode()
+
+    def put_start(self, run_id: str, body: bytes | None = None, writer: str | None = "default"):
+        return self.call("PUT", f"{STREAM}/runs/started-{run_id}", body or self.record(run_id), writer=writer)
+
+    def test_a_record_round_trips_beside_the_ring(self) -> None:
+        body = self.record("task-7f3a")
+        self.assertEqual(204, self.put_start("task-7f3a", body).status_code)
+        written = self.starts / "task-7f3a.json"
+        kept = json.loads(written.read_bytes())
+        received = kept.pop(store.RUN_START_RECEIVED_KEY)
+        self.assertEqual(json.loads(body), kept)
+        self.assertEqual(0o644, written.stat().st_mode & 0o777)
+        got = self.call("GET", f"{STREAM}/runs/started-task-7f3a")
+        self.assertEqual(200, got.status_code)
+        self.assertEqual(written.read_bytes(), got.content)
+        # Unstamped: a broker header is checked, not kept.
+        self.assertNotIn(store.REPORT_WRITER_HEADER, got.headers)
+        self.assertFalse(any(p.suffix == ".writer" for p in self.starts.iterdir()))
+        self.assertEqual(404, self.call("GET", f"{STREAM}/runs/started-task-0").status_code)
+        # Never a ring entry: not in the index, not the newest run, not in runs/.
+        self.assertEqual([STAMP_1], self.call("GET", f"{STREAM}/runs").json())
+        (row,) = self.call("GET", "/v1/audit-reports").json()
+        self.assertEqual(STAMP_1, row["newest_run"])
+        self.assertEqual(
+            {"run_id": "task-7f3a", "started_at": "2026-12-01T00:00:00+00:00", "received_at": received, "scheduled": True},
+            row["last_run_start"],
+        )
+        self.assertEqual([f"{STAMP_1}.json", f"{STAMP_1}.writer"], sorted(p.name for p in (self.store_dir / "runs").iterdir()))
+
+    def test_a_record_never_creates_a_store(self) -> None:
+        other = "/v1/audit-reports/compliance-audit/acme%2Fother"
+        response = self.call("PUT", f"{other}/runs/started-task-1", self.record("task-1"))
+        self.assertEqual(404, response.status_code)
+        self.assertEqual({"error": "not found"}, response.json())
+        self.assertFalse((self.root / "compliance-audit" / "acme" / "other").exists())
+
+    def test_a_record_must_be_its_runs_and_must_have_started(self) -> None:
+        future = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(FIXED_NOW + store.RUN_STAMP_MAX_FUTURE_SECONDS + 60))
+        for name, body, status in (
+            ("another run's", self.record("task-2"), 400),
+            ("a done mark with no start", json.dumps({"run_id": "task-1", "done_at": "2026-12-01T00:00:00+00:00"}).encode(), 400),
+            ("a start with no zone", self.record("task-1", "2026-12-01T00:00:00"), 400),
+            ("a start far ahead", self.record("task-1", future), 400),
+            ("scheduled that is no boolean", self.record("task-1", scheduled="yes"), 400),
+            ("a done_at that is no time", self.record("task-1", done_at="soon"), 400),
+            ("not an object", b"[]", 400),
+            ("too large", self.record("task-1", pad="x" * store.RUN_START_MAX_BYTES), 413),
+        ):
+            with self.subTest(name):
+                self.assertEqual(status, self.put_start("task-1", body).status_code)
+        self.assertFalse(self.starts.exists() and any(self.starts.iterdir()))
+        # The broker's writer header is held to a run write's rule.
+        self.assertEqual(400, self.put_start("task-1", writer="builtin-schedule:other-audit:task-1").status_code)
+        self.assertEqual(204, self.put_start("task-1", writer="builtin-schedule:compliance-audit:task-1").status_code)
+        self.assertEqual(204, self.put_start("task-1", writer=None).status_code)
+
+    def test_the_reserved_name_is_refused_off_its_two_routes(self) -> None:
+        body = self.record("task-1")
+        self.assertEqual(204, self.put_start("task-1", body).status_code)
+        # Not latest: a record is never a ring entry, so it is no copy of one.
+        self.assertEqual(409, self.call("PUT", f"{STREAM}/latest", body).status_code)
+        self.assertEqual(405, self.call("DELETE", f"{STREAM}/runs/started-task-1").status_code)
+        for path in (f"{STREAM}/runs/started-task-1/latest", f"{STREAM}/started-task-1", f"{STREAM}/latest/started-task-1"):
+            with self.subTest(path=path):
+                self.assertEqual(404, self.call("GET", path).status_code)
+        for bad in ("started-", "started-Task-1", "started-" + "a" * 64, "started--x", "started-task-1.json", "started-a.b"):
+            with self.subTest(name=bad):
+                self.assertEqual(400, self.call("PUT", f"{STREAM}/runs/{bad}", body).status_code)
+                self.assertEqual(400, self.call("GET", f"{STREAM}/runs/{bad}").status_code)
+        self.assertEqual(["task-1.json"], sorted(p.name for p in self.starts.iterdir()))
+
+    def test_records_never_count_in_the_ring(self) -> None:
+        for n in range(store.RUN_START_HISTORY):
+            self.assertEqual(204, self.put_start(f"task-{n}", self.record(f"task-{n}", f"2026-12-0{n + 1}T00:00:00+00:00")).status_code)
+        stamps = [f"202611{day:02d}T000000.000000Z" for day in range(2, 2 + store.REPORT_HISTORY)]
+        for stamp in stamps:
+            self.assertEqual(204, self.put_run(stamp).status_code)
+        # The ring pruned to its fourteen, every one a stamp; the records all stand.
+        self.assertEqual(list(reversed(stamps)), self.call("GET", f"{STREAM}/runs").json())
+        self.assertEqual(store.RUN_START_HISTORY, len(list(self.starts.glob("*.json"))))
+
+    def test_the_newest_records_are_kept_by_their_receipt(self) -> None:
+        for n in range(store.RUN_START_HISTORY + 2):
+            self.put_start(f"task-{n}", self.record(f"task-{n}", f"2026-11-{n + 10:02d}T00:00:00+00:00"))
+        # A record received last stays, whatever start its writer claims; the
+        # first received goes.
+        self.assertEqual(204, self.put_start("task-old", self.record("task-old", "2026-10-01T00:00:00+00:00")).status_code)
+        # A file named for a run that is no record of it goes too.
+        (self.starts / "task-junk.json").write_text("{}")
+        # A done mark keeps its record's place: task-9 is still older than task-old.
+        self.put_start("task-9", self.record("task-9", "2026-11-19T00:00:00+00:00", done_at="2026-11-19T01:00:00+00:00"))
+        self.assertEqual(
+            sorted([f"task-{n}.json" for n in range(3, store.RUN_START_HISTORY + 2)] + ["task-old.json"]),
+            sorted(p.name for p in self.starts.iterdir()),
+        )
+
+    def test_a_start_further_ahead_than_the_skew_is_refused(self) -> None:
+        def ahead(seconds: float) -> str:
+            return datetime.fromtimestamp(FIXED_NOW + seconds, timezone.utc).isoformat()
+
+        self.assertEqual(60, store.RUN_START_MAX_FUTURE_SECONDS)
+        # Planted to stand as the newest over a real run that starts later.
+        self.assertEqual(400, self.put_start("task-1", self.record("task-1", ahead(store.RUN_START_MAX_FUTURE_SECONDS + 30))).status_code)
+        self.assertFalse(self.starts.exists() and any(self.starts.iterdir()))
+        self.assertEqual(204, self.put_start("task-1", self.record("task-1", ahead(30))).status_code)
+
+    def test_the_newest_is_by_receipt_not_the_writers_clock(self) -> None:
+        # A record whose writer claims the later start, received first, does
+        # not stand over a real run received after it.
+        self.assertEqual(204, self.put_start("task-planted", self.record("task-planted", "2027-01-01T00:00:50+00:00")).status_code)
+        self.assertEqual(204, self.put_start("task-real", self.record("task-real", "2026-12-31T23:00:00+00:00")).status_code)
+        (row,) = self.call("GET", "/v1/audit-reports").json()
+        self.assertEqual("task-real", row["last_run_start"]["run_id"])
+
+    def test_a_done_mark_keeps_its_received_at(self) -> None:
+        self.put_start("task-old", self.record("task-old"))
+        first = json.loads((self.starts / "task-old.json").read_bytes())[store.RUN_START_RECEIVED_KEY]
+        self.put_start("task-new", self.record("task-new", "2026-11-01T00:00:00+00:00"))
+        # The older run's done mark, sent with a received_at of its own.
+        self.assertEqual(
+            204,
+            self.put_start(
+                "task-old",
+                self.record("task-old", done_at="2026-12-01T01:00:00+00:00", outcome="UPDATED", received_at="2099-01-01T00:00:00+00:00"),
+            ).status_code,
+        )
+        marked = json.loads((self.starts / "task-old.json").read_bytes())
+        self.assertEqual(first, marked[store.RUN_START_RECEIVED_KEY])
+        self.assertEqual("2026-12-01T01:00:00+00:00", marked["done_at"])
+        (row,) = self.call("GET", "/v1/audit-reports").json()
+        self.assertEqual("task-new", row["last_run_start"]["run_id"])
+
+    def test_a_received_at_the_writer_sends_is_never_kept(self) -> None:
+        self.put_start("task-1", self.record("task-1", received_at="2099-01-01T00:00:00+00:00"))
+        kept = json.loads((self.starts / "task-1.json").read_bytes())[store.RUN_START_RECEIVED_KEY]
+        self.assertNotEqual("2099-01-01T00:00:00+00:00", kept)
+        self.assertTrue(FIXED_NOW < datetime.fromisoformat(kept).timestamp() <= self.ticks[0] + 1e-6, kept)
+
+    def test_a_record_from_before_received_at_sorts_below_every_one_with_it(self) -> None:
+        self.starts.mkdir()
+        (self.starts / "task-legacy.json").write_bytes(self.record("task-legacy", "2027-01-01T00:00:30+00:00"))
+        self.put_start("task-1", self.record("task-1", "2026-12-01T00:00:00+00:00"))
+        (row,) = self.call("GET", "/v1/audit-reports").json()
+        self.assertEqual("task-1", row["last_run_start"]["run_id"])
+
+    def test_the_listing_names_the_newest_start_not_the_newest_write(self) -> None:
+        self.put_start("task-old", self.record("task-old", "2026-12-01T00:00:00+00:00"))
+        self.put_start("task-new", self.record("task-new", "2026-12-02T00:00:00+00:00"))
+        # The older run's done mark lands after the newer run started.
+        self.put_start(
+            "task-old", self.record("task-old", "2026-12-01T00:00:00+00:00", done_at="2026-12-02T01:00:00+00:00", outcome="UPDATED")
+        )
+        (row,) = self.call("GET", "/v1/audit-reports").json()
+        self.assertEqual("task-new", row["last_run_start"]["run_id"])
+        self.assertNotIn("done_at", row["last_run_start"])
+
+    def test_a_symlinked_record_directory_is_refused(self) -> None:
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.starts.symlink_to(elsewhere)
+        self.assertEqual(409, self.put_start("task-1").status_code)
+        self.assertEqual([], list(elsewhere.iterdir()))
+        self.assertEqual(409, self.call("GET", f"{STREAM}/runs/started-task-1").status_code)
+
+    def test_the_client_copies_match(self) -> None:
+        import importlib.util
+
+        path = AUDIT_REPORT_PATH.parent / "report_status.py"
+        spec = importlib.util.spec_from_file_location("report_status_for_store_test", path)
+        status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(status)
+        for name in ("RUN_START_PREFIX", "RUN_STARTS_DIR", "RUN_START_HISTORY", "RUN_START_MAX_BYTES"):
+            self.assertEqual(getattr(store, name), getattr(status, name), name)
+        for run_id in ("task-1", "local-0a1b2c3d4e5f", "a" * 63, "a" * 64, "Task-1", "-a", "a-", "a.b", ""):
+            self.assertEqual(bool(store.RUN_ID_RE.match(run_id)), bool(status.RUN_ID_RE.match(run_id)), run_id)
+
 
 if __name__ == "__main__":
     unittest.main()

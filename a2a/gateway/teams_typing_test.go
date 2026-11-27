@@ -1,0 +1,359 @@
+package gateway
+
+import (
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+const testTeamsTypingInterval = 10 * time.Millisecond
+
+func typingTeamsAdapter(t *testing.T) (*TeamsAdapter, *fakeTeamsRelay) {
+	t.Helper()
+	relay := newFakeTeamsRelay(t, nil)
+	a := newTestTeamsAdapter(t, relay.srv.URL, testTeamsTenant)
+	a.typingInterval = testTeamsTypingInterval
+	return a, relay
+}
+
+func teamsTypingCount(relay *fakeTeamsRelay) int {
+	relay.mu.Lock()
+	defer relay.mu.Unlock()
+	return len(relay.typing)
+}
+
+// teamsTypingSettled waits until no typing post has arrived for several
+// intervals and returns the count it settled at.
+func teamsTypingSettled(t *testing.T, relay *fakeTeamsRelay) int {
+	t.Helper()
+	last, quiet := teamsTypingCount(relay), 0
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(5 * testTeamsTypingInterval)
+		now := teamsTypingCount(relay)
+		if now == last {
+			if quiet++; quiet >= 3 {
+				return now
+			}
+			continue
+		}
+		last, quiet = now, 0
+	}
+	t.Fatalf("typing posts never settled; last count %d", last)
+	return 0
+}
+
+// teamsTypingQuiet fails if a typing post arrives over several intervals.
+func teamsTypingQuiet(t *testing.T, relay *fakeTeamsRelay, when string) {
+	t.Helper()
+	before := teamsTypingCount(relay)
+	time.Sleep(10 * testTeamsTypingInterval)
+	if now := teamsTypingCount(relay); now != before {
+		t.Fatalf("typing posts %s: %d then %d", when, before, now)
+	}
+}
+
+// The hand-off: nothing is posted while the first agent's task runs, since
+// its line shows the work; once it has ended with the ask still open, the
+// indicator is posted to the conversation and posted again, until the ask
+// settles.
+func TestTeamsTypesWhileAnAskIsOpenPastItsTask(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	m := NewMetrics()
+	a.SetMetrics(m)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.MarkChanged(conversation, "investigate", "")
+	teamsTypingQuiet(t, relay, "while the task was running")
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	waitFor(t, "the indicator posted more than once", func() bool { return teamsTypingCount(relay) >= 3 })
+	relay.mu.Lock()
+	first := relay.typing[0]
+	relay.mu.Unlock()
+	payload, _ := first["payload"].(map[string]any)
+	if first["method"] != http.MethodPost || first["endpoint"] != teamsConversationsPath+testTeamsChannel+teamsActivitiesSuffix || payload["type"] != teamsTypingActivityType || len(payload) != 1 {
+		t.Fatalf("typing post %v, want a typing activity posted to the conversation", first)
+	}
+	a.MarkChanged("teams:19:another@thread.tacv2", "", "")
+	before := teamsTypingCount(relay)
+	waitFor(t, "another conversation's mark left the indicator on", func() bool { return teamsTypingCount(relay) >= before+2 })
+	a.MarkChanged(conversation, "", "")
+	teamsTypingSettled(t, relay)
+	teamsTypingQuiet(t, relay, "went on after the ask settled")
+	if n := teamsCallCount(relay); n != 0 {
+		t.Fatalf("the indicator posted %d messages, want none", n)
+	}
+	// A typing post creates no message, so it is counted with the
+	// passthrough's other calls and not among the creates.
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(metricsLabelOther, teamsCallOK)); got < 3 {
+		t.Errorf("typing posts counted as other = %d, want every one", got)
+	}
+	if got := histogramCount(t, m.teamsAPIDuration.WithLabelValues(teamsAPIMethodCreate, teamsCallOK)); got != 0 {
+		t.Errorf("typing posts counted as creates = %d, want none", got)
+	}
+}
+
+// A task that answers on its own line never shows the indicator, whichever
+// of its end and its mark's settle arrives first: Teams would leave it on
+// screen under the answer.
+func TestTeamsDoesNotTypeForATaskThatAnswers(t *testing.T) {
+	for name, end := range map[string]func(t *testing.T, a *TeamsAdapter, c string){
+		"the task ends, then the mark settles": func(t *testing.T, a *TeamsAdapter, c string) {
+			a.TaskTerminal(c, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+			// The first post waits one interval behind the task's end,
+			// which is what covers a mark settling just after it.
+			a.mu.Lock()
+			quiet := a.typing[c] != nil && a.typing[c].quietUntil.After(time.Now())
+			a.mu.Unlock()
+			if !quiet {
+				t.Fatal("no quiet interval behind the task's end")
+			}
+			a.MarkChanged(c, "", "")
+		},
+		"the mark settles, then the task ends": func(t *testing.T, a *TeamsAdapter, c string) {
+			a.MarkChanged(c, "", "")
+			a.TaskTerminal(c, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, relay := typingTeamsAdapter(t)
+			conversation := "teams:" + testTeamsChannel
+			a.TaskStarted(conversation, "task-1")
+			a.MarkChanged(conversation, "investigate", "")
+			time.Sleep(5 * testTeamsTypingInterval)
+			end(t, a, conversation)
+			time.Sleep(10 * testTeamsTypingInterval)
+			if n := teamsTypingCount(relay); n != 0 {
+				t.Fatalf("%d typing posts for a task that answered, want none", n)
+			}
+			a.mu.Lock()
+			left := len(a.typing)
+			a.mu.Unlock()
+			if left != 0 {
+				t.Fatalf("%d conversations still remembered after the work ended, want none", left)
+			}
+		})
+	}
+}
+
+// A second ask while card work is open pauses the indicator for as long as
+// its own task runs, and the indicator comes back after it.
+func TestTeamsPausesTypingWhileALaterTaskRuns(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 2 })
+	a.TaskStarted(conversation, "task-2")
+	teamsTypingSettled(t, relay)
+	teamsTypingQuiet(t, relay, "while the later task was running")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+	before := teamsTypingCount(relay)
+	waitFor(t, "the indicator came back", func() bool { return teamsTypingCount(relay) >= before+2 })
+	a.MarkChanged(conversation, "", "")
+}
+
+// An ask that never settles does not keep the indicator on for ever: the
+// loop stops at its bound, and a later task in the conversation starts it
+// again.
+func TestTeamsStopsTypingAtItsBound(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 1 })
+	settled := teamsTypingSettled(t, relay)
+	if settled > 40 {
+		t.Fatalf("%d typing posts before the bound stopped them, want about 20", settled)
+	}
+	a.TaskStarted(conversation, "task-2")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+	waitFor(t, "a later task turned the indicator on again", func() bool { return teamsTypingCount(relay) > settled })
+	a.MarkChanged(conversation, "", "")
+}
+
+// Work that goes on showing itself keeps the indicator past the bound: each
+// message the adapter posts or edits in the conversation restarts it. Once
+// the bound has ended the loop, an edit starts it again and a new message
+// does not: that message is usually the answer, and typing would sit under
+// it.
+func TestTeamsKeepsTypingWhileTheWorkShowsItself(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	const line = "1700000000001"
+	a.MarkChanged(conversation, "investigate", "")
+	for i := 0; i < 4; i++ {
+		time.Sleep(12 * testTeamsTypingInterval)
+		if err := a.Edit(conversation, line, "still working"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 48 intervals in, more than twice the bound from the ask's opening.
+	before := teamsTypingCount(relay)
+	waitFor(t, "the indicator kept posting past the bound", func() bool { return teamsTypingCount(relay) >= before+2 })
+	settled := teamsTypingSettled(t, relay)
+	if _, err := a.Post(conversation, "the answer"); err != nil {
+		t.Fatal(err)
+	}
+	teamsTypingQuiet(t, relay, "behind a new message after the bound ended the loop")
+	if err := a.Edit(conversation, line, "working again"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "an edit after the bound turned the indicator on again", func() bool { return teamsTypingCount(relay) > settled })
+	a.MarkChanged(conversation, "", "")
+	if err := a.Edit(conversation, line, "done"); err != nil {
+		t.Fatal(err)
+	}
+	teamsTypingQuiet(t, relay, "after an edit with no ask open")
+}
+
+// An edit that starts an ended loop again waits one interval before its
+// first post, so a plan's last edit just ahead of the settle posts nothing.
+func TestTeamsRestartedTypingWaitsAnInterval(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 1 })
+	settled := teamsTypingSettled(t, relay)
+	a.typingInterval = time.Hour
+	if err := a.Edit(conversation, "1700000000001", "the last step is done"); err != nil {
+		t.Fatal(err)
+	}
+	a.MarkChanged(conversation, "", "")
+	teamsTypingQuiet(t, relay, "between a restarting edit and the settle just behind it")
+	if now := teamsTypingCount(relay); now != settled {
+		t.Fatalf("typing posts went from %d to %d around the last edit", settled, now)
+	}
+}
+
+// A task that never reports its end is forgotten at the bound, so it does
+// not keep the indicator off for the asks that follow.
+func TestTeamsForgetsATaskThatNeverEnds(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.MarkChanged(conversation, "investigate", "")
+	time.Sleep(30 * testTeamsTypingInterval)
+	a.TaskStarted(conversation, "task-2")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+	waitFor(t, "the indicator posted after the forgotten task", func() bool { return teamsTypingCount(relay) >= 1 })
+	a.MarkChanged(conversation, "", "")
+}
+
+// A stopped task whose end is never announced is replaced by the next ask's
+// task: it does not keep the indicator off for that ask's card work.
+func TestTeamsTypesForTheAskAfterATaskThatNeverEnded(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.MarkChanged(conversation, "investigate", "")
+	a.TaskStarted(conversation, "task-2")
+	teamsTypingQuiet(t, relay, "while the second task was running")
+	a.TaskTerminal(conversation, "task-2", lib.StateCompleted, TerminalFromExecutor, "")
+	waitFor(t, "the indicator posted for the second ask's card work", func() bool { return teamsTypingCount(relay) >= 2 })
+	a.MarkChanged(conversation, "", "")
+}
+
+// A chain that ran past the bound and then hands off still gets the
+// indicator for its card work: the bound runs again from the chain's end.
+func TestTeamsTypesAfterALongTaskHandsOff(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingMax = 20 * testTeamsTypingInterval
+	conversation := "teams:" + testTeamsChannel
+	a.TaskStarted(conversation, "task-1")
+	a.MarkChanged(conversation, "investigate", "")
+	time.Sleep(15 * testTeamsTypingInterval)
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	// Past the bound as run from the task's start, inside it from its end.
+	time.Sleep(10 * testTeamsTypingInterval)
+	before := teamsTypingCount(relay)
+	waitFor(t, "the indicator kept posting past the first bound", func() bool { return teamsTypingCount(relay) >= before+2 })
+	a.MarkChanged(conversation, "", "")
+}
+
+// A new message the adapter posts holds the indicator off for an interval:
+// a card's answer lands before its mark settles, and a typing post behind
+// it would sit under the answer.
+func TestTeamsHoldsTypingOffBehindANewMessage(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	a.typingInterval = time.Hour
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 1 })
+	a.mu.Lock()
+	a.typing[conversation].quietUntil = time.Time{}
+	a.mu.Unlock()
+	if _, err := a.Post(conversation, "the answer"); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	a.mu.Lock()
+	quiet := a.typing[conversation].quietUntil.After(time.Now())
+	a.mu.Unlock()
+	if !quiet {
+		t.Fatal("no quiet interval behind a new message")
+	}
+	a.MarkChanged(conversation, "", "")
+}
+
+// A typing post the broker refuses is dropped and the next one still goes.
+func TestTeamsTypingSurvivesARefusedPost(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	relay.mu.Lock()
+	relay.apiStatus = http.StatusBadGateway
+	relay.mu.Unlock()
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator kept posting", func() bool { return teamsTypingCount(relay) >= 3 })
+	a.MarkChanged(conversation, "", "")
+}
+
+// The indicator stops when the open ask settles or waits on the person.
+func TestTeamsStopsTypingWhenTheAskIsNoLongerOpen(t *testing.T) {
+	for name, release := range map[string]func(a *TeamsAdapter, conversation string){
+		"the ask cleared":       func(a *TeamsAdapter, c string) { a.MarkChanged(c, "", "") },
+		"waiting on the person": func(a *TeamsAdapter, c string) { a.MarkChanged(c, "investigate", markSettleBlocked) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, relay := typingTeamsAdapter(t)
+			conversation := "teams:" + testTeamsChannel
+			a.MarkChanged(conversation, "investigate", "")
+			waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 3 })
+			release(a, conversation)
+			teamsTypingSettled(t, relay)
+			teamsTypingQuiet(t, relay, "went on after the release")
+		})
+	}
+}
+
+// A settled or blocked mark starts nothing, and neither does a task with
+// no open ask.
+func TestTeamsDoesNotTypeWithoutAnOpenAsk(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "", markSettleFailed)
+	a.MarkChanged(conversation, "investigate", markSettleBlocked)
+	a.TaskStarted(conversation, "task-1")
+	time.Sleep(5 * testTeamsTypingInterval)
+	a.TaskTerminal(conversation, "task-1", lib.StateCompleted, TerminalFromExecutor, "")
+	time.Sleep(10 * testTeamsTypingInterval)
+	if n := teamsTypingCount(relay); n != 0 {
+		t.Fatalf("%d typing posts with no open ask, want none", n)
+	}
+}
+
+// The work resuming after the person answered turns the indicator on
+// again.
+func TestTeamsTypesAgainWhenTheWorkResumes(t *testing.T) {
+	a, relay := typingTeamsAdapter(t)
+	conversation := "teams:" + testTeamsChannel
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator posted", func() bool { return teamsTypingCount(relay) >= 1 })
+	a.MarkChanged(conversation, "investigate", markSettleBlocked)
+	settled := teamsTypingSettled(t, relay)
+	a.MarkChanged(conversation, "investigate", "")
+	waitFor(t, "the indicator came back", func() bool { return teamsTypingCount(relay) >= settled+2 })
+	a.MarkChanged(conversation, "", "")
+}

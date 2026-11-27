@@ -57,7 +57,7 @@ func newUnprovisionedGateway(t *testing.T) (*Gateway, string, context.Context) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	client, err := connectClientTest(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}

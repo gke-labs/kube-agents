@@ -157,7 +157,7 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # default is None (unbounded). A test that calls `serve` puts them back: a later
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
-_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots", "lifecycle", "readings_sweep")
 
 
 def setUpModule():
@@ -1036,6 +1036,519 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertTrue(self.second_chunk_released)
         self.assertIn(b"event: done\n", rest)
 
+    def test_scope_route_requires_external_api_key(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(401, raised.exception.code)
+        self.assertEqual("", self.received_authorization)
+
+    def test_scope_route_returns_empty_defaults_when_snapshot_is_missing_or_corrupt(self):
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+        self.assertEqual("", self.received_authorization)
+        self.assertEqual("", data["resolved_at"])
+        self.assertEqual([], data["projects"])
+        self.assertEqual([], data["profile_identities"])
+        self.assertFalse(data["event_watcher"]["enabled"])
+
+        snapshot_path = Path(self.workspace_dir.name) / "fleet_scope.json"
+        snapshot_path.write_text("{not valid json", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            with urllib.request.urlopen(request) as response:
+                corrupt_data = json.loads(response.read())
+        self.assertEqual([], corrupt_data["projects"])
+
+    def test_scope_route_reads_snapshot_profiles_and_event_watcher_metrics(self):
+        root = Path(self.workspace_dir.name)
+        (root / "fleet_scope.json").write_text(
+            json.dumps(
+                {
+                    "resolvedAt": "2026-11-26T06:00:00Z",
+                    "present": True,
+                    "boundary": True,
+                    "maxProjects": 100,
+                    "resolver": "explicit",
+                    "projects": [
+                        {
+                            "id": "proj-host",
+                            "via": ["management"],
+                            "outcome": "ok",
+                            "state": "in-scope",
+                            "clusters": 1,
+                        },
+                        {
+                            "id": "proj-denied",
+                            "via": ["explicit"],
+                            "outcome": "denied",
+                            "state": "in-scope",
+                            "clusters": None,
+                        },
+                    ],
+                    "containers": [],
+                    "profiles": {"cluster-proj-host-c1-us-central1": "proj-host"},
+                    "unmanaged": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prof_ready = root / "profiles" / "cluster-proj-host-c1-us-central1"
+        prof_ready.mkdir(parents=True)
+        (prof_ready / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_ready / "profile.yaml").write_text("name: cluster-proj-host-c1-us-central1\n", encoding="utf-8")
+        (prof_ready / "USER.md").write_text("# Cluster Agent Context\n", encoding="utf-8")
+
+        # Profile with USER.md but missing profile.yaml (not registered with Hermes) must report ready=False.
+        prof_unready = root / "profiles" / "cluster-proj-host-c2-us-east1"
+        prof_unready.mkdir(parents=True)
+        (prof_unready / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c2\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        (prof_unready / "USER.md").write_text("# Unregistered skeleton\n", encoding="utf-8")
+
+        # Broken profile still present on disk with unparseable config.yaml must count as 1 active error.
+        prof_broken = root / "profiles" / "cluster-proj-host-c3-broken"
+        prof_broken.mkdir(parents=True)
+        (prof_broken / "config.yaml").write_text(":::not valid yaml\n", encoding="utf-8")
+
+        # Reserved profiles (platform, default, tse) are ignored even if they have config.yaml.
+        prof_reserved = root / "profiles" / "platform"
+        prof_reserved.mkdir(parents=True)
+        (prof_reserved / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_reserved / "profile.yaml").write_text("name: platform\n", encoding="utf-8")
+        (prof_reserved / "USER.md").write_text("# Platform\n", encoding="utf-8")
+
+        filler_series = "".join(
+            f'k8s_event_watcher_events_seen_total{{cluster="c1",reason="BackOff_{i:05d}"}} 1\n'
+            for i in range(18000)
+        )
+        metrics_body = (
+            # Stale error for c2 (already recovered and present in cluster_up) and c4 (removed from disk)
+            # must be filtered out; only c3-broken (still on disk and unwatched) counts as active.
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 5\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c3-broken"} 3\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c4-removed"} 2\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c1-us-central1"} 0\n'
+            'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
+            'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
+            + filler_series
+            + "# HELP k8s_event_watcher_watch_set_ready ready\n"
+            + "# TYPE k8s_event_watcher_watch_set_ready gauge\n"
+            + "k8s_event_watcher_watch_set_ready 1\n"
+        ).encode("utf-8")
+        self.assertGreater(len(metrics_body), credential_proxy.AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES)
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(metrics_body)))
+                self.end_headers()
+                self.wfile.write(metrics_body)
+
+            def log_message(self, _message, *_args):
+                return
+
+        metrics_srv = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        threading.Thread(target=metrics_srv.serve_forever, daemon=True).start()
+        self.addCleanup(metrics_srv.server_close)
+        self.addCleanup(metrics_srv.shutdown)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "EVENT_WATCHER_ENABLED": "true",
+                "EVENT_WATCHER_METRICS_PORT": str(metrics_srv.server_port),
+            },
+            clear=False,
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+
+        self.assertEqual("", self.received_authorization)
+        self.assertEqual("2026-11-26T06:00:00Z", data["resolved_at"])
+        self.assertTrue(data["present"])
+        self.assertTrue(data["boundary"])
+        self.assertEqual(2, len(data["projects"]))
+        self.assertEqual(
+            [
+                {
+                    "profile": "cluster-proj-host-c1-us-central1",
+                    "project": "proj-host",
+                    "cluster": "c1",
+                    "location": "us-central1",
+                    "ready": True,
+                },
+                {
+                    "profile": "cluster-proj-host-c2-us-east1",
+                    "project": "proj-host",
+                    "cluster": "c2",
+                    "location": "us-east1",
+                    "ready": False,
+                },
+            ],
+            data["profile_identities"],
+        )
+        watcher = data["event_watcher"]
+        self.assertTrue(watcher["enabled"])
+        self.assertTrue(watcher["reachable"])
+        self.assertTrue(watcher["watch_set_ready"])
+        self.assertEqual(1, watcher["clusters_up"])
+        self.assertEqual(2, watcher["clusters_total"])
+        self.assertEqual(1, watcher["discovery_errors"])
+
+    def test_parse_event_watcher_metrics_counts_distinct_error_profiles_across_ticks(self):
+        # Cumulative rescan counter increments for one broken profile must count as 1 affected profile, not 7.
+        single_profile_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 7\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 0\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        single = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(single_profile_text)
+        self.assertEqual(1, single["discovery_errors"])
+
+        # Multiple distinct profiles with multi-tick counts plus a duplicate sample line count distinct profiles only.
+        multi_profile_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 4\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 5\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-b-c2-us-west1"} 9\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-c-c3-europe-west1"} 0\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        multi = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(multi_profile_text)
+        self.assertEqual(2, multi["discovery_errors"])
+
+    def test_parse_event_watcher_metrics_filters_recovered_and_removed_profiles(self):
+        # Transient skip that recovered (profile now maps to a watched cluster) and a profile
+        # later removed from disk must both drop to 0, while genuinely failing profiles stay counted.
+        identities = [
+            {
+                "profile": "cluster-proj-a-recovered-us-central1",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+            {
+                "profile": "cluster-proj-a-still-denied-us-east1",
+                "project": "proj-a",
+                "cluster": "still-denied",
+                "location": "us-east1",
+                "ready": True,
+            },
+        ]
+        present = {
+            "cluster-proj-a-recovered-us-central1",
+            "cluster-proj-a-still-denied-us-east1",
+        }
+
+        # Recovered + removed only => 0 active discovery errors.
+        stale_only_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-us-central1"} 1\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-deleted-us-west1"} 4\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="-"} 1\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        stale_only = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            stale_only_text,
+            profile_identities=identities,
+            present_profiles=present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(0, stale_only["discovery_errors"])
+
+        # Genuinely failing profile (valid identity on disk, still absent from cluster_up) stays 1.
+        still_failing_text = (
+            stale_only_text
+            + 'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-still-denied-us-east1"} 3\n'
+        )
+        still_failing = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            still_failing_text,
+            profile_identities=identities,
+            present_profiles=present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, still_failing["discovery_errors"])
+
+        # Duplicate on-disk profile claiming an already-watched cluster remains counted as 1 active error
+        # (even if both profiles carry historical counter increments), and clears once the duplicate is removed.
+        dup_identities = [
+            *identities,
+            {
+                "profile": "cluster-proj-a-recovered-copy",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+        ]
+        dup_present = present | {"cluster-proj-a-recovered-copy"}
+        dup_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-us-central1"} 1\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-copy"} 2\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        dup_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            dup_text,
+            profile_identities=dup_identities,
+            present_profiles=dup_present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, dup_res["discovery_errors"])
+
+        # Reserved "direct" profile directory is always refused by the watcher while present on disk.
+        direct_identities = [
+            {
+                "profile": "direct",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+        ]
+        direct_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="direct"} 2\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        direct_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            direct_text,
+            profile_identities=direct_identities,
+            present_profiles={"direct"},
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, direct_res["discovery_errors"])
+
+        # Unreadable profiles directory preserves the NoProfile ("-") discovery error.
+        unreadable_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="-"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        unreadable_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            unreadable_text,
+            profile_identities=[],
+            present_profiles=set(),
+            profiles_dir_unreadable=True,
+        )
+        self.assertEqual(1, unreadable_res["discovery_errors"])
+
+    def test_scope_route_clears_recovered_and_removed_discovery_errors_end_to_end(self):
+        root = Path(self.workspace_dir.name)
+        profiles_dir = root / "profiles"
+
+        recovered = profiles_dir / "cluster-proj-a-c1-us-central1"
+        recovered.mkdir(parents=True)
+        (recovered / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-a\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (recovered / "profile.yaml").write_text("name: cluster-proj-a-c1-us-central1\n", encoding="utf-8")
+        (recovered / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        failing = profiles_dir / "cluster-proj-a-c2-us-east1"
+        failing.mkdir(parents=True)
+        (failing / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-a\n  cluster: c2\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        (failing / "profile.yaml").write_text("name: cluster-proj-a-c2-us-east1\n", encoding="utf-8")
+        (failing / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        # c1 transiently failed then recovered (cluster_up=1); c3 was removed from disk; c2 is still failing.
+        metrics_state = {
+            "body": (
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 1\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 2\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c3-removed"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-a"} 1\n'
+                "k8s_event_watcher_watch_set_ready 1\n"
+            ).encode("utf-8")
+        }
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = metrics_state["body"]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _message, *_args):
+                return
+
+        metrics_srv = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        threading.Thread(target=metrics_srv.serve_forever, daemon=True).start()
+        self.addCleanup(metrics_srv.server_close)
+        self.addCleanup(metrics_srv.shutdown)
+
+        env = {
+            "EVENT_WATCHER_ENABLED": "true",
+            "EVENT_WATCHER_METRICS_PORT": str(metrics_srv.server_port),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                first = json.loads(resp.read())
+            self.assertEqual(1, first["event_watcher"]["discovery_errors"])
+
+            # Once c2 also recovers (now in cluster_up) while all cumulative counters stay >= 1,
+            # /api/scope reports 0 active discovery errors without a watcher pod restart.
+            metrics_state["body"] = (
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 1\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 2\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c3-removed"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-a"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-a"} 1\n'
+                "k8s_event_watcher_watch_set_ready 1\n"
+            ).encode("utf-8")
+            with urllib.request.urlopen(req) as resp:
+                second = json.loads(resp.read())
+            self.assertEqual(0, second["event_watcher"]["discovery_errors"])
+
+    def test_scope_route_skips_unreadable_profile_and_coerces_bool_max_projects(self):
+        root = Path(self.workspace_dir.name)
+        (root / "fleet_scope.json").write_text(
+            json.dumps(
+                {
+                    "resolvedAt": "2026-11-26T06:00:00Z",
+                    "present": True,
+                    "boundary": True,
+                    "maxProjects": True,
+                    "projects": [{"id": "proj-host", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        good = root / "profiles" / "cluster-proj-host-good-us-central1"
+        good.mkdir(parents=True)
+        (good / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: good\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (good / "profile.yaml").write_text("name: cluster-proj-host-good-us-central1\n", encoding="utf-8")
+        (good / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        blocked = root / "profiles" / "cluster-proj-host-blocked-us-east1"
+        blocked.mkdir(parents=True)
+        blocked_cfg = blocked / "config.yaml"
+        blocked_cfg.write_text("cluster_identity:\n  project: proj-host\n", encoding="utf-8")
+
+        orig_is_file = Path.is_file
+
+        def flaky_is_file(self_path):
+            if self_path == blocked_cfg:
+                raise PermissionError("simulated EACCES on profile directory")
+            return orig_is_file(self_path)
+
+        with (
+            mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False),
+            mock.patch.object(Path, "is_file", flaky_is_file),
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+
+        self.assertEqual(0, data["max_projects"])
+        self.assertEqual(["cluster-proj-host-good-us-central1"], [p["profile"] for p in data["profile_identities"]])
+
+    def test_parse_cluster_identity_caches_by_stat_and_invalidates_on_change(self):
+        import yaml
+
+        root = Path(self.workspace_dir.name)
+        cfg = root / "cached-config.yaml"
+        cfg.write_text(
+            "cluster_identity:\n  project: proj-cache\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        with credential_proxy._PROFILE_IDENTITY_CACHE_LOCK:
+            credential_proxy._PROFILE_IDENTITY_CACHE.clear()
+
+        with mock.patch.object(yaml, "load", wraps=yaml.load) as spy_load:
+            first = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            second = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            self.assertEqual({"project": "proj-cache", "cluster": "c1", "location": "us-central1"}, first)
+            self.assertEqual(first, second)
+            self.assertEqual(1, spy_load.call_count)
+
+            # Mutating content (size/mtime change) must invalidate the cache entry.
+            cfg.write_text(
+                "cluster_identity:\n  project: proj-cache\n  cluster: c1-updated\n  location: europe-west1\n",
+                encoding="utf-8",
+            )
+            third = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            self.assertEqual({"project": "proj-cache", "cluster": "c1-updated", "location": "europe-west1"}, third)
+            self.assertEqual(2, spy_load.call_count)
+
+    def test_scope_route_skips_non_utf8_and_symlink_escape_profile_configs(self):
+        root = Path(self.workspace_dir.name)
+        profiles_dir = root / "profiles"
+
+        good_dir = profiles_dir / "cluster-proj-good-us-central1"
+        good_dir.mkdir(parents=True)
+        (good_dir / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-good\n  cluster: good\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (good_dir / "profile.yaml").write_text("name: good\n", encoding="utf-8")
+        (good_dir / "USER.md").write_text("# user\n", encoding="utf-8")
+
+        # Invalid UTF-8 bytes must be skipped rather than crashing GET /api/scope.
+        bad_utf8_dir = profiles_dir / "cluster-proj-bad-utf8-us-central1"
+        bad_utf8_dir.mkdir(parents=True)
+        (bad_utf8_dir / "config.yaml").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+        # Symlink escaping profiles_dir must be ignored by containment guard.
+        outside_file = root / "outside-config.yaml"
+        outside_file.write_text(
+            "cluster_identity:\n  project: proj-outside\n  cluster: leaked\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        escape_dir = profiles_dir / "cluster-proj-escape-us-east1"
+        escape_dir.mkdir(parents=True)
+        (escape_dir / "config.yaml").symlink_to(outside_file)
+
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(200, response.status)
+                data = json.loads(response.read())
+
+        self.assertEqual(
+            ["cluster-proj-good-us-central1"],
+            [p["profile"] for p in data["profile_identities"]],
+        )
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):
@@ -1627,6 +2140,8 @@ class GitHardeningTest(unittest.TestCase):
             "gpg.ssh.defaultKeyCommand": "false",
             "gpg.x509.program": "false",
             "help.autocorrect": "0",
+            # A push stays in the repository that the command names.
+            "push.recurseSubmodules": "no",
         }
         for key, value in expected.items():
             result = executor.execute(
@@ -1964,6 +2479,228 @@ class GitHardeningTest(unittest.TestCase):
         ):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(git_argument_violation(argv))
+
+    # -- a push that also pushes the submodules -------------------------------
+
+    SUBMODULE_PUSH_REFUSAL = (
+        "`git push --recurse-submodules` with a value other than `no` is refused: git can then push "
+        "inside each submodule too, and the broker judges only the repository that the command names."
+    )
+
+    def superproject_with_a_submodule(self, name):
+        """With the host's git: a clone of one remote, with a submodule of a second remote.
+        Each remote has the one branch `release-trunk`, and both work trees are on that
+        branch, as a push into a submodule needs. The submodule has one commit that its
+        remote does not have, and the superproject records it. No git variable and no
+        config file of the host is read. Returns the superproject, a function that says if
+        the submodule's remote got that commit, and the environment of the git calls."""
+        base = Path(self.temp_dir.name) / name
+        base.mkdir()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_DEFAULT_REF_FORMAT="files")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+
+        def must(*arguments):
+            done = subprocess.run(["git", *arguments], env=environment, capture_output=True, text=True, check=False)
+            self.assertEqual(0, done.returncode, f"git {' '.join(arguments)}: {done.stderr}{done.stdout}")
+            return done.stdout.strip()
+
+        remotes = {}
+        for remote_name in ("superproject", "module"):
+            remotes[remote_name] = base / f"{remote_name}.git"
+            seed = base / f"{remote_name}-seed"
+            must("init", "--quiet", "--bare", "-b", "release-trunk", str(remotes[remote_name]))
+            must("clone", "--quiet", str(remotes[remote_name]), str(seed))
+            (seed / "README.md").write_text(f"{remote_name}\n", encoding="utf-8")
+            must("-C", str(seed), "add", ".")
+            must("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+            must("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+        superproject = base / "clone"
+        must("clone", "--quiet", str(remotes["superproject"]), str(superproject))
+        # A submodule from a local path needs the file protocol, which git allows a user only by name.
+        must("-C", str(superproject), "-c", "protocol.file.allow=always", "submodule", "add", "--quiet", str(remotes["module"]), "module")
+        module = superproject / "module"
+        self.assertTrue((module / ".git").is_file())
+        (module / "change.txt").write_text("a change in the submodule\n", encoding="utf-8")
+        must("-C", str(module), "add", ".")
+        must("-C", str(module), *identity, "commit", "--quiet", "-m", "a change in the submodule")
+        must("-C", str(superproject), "add", ".")
+        must("-C", str(superproject), *identity, "commit", "--quiet", "-m", "add the module")
+        made = must("-C", str(module), "rev-parse", "HEAD")
+        self.assertNotEqual(made, must("-C", str(remotes["module"]), "rev-parse", "release-trunk"))
+
+        def module_remote_got_the_commit():
+            return made == must("-C", str(remotes["module"]), "rev-parse", "release-trunk")
+
+        return superproject, module_remote_got_the_commit, environment
+
+    def forced_config_layer(self, executor, without=None):
+        """The executor's forced config, as the environment layer that git reads; `without`
+        leaves one key out, for the control of a pin."""
+        environment = executor.environment
+        count = int(environment["GIT_CONFIG_COUNT"])
+        pairs = tuple((environment[f"GIT_CONFIG_KEY_{index}"], environment[f"GIT_CONFIG_VALUE_{index}"]) for index in range(count))
+        kept = tuple(pair for pair in pairs if pair[0] != without)
+        if without is not None:
+            self.assertEqual(count - 1, len(kept), f"{without} is not in the forced config")
+        return credential_proxy._git_forced_config_environment(kept)
+
+    def test_a_push_does_not_push_the_submodules_whatever_the_repository_config_says(self):
+        # `push.recurseSubmodules = on-demand` (or `only`, the same class) and
+        # `submodule.recurse = true` each make a plain `git push` also push inside each
+        # submodule, to that submodule's own remote. The agent can write both in `.git/config`,
+        # the argv has no flag for the push guard to see, and the guard judges only the
+        # repository that the command names. The control shows that the push goes into the
+        # submodule without the pin, so the first half is not true of a fixture that could
+        # never push there.
+        executor = self.executor()
+        for number, setting in enumerate(("[push]\n\trecurseSubmodules = on-demand\n", "[submodule]\n\trecurse = true\n")):
+            for pinned in (False, True):
+                with self.subTest(config=setting.split()[0], pinned=pinned):
+                    superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(
+                        f"config-{number}-{'pinned' if pinned else 'control'}"
+                    )
+                    self.append_repository_config(superproject, "\n" + setting)
+                    layer = self.forced_config_layer(executor, without=None if pinned else "push.recurseSubmodules")
+                    pushed = subprocess.run(
+                        ["git", "push", "origin", "HEAD:release-trunk"],
+                        cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(0, pushed.returncode, pushed.stderr)
+                    self.assertEqual(not pinned, module_remote_got_the_commit(), pushed.stderr)
+
+    def test_a_push_that_asks_git_to_push_the_submodules_is_refused(self):
+        # The flag outranks the forced config, so the pin above does not hold it: the control
+        # is the refusal. The test below runs the spellings that push into a submodule with git.
+        from credential_proxy import GIT_PUSH_RECURSE_SUBMODULES_REFUSAL, git_push_violation
+
+        self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, GIT_PUSH_RECURSE_SUBMODULES_REFUSAL)
+        for flags in (
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules=only"],
+            ["--recurse-submodules=check"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+            # The rule is each value but the word `no`: a value that git reads as on-demand
+            # under another name, values that git reads as off, and values that git refuses.
+            ["--recurse-submodules=only-is-on-demand"],
+            ["--recurse-submodules=false"],
+            ["--recurse-submodules=No"],
+            ["--recurse-submodules=yes"],
+            ["--recurse-submodules=none"],
+            ["--recurse-submodules="],
+            # The last one wins in git; the guard does not rely on the order.
+            ["--recurse-submodules=no", "--recurse-submodules=on-demand"],
+            ["--recurse-submodules=on-demand", "--recurse-submodules=no"],
+        ):
+            for argv in (
+                ["git", "push", *flags, "origin", "HEAD:feature"],
+                ["git", "push", "origin", "HEAD:feature", *flags],
+                ["git", "-C", "clone", "push", *flags, "origin", "HEAD:feature"],
+            ):
+                with self.subTest(argv=argv[1:]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_argument_violation(argv))
+        # The flag as the last word has no value: not `no`.
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL, git_push_violation(["git", "push", "origin", "HEAD:feature", "--recurse-submodules"])
+        )
+        # The flag in a push of tags only (the one push with no refspec that the guard lets
+        # pass), after an option that takes the next word, and as a prefix that names two
+        # options (an error in git).
+        for argv in (
+            ["git", "push", "--tags", "--recurse-submodules=on-demand", "origin"],
+            ["git", "push", "-o", "x", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--repo", "origin", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--rec=on-demand", "origin", "HEAD:feature"],
+            ["git", "push", "--re=on-demand", "origin", "HEAD:feature"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, git_push_violation(argv))
+        # A prefix that names two options with the value `no` passes this rule; git itself
+        # stops on the prefix.
+        self.assertIsNone(git_push_violation(["git", "push", "--re=no", "origin", "HEAD:feature"]))
+        # Pass-through: the value `no`, the negated flag, no flag, and a command that is not a push.
+        for argv in (
+            ["git", "push", "--recurse-submodules=no", "origin", "HEAD:feature"],
+            ["git", "push", "--recurse-submodules", "no", "origin", "HEAD:feature"],
+            ["git", "push", "--no-recurse-submodules", "origin", "HEAD:feature"],
+            ["git", "push", "origin", "HEAD:feature"],
+            ["git", "fetch", "--recurse-submodules=on-demand", "origin"],
+            ["git", "submodule", "update", "--init"],
+        ):
+            with self.subTest(argv=argv[1:]):
+                self.assertIsNone(git_push_violation(argv))
+                self.assertIsNone(git_argument_violation(argv))
+        # After `--` the word is a refspec, and another rule judges it.
+        self.assertNotEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "origin", "--", "--recurse-submodules=on-demand"]),
+        )
+        # The refusals that come before it in the argv keep their text.
+        self.assertIn("`git push --all` is refused", git_push_violation(["git", "push", "--all", "--recurse-submodules=on-demand"]) or "")
+        # Through the executor's own check, with the lease switch on and off, and through an alias.
+        executor = self.executor()
+        repository = self.repository(executor)
+        self.append_repository_config(repository, "\n[alias]\n\tdeep = push --recurse-submodules=on-demand\n")
+        for lease in (False, True):
+            executor.require_git_lease = lease
+            for argv in (
+                ["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"],
+                ["git", "deep", "origin", "HEAD:feature"],
+            ):
+                with self.subTest(lease=lease, argv=argv[1]):
+                    self.assertEqual(self.SUBMODULE_PUSH_REFUSAL, executor.git_lease_violation(argv, cwd=str(repository)))
+        # In a clone that the guard refuses for its ref format too, the flag's refusal answers first.
+        self.append_repository_config(repository, "\n[extensions]\n\trefStorage = reftable\n")
+        self.assertIn("reftable", git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=repository) or "")
+        self.assertEqual(
+            self.SUBMODULE_PUSH_REFUSAL,
+            git_push_violation(["git", "push", "--recurse-submodules=on-demand", "origin", "HEAD:feature"], cwd=repository),
+        )
+
+    def test_git_takes_each_spelling_of_the_submodule_push_flag_that_is_refused(self):
+        # With the host's git and the executor's forced config: the flag with the value
+        # `on-demand` or `only`, in each spelling of the name and of the value's place, pushes
+        # inside the submodule. So the pin does not hold the flag, and git reads these
+        # spellings as the guard does. `check` is in the list of the test above and not here:
+        # it stops the push and pushes nothing into a submodule.
+        executor = self.executor()
+        layer = self.forced_config_layer(executor)
+        self.assertIn("push.recurseSubmodules", layer.values())
+        for number, flags in enumerate((
+            ["--recurse-submodules=on-demand"],
+            ["--recurse-submodules", "on-demand"],
+            ["--recurse-sub=on-demand"],
+            ["--recu=only"],
+        )):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"flag-{number}")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject, env={**environment, **layer}, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertTrue(module_remote_got_the_commit(), pushed.stderr)
+                self.assertEqual(
+                    self.SUBMODULE_PUSH_REFUSAL,
+                    git_argument_violation(["git", "push", *flags, "origin", "HEAD:release-trunk"]),
+                )
+        # The value `no` and the negated flag keep the push out of the submodule, also where
+        # the repository config asks for it.
+        for number, flags in enumerate((["--recurse-submodules=no"], ["--no-recurse-submodules"])):
+            with self.subTest(flags=flags):
+                superproject, module_remote_got_the_commit, environment = self.superproject_with_a_submodule(f"off-{number}")
+                self.append_repository_config(superproject, "\n[push]\n\trecurseSubmodules = on-demand\n")
+                pushed = subprocess.run(
+                    ["git", "push", *flags, "origin", "HEAD:release-trunk"],
+                    cwd=superproject,
+                    env={**environment, **self.forced_config_layer(executor, without="push.recurseSubmodules")},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(0, pushed.returncode, pushed.stderr)
+                self.assertFalse(module_remote_got_the_commit(), pushed.stderr)
 
     def test_the_help_viewer_cannot_run_a_command(self):
         # `git help -m <page>` runs `man.<man.viewer>.cmd` through
@@ -2807,17 +3544,23 @@ class GitHardeningTest(unittest.TestCase):
         self.assertEqual("files", _repo_ref_format(closed))
 
     def test_a_git_file_that_points_to_the_git_directory_is_not_followed(self):
-        """A known limit, held so that a change of it is a decision: a linked worktree, a
-        submodule and a clone with a separate git directory have a `.git` file. The reader
-        does not follow it, so the format reads as `files` and the push is judged as before."""
+        """A linked worktree, a submodule and a clone with a separate git directory have a
+        `.git` file. The reader does not follow it, so the format reads as `files` in each
+        ref format. That answer does not decide a push: the guard refuses a push from such
+        a place before it asks for the format (#7072)."""
         from credential_proxy import _repo_ref_format, git_push_violation
 
         main = self.clone_folder("main-clone", self.REFTABLE_CONFIG)
         linked = Path(self.temp_dir.name) / "linked-worktree"
         linked.mkdir()
-        (linked / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'linked'}\n", encoding="utf-8")
+        # As git writes it: the pointer names a folder whose `commondir` file names the clone's
+        # git directory. A reader that follows the two would find the reftable config.
+        admin = main / ".git" / "worktrees" / "linked"
+        admin.mkdir(parents=True)
+        (admin / "commondir").write_text("../..\n", encoding="utf-8")
+        (linked / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
         self.assertEqual("files", _repo_ref_format(linked))
-        self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=linked))
+        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=linked))
 
     def test_a_byte_that_is_not_utf8_does_not_hide_the_format(self):
         from credential_proxy import _repo_ref_format
@@ -2935,6 +3678,422 @@ class GitHardeningTest(unittest.TestCase):
                     self.skipTest(f"this git cannot make a clone in the {ref_format} ref format")
                 self.assertEqual(0, made.returncode, made.stderr)
                 self.assertEqual(ref_format, _repo_ref_format(clone))
+                to_default = git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=clone) or ""
+                to_work = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=clone)
+                if ref_format == "files":
+                    self.assertIn("protected branch 'release-trunk'", to_default)
+                    self.assertIsNone(to_work)
+                else:
+                    self.assertIn("'reftable' ref format", to_default)
+                    self.assertIn("'reftable' ref format", to_work or "")
+
+    # -- a `.git` that is not a folder (#7072) --------------------------------
+
+    LAYOUT_REFUSAL = (
+        "`git push` is refused: `.git` at the working directory or at a folder above it is not a "
+        "folder (a linked worktree, a submodule, a clone with a separate git directory, or a file or "
+        "a link named `.git`). The broker reads the remote's default branch only under a `.git` "
+        "folder and follows no file or link, so here it cannot tell a push to that branch from another."
+    )
+    GIT_ENTRY_KINDS = (
+        "a pointer file",
+        "a pointer file past the size that the guard reads",
+        "a file with other text",
+        "an empty file",
+        "a link to a `.git` folder",
+        "a link to a pointer file",
+        "a link to nothing",
+    )
+
+    def place_with_a_git_entry(self, name, kind):
+        """A folder whose `.git` is `kind`, written by hand. The clone that a pointer or a
+        link names is beside it: the files ref format, `release-trunk` as the remote's default."""
+        base = Path(self.temp_dir.name)
+        target = self.clone_folder(f"{name}-target", self.FILES_CONFIG, default_branch="release-trunk")
+        place = base / name
+        place.mkdir()
+        entry = place / ".git"
+        pointer = f"gitdir: {target / '.git'}\n"
+        if kind == "a pointer file":
+            entry.write_text(pointer, encoding="utf-8")
+        elif kind == "a pointer file past the size that the guard reads":
+            entry.write_text(pointer + "#" * 8192, encoding="utf-8")
+        elif kind == "a file with other text":
+            entry.write_text("not a pointer\n", encoding="utf-8")
+        elif kind == "an empty file":
+            entry.write_text("", encoding="utf-8")
+        elif kind == "a link to a `.git` folder":
+            entry.symlink_to(target / ".git", target_is_directory=True)
+        elif kind == "a link to a pointer file":
+            (base / f"{name}-pointer").write_text(pointer, encoding="utf-8")
+            entry.symlink_to(base / f"{name}-pointer")
+        elif kind == "a link to nothing":
+            entry.symlink_to(base / f"{name}-absent")
+        else:
+            raise AssertionError(kind)
+        return place
+
+    def test_a_push_from_a_place_whose_git_entry_is_not_a_folder_is_refused_by_name(self):
+        """The guard reads the remote's default branch and the ref format only under a `.git`
+        folder. Where `.git` is a file or a link it cannot tell a push to the default branch
+        from another push, so each push is refused, with one fixed text."""
+        from credential_proxy import GIT_PUSH_LAYOUT_REFUSAL, _git_entry_is_not_a_folder, git_push_violation
+
+        self.assertEqual(self.LAYOUT_REFUSAL, GIT_PUSH_LAYOUT_REFUSAL)
+        pushes = (
+            ["git", "push", "origin", "HEAD:release-trunk"],
+            ["git", "push", "origin", "HEAD:feature"],
+            ["git", "push", "-u", "origin", "platform-agent/work"],
+            ["git", "push", "origin"],
+            ["git", "push"],
+            # Before this check, a push of tags only and a push with no refspec had their own answer.
+            ["git", "push", "--tags", "origin"],
+            ["git", "push", "--force-with-lease", "origin", "+HEAD:feature"],
+        )
+        for number, kind in enumerate(self.GIT_ENTRY_KINDS):
+            place = self.place_with_a_git_entry(f"place-{number}", kind)
+            inside = place / "manifests" / "prod"
+            inside.mkdir(parents=True)
+            for where, cwd in (
+                ("the place", place),
+                ("a folder inside it", inside),
+                ("a path inside it that is not there", place / "absent" / "deeper"),
+            ):
+                self.assertTrue(_git_entry_is_not_a_folder(cwd), f"{kind}, {where}")
+                for argv in pushes:
+                    with self.subTest(git_entry=kind, cwd=where, argv=argv[2:]):
+                        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(argv, cwd=cwd))
+                        # The working directory as text, as the executor's caller sends it.
+                        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(argv, cwd=str(cwd)))
+            # A command that is not a push is not this guard's.
+            for argv in (["git", "status"], ["git", "fetch", "origin"], ["git", "commit", "-m", "push"]):
+                with self.subTest(git_entry=kind, argv=argv[1]):
+                    self.assertIsNone(git_push_violation(argv, cwd=place))
+
+    def test_the_refusals_that_come_before_the_layout_check_keep_their_text(self):
+        from credential_proxy import git_push_violation
+
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        for option in ("--all", "--mirror"):
+            with self.subTest(option=option):
+                self.assertIn(
+                    f"`git push {option}` is refused",
+                    git_push_violation(["git", "push", option, "origin"], cwd=place) or "",
+                )
+
+    def test_a_push_from_a_place_with_a_git_folder_or_with_no_git_entry_is_judged_as_before(self):
+        """The pass-through of the layout check: it refuses nothing where each `.git` is a folder."""
+        from credential_proxy import _git_entry_is_not_a_folder, git_push_violation
+
+        base = Path(self.temp_dir.name)
+        clone = self.clone_folder("clone", self.FILES_CONFIG, default_branch="release-trunk")
+        inside = clone / "manifests"
+        inside.mkdir()
+        no_clone = base / "no-clone"
+        no_clone.mkdir()
+        bare = base / "bare.git"
+        bare.mkdir()
+        (bare / "config").write_text(self.FILES_CONFIG, encoding="utf-8")
+        (bare / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        a_file = clone / "README.md"
+        a_file.write_text("hello\n", encoding="utf-8")
+        for name, cwd in (
+            ("a clone", clone),
+            ("a folder inside a clone", inside),
+            ("a folder with no clone", no_clone),
+            ("a bare layout", bare),
+            ("a path that is a file", a_file),
+            ("a path that is not there", base / "absent" / "deeper"),
+        ):
+            with self.subTest(cwd=name):
+                self.assertFalse(_git_entry_is_not_a_folder(cwd))
+                self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=cwd))
+                self.assertIn(
+                    "protected branch 'main'",
+                    git_push_violation(["git", "push", "origin", "HEAD:main"], cwd=cwd) or "",
+                )
+        for name, cwd in (("a clone", clone), ("a folder inside a clone", inside)):
+            with self.subTest(cwd=name):
+                self.assertIn(
+                    "protected branch 'release-trunk'",
+                    git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=cwd) or "",
+                )
+        # With no working directory the guard reads no folder.
+        with mock.patch.object(credential_proxy.os, "lstat", side_effect=AssertionError("a read with no working directory")):
+            self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"]))
+            self.assertIsNone(git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=""))
+
+    def test_a_git_folder_below_does_not_hide_a_git_entry_that_is_not_a_folder_above(self):
+        """git goes past a `.git` folder that it does not take as a repository, to the folder
+        above. The walk does not stop at a `.git` folder, so such a folder cannot hide the
+        place. The cost is in the last row: a clone that git makes inside such a place is
+        refused too, where git itself uses the clone."""
+        from credential_proxy import _git_entry_is_not_a_folder, git_push_violation
+
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        empty_folder = place / "decoy-empty"
+        (empty_folder / ".git").mkdir(parents=True)
+        folder_with_a_config = place / "decoy-config"
+        (folder_with_a_config / ".git").mkdir(parents=True)
+        (folder_with_a_config / ".git" / "config").write_text(self.FILES_CONFIG, encoding="utf-8")
+        reftable_config = place / "decoy-reftable-config"
+        (reftable_config / ".git").mkdir(parents=True)
+        (reftable_config / ".git" / "config").write_text(self.REFTABLE_CONFIG, encoding="utf-8")
+        # The entries of a repository, with a `commondir` file that names a path that is not
+        # there: git does not take the folder, and a walk that stops at this shape is hidden.
+        looks_like_a_clone = self.clone_folder("place/decoy-entries", self.FILES_CONFIG, default_branch="harmless")
+        (looks_like_a_clone / ".git" / "HEAD").write_text("ref: refs/heads/work\n", encoding="utf-8")
+        (looks_like_a_clone / ".git" / "objects").mkdir()
+        (looks_like_a_clone / ".git" / "commondir").write_text("../absent\n", encoding="utf-8")
+        real_clone = place / "real-clone"
+        subprocess.run(["git", "init", "--quiet", str(real_clone)], check=True, capture_output=True)
+        self.assertTrue((real_clone / ".git").is_dir())
+        for name, cwd in (
+            ("an empty `.git` folder", empty_folder),
+            ("a `.git` folder with a config file", folder_with_a_config),
+            ("a folder below it", folder_with_a_config / "deeper"),
+            ("a `.git` folder with a config file of another ref format", reftable_config),
+            ("a `.git` folder with the entries of a repository", looks_like_a_clone),
+            ("a clone that git makes", real_clone),
+        ):
+            with self.subTest(below=name):
+                cwd.mkdir(exist_ok=True)
+                self.assertTrue(_git_entry_is_not_a_folder(cwd))
+                for target in ("release-trunk", "feature"):
+                    self.assertEqual(
+                        self.LAYOUT_REFUSAL,
+                        git_push_violation(["git", "push", "origin", f"HEAD:{target}"], cwd=cwd),
+                    )
+        # A folder beside the place is not below it.
+        beside = self.clone_folder("beside", self.FILES_CONFIG)
+        self.assertFalse(_git_entry_is_not_a_folder(beside))
+
+    def test_a_working_directory_that_is_a_link_is_judged_at_the_folder_that_it_names(self):
+        from credential_proxy import git_push_violation
+
+        base = Path(self.temp_dir.name)
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        clone = self.clone_folder("clone", self.FILES_CONFIG)
+        (base / "to-the-place").symlink_to(place, target_is_directory=True)
+        (place / "to-the-clone").symlink_to(clone, target_is_directory=True)
+        push = ["git", "push", "origin", "HEAD:feature"]
+        self.assertEqual(self.LAYOUT_REFUSAL, git_push_violation(push, cwd=base / "to-the-place"))
+        self.assertIsNone(git_push_violation(push, cwd=place / "to-the-clone"))
+
+    def test_a_git_entry_that_cannot_be_examined_counts_as_not_a_folder(self):
+        clone = self.clone_folder("clone", self.FILES_CONFIG)
+        self.assertFalse(credential_proxy._git_entry_is_not_a_folder(clone))
+        for error in (PermissionError("no permission"), OSError("too many levels of symbolic links")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(credential_proxy.os, "lstat", side_effect=error):
+                self.assertTrue(credential_proxy._git_entry_is_not_a_folder(clone))
+        # No `.git` at a folder, or a path whose parent is a file, is no answer for that folder.
+        for error in (FileNotFoundError(), NotADirectoryError()):
+            with self.subTest(error=type(error).__name__), mock.patch.object(credential_proxy.os, "lstat", side_effect=error):
+                self.assertFalse(credential_proxy._git_entry_is_not_a_folder(clone))
+
+    def test_a_git_entry_of_another_file_type_counts_as_not_a_folder(self):
+        """A FIFO stands for each type that is not a folder, a file or a link. The stand-in
+        for `lstat` gives the FIFO's answer for the `.git` of a place, so there is no FIFO
+        at that path and no reader can wait on it."""
+        base = Path(self.temp_dir.name)
+        os.mkfifo(base / "a-fifo")
+        as_a_fifo = os.lstat(base / "a-fifo")
+        place = base / "place"
+
+        def lstat(path):
+            if Path(path) == place / ".git":
+                return as_a_fifo
+            raise FileNotFoundError(path)
+
+        with mock.patch.object(credential_proxy.os, "lstat", side_effect=lstat):
+            self.assertTrue(credential_proxy._git_entry_is_not_a_folder(place / "manifests"))
+
+    def test_the_guard_opens_no_file_before_it_refuses_for_the_layout(self):
+        """It does not follow the `.git` file: it opens neither that file nor a path that it names."""
+        from credential_proxy import git_push_violation
+
+        place = self.place_with_a_git_entry("place", "a pointer file")
+        opened = AssertionError("the guard opened a file")
+        with mock.patch("builtins.open", side_effect=opened), mock.patch("io.open", side_effect=opened):
+            violation = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=place)
+        self.assertEqual(self.LAYOUT_REFUSAL, violation)
+
+    def test_the_walk_goes_to_the_root_of_the_file_system(self):
+        """With a stand-in for `lstat`: only the named path has a `.git`, and it is a file."""
+        a_file = Path(self.temp_dir.name) / "a-file"
+        a_file.write_text("", encoding="utf-8")
+        as_a_file = os.lstat(a_file)
+        root = Path(a_file.anchor)
+        below = root / "volume" / "workspace" / "lease" / "clone"
+        for name, with_a_git_file in (("the root", root), ("the folder below the root", root / "volume")):
+            asked = []
+
+            def lstat(path, with_a_git_file=with_a_git_file, asked=asked):
+                asked.append(Path(path))
+                if Path(path) == with_a_git_file / ".git":
+                    return as_a_file
+                raise FileNotFoundError(path)
+
+            with self.subTest(git_file_at=name), mock.patch.object(credential_proxy.os, "lstat", side_effect=lstat):
+                self.assertTrue(credential_proxy._git_entry_is_not_a_folder(below))
+                self.assertEqual(below / ".git", asked[0])
+        asked = []
+
+        def no_git_entry(path):
+            asked.append(Path(path))
+            raise FileNotFoundError(path)
+
+        with mock.patch.object(credential_proxy.os, "lstat", side_effect=no_git_entry):
+            self.assertFalse(credential_proxy._git_entry_is_not_a_folder(below))
+        self.assertEqual([folder / ".git" for folder in (below, *below.parents)], asked)
+
+    def test_the_executor_refuses_a_push_from_a_place_whose_git_entry_is_a_file(self):
+        """Through the executor's own check, with the lease switch on and off, and with the
+        place named by `-C` and by the working directory. The refusal comes before the lease
+        check, so the reason is the layout also where the place is in no leased workspace."""
+        executor = self.executor()
+        main = Path(executor.workspace_dir) / "main-clone"
+        (main / ".git" / "worktrees" / "linked").mkdir(parents=True)
+        (main / ".git" / "config").write_text(self.FILES_CONFIG, encoding="utf-8")
+        linked = Path(executor.workspace_dir) / "linked-worktree"
+        (linked / "manifests").mkdir(parents=True)
+        (linked / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'linked'}\n", encoding="utf-8")
+        for lease in (False, True):
+            executor.require_git_lease = lease
+            for argv, cwd in (
+                (["git", "push", "origin", "HEAD:feature"], str(linked)),
+                (["git", "push", "origin", "HEAD:release-trunk"], str(linked / "manifests")),
+                (["git", "-C", str(linked), "push", "origin", "HEAD:feature"], str(executor.workspace_dir)),
+                (["git", "-C", "linked-worktree", "-C", "manifests", "push", "origin", "HEAD:feature"], str(executor.workspace_dir)),
+            ):
+                with self.subTest(lease=lease, argv=argv[1], cwd=Path(cwd).name):
+                    self.assertEqual(self.LAYOUT_REFUSAL, executor.git_lease_violation(argv, cwd=cwd))
+                    violation, _ = executor.resolve_git_command(argv, cwd)
+                    self.assertEqual(self.LAYOUT_REFUSAL, violation)
+            # A command that is not a push is not refused for the layout.
+            self.assertNotEqual(self.LAYOUT_REFUSAL, executor.git_lease_violation(["git", "status"], cwd=str(linked)))
+        executor.require_git_lease = False
+        self.assertIsNone(executor.git_lease_violation(["git", "status"], cwd=str(linked)))
+
+    GIT_REF_FORMAT_OPTIONS = ("--ref-format", "--ref-storage-format")
+
+    def places_that_git_makes(self, ref_format):
+        """With the host's git: a clone in `ref_format`, and the three places where git itself
+        writes a `.git` file: a linked worktree of that clone, a clone with a separate git
+        directory and a submodule. The format is in each command, and no git variable and
+        no config file of the host is read, so the host's default does not matter. Each place
+        is checked before it is returned: a wrong fixture fails."""
+        base = Path(self.temp_dir.name) / f"made-{ref_format}"
+        base.mkdir()
+        environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        identity = ["-c", "user.name=Test User", "-c", "user.email=test@example.com"]
+
+        def git(*arguments):
+            return subprocess.run(["git", *arguments], env=environment, capture_output=True, text=True, check=False)
+
+        def must(*arguments):
+            done = git(*arguments)
+            self.assertEqual(0, done.returncode, f"git {' '.join(arguments)}: {done.stderr}")
+            return done
+
+        def in_the_format(before, after):
+            """`git <before> <the format option> <after>`. git has had two names for the option.
+            A git that knows neither has only the files format: for that format the command
+            runs with no option, and for another format the test is skipped. In CI (the
+            variable `CI` is set) that skip is a failure, so that a runner with an older git
+            does not lose the rows of the other format in silence."""
+
+            def not_known(done):
+                # `git submodule` was a shell script: for an option that it does not know it
+                # prints its usage text.
+                return done.returncode != 0 and ("unknown option" in done.stderr or done.stderr.startswith("usage: git submodule"))
+
+            for option in self.GIT_REF_FORMAT_OPTIONS:
+                done = git(*before, f"{option}={ref_format}", *after)
+                if not not_known(done):
+                    break
+            if not_known(done) and ref_format == "files":
+                done = git(*before, *after)
+            if ref_format != "files" and (not_known(done) or (done.returncode != 0 and "ref storage format" in done.stderr)):
+                reason = f"this git cannot make a place in the {ref_format} ref format: {done.stderr.strip()[:200]}"
+                if os.environ.get("CI"):
+                    self.fail(f"{reason}. In CI these rows must run: the runner needs a git that has this format.")
+                self.skipTest(reason)
+            self.assertEqual(0, done.returncode, f"{before} {after}: {done.stderr}")
+
+        remote = base / "remote.git"
+        must("init", "--quiet", "--bare", "-b", "release-trunk", str(remote))
+        seed = base / "seed"
+        must("clone", "--quiet", str(remote), str(seed))
+        (seed / "README.md").write_text("hello\n", encoding="utf-8")
+        must("-C", str(seed), "add", ".")
+        must("-C", str(seed), *identity, "commit", "--quiet", "-m", "init")
+        must("-C", str(seed), "push", "--quiet", "origin", "HEAD:release-trunk")
+
+        clone = base / "clone"
+        in_the_format(["clone", "--quiet"], [str(remote), str(clone)])
+        linked = base / "linked-worktree"
+        # `worktree add` has no format option: a linked worktree has the format of its clone.
+        must("-C", str(clone), "worktree", "add", "--quiet", "-b", "work", str(linked))
+        separate = base / "separate-git-dir"
+        in_the_format(["clone", "--quiet", f"--separate-git-dir={base / 'separate.git'}"], [str(remote), str(separate)])
+        superproject = base / "superproject"
+        must("init", "--quiet", str(superproject))
+        # A submodule from a local path needs the file protocol, which git allows a user only by name.
+        in_the_format(
+            ["-C", str(superproject), "-c", "protocol.file.allow=always", "submodule", "add", "--quiet"],
+            [str(remote), "module"],
+        )
+        places = {"a linked worktree": linked, "a clone with a separate git directory": separate, "a submodule": superproject / "module"}
+
+        self.assertTrue((clone / ".git").is_dir() and not (clone / ".git").is_symlink())
+        for name, place in {"the clone": clone, **places}.items():
+            if place != clone:
+                entry = place / ".git"
+                self.assertTrue(entry.is_file() and not entry.is_symlink(), f"{name}: `.git` is not a file")
+                self.assertTrue(entry.read_text(encoding="utf-8").startswith("gitdir: "), name)
+            shown = must("-C", str(place), "rev-parse", "--show-ref-format").stdout.strip()
+            # A git from before this option prints the option back, and has only the files format.
+            if shown != "--show-ref-format":
+                self.assertEqual(ref_format, shown, name)
+            # git takes the place for a repository with the remote, and pushes from it.
+            branch = f"refs/heads/from-{place.name}"
+            must("-C", str(place), "push", "--quiet", "origin", f"HEAD:{branch}")
+            must("-C", str(remote), "rev-parse", "--verify", "--quiet", branch)
+        return clone, places
+
+    def test_a_push_from_each_place_where_git_writes_a_git_file_is_refused(self):
+        """A linked worktree, a clone with a separate git directory and a submodule, made by
+        the host's git in each ref format. Before this check the guard said nothing for a
+        push to the remote's default branch from each of them."""
+        from credential_proxy import git_push_violation
+
+        for ref_format in ("files", "reftable"):
+            with self.subTest(ref_format=ref_format):
+                clone, places = self.places_that_git_makes(ref_format)
+                for name, place in places.items():
+                    inside = place / "manifests"
+                    inside.mkdir()
+                    for cwd in (place, inside):
+                        for target in ("release-trunk", "feature"):
+                            self.assertEqual(
+                                self.LAYOUT_REFUSAL,
+                                git_push_violation(["git", "push", "origin", f"HEAD:{target}"], cwd=cwd),
+                                f"{name}, {cwd.name}, {target}",
+                            )
+                    self.assertIsNone(git_push_violation(["git", "status"], cwd=place), name)
+                # A push through an alias of the clone's config, from the linked worktree and,
+                # as the control, from the clone.
+                subprocess.run(["git", "-C", str(clone), "config", "alias.p", "push"], check=True, capture_output=True)
+                executor = self.executor()
+                executor.require_git_lease = False
+                alias_push = ["git", "p", "origin", "HEAD:feature"]
+                violation, _ = executor.resolve_git_command(alias_push, str(places["a linked worktree"]))
+                self.assertEqual(self.LAYOUT_REFUSAL, violation)
+                violation, _ = executor.resolve_git_command(alias_push, str(clone))
+                self.assertNotEqual(self.LAYOUT_REFUSAL, violation)
+                # The control: the clone itself has a `.git` folder and is judged as before.
                 to_default = git_push_violation(["git", "push", "origin", "HEAD:release-trunk"], cwd=clone) or ""
                 to_work = git_push_violation(["git", "push", "origin", "HEAD:feature"], cwd=clone)
                 if ref_format == "files":
@@ -10527,6 +11686,9 @@ class GracefulDrainTest(unittest.TestCase):
         slack = mock.patch.object(CredentialProxyHandler, "slack_relay", None)
         slack.start()
         self.addCleanup(slack.stop)
+        lifecycle = mock.patch.object(CredentialProxyHandler, "lifecycle", None)
+        lifecycle.start()
+        self.addCleanup(lifecycle.stop)
 
     def _handler(self, path):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
@@ -10536,7 +11698,9 @@ class GracefulDrainTest(unittest.TestCase):
         handler._authenticated = lambda: object()
         handler._counted_in_flight = False
         captured = {}
-        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+        handler._json = lambda status, payload, headers=None: captured.update(
+            status=status, payload=payload, headers=headers
+        )
         return handler, captured
 
     def test_a_new_request_is_refused_with_the_draining_bound(self):
@@ -10555,6 +11719,10 @@ class GracefulDrainTest(unittest.TestCase):
                 with mock.patch.object(credential_proxy, "drain_request_body") as drained:
                     getattr(handler, f"do_{method}")()
                 self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+                self.assertEqual(
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)},
+                    captured["headers"],
+                )
                 self.assertEqual(
                     {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
                      "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining",
@@ -10579,15 +11747,15 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertEqual({}, captured)
 
     def test_a_draining_exec_pod_fails_its_readiness_probe(self):
-        # The readiness probe reads /healthz. An exec pod that drains answers
-        # 503, so the Service stops sending it new connections and a caller at
-        # one replica falls back to the stateful broker; the broker, which
-        # rolls with Recreate, and any pod that does not drain answer ok.
+        # The readiness probe reads /healthz. Both an exec pod and a RollingUpdate
+        # standalone broker return 503 while draining so Kubernetes stops routing
+        # new connections to them while in-flight requests finish; a sidecar role
+        # or non-draining pod answers ok.
         cases = (
             (credential_proxy_client.EXEC_ROLE, True, HTTPStatus.SERVICE_UNAVAILABLE,
              credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             (credential_proxy_client.EXEC_ROLE, False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
-            ("broker", True, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", True, HTTPStatus.SERVICE_UNAVAILABLE, credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
             ("broker", False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
         )
         for role, draining, status, payload in cases:
@@ -19295,6 +20463,36 @@ class SweepTransportTest(unittest.TestCase):
 
         return Opener(*answers)
 
+    def test_a_failed_sweep_mint_reads_as_no_credential_and_never_reaches_the_forge(self):
+        """The readings sweep reports the cause by this code: `unauthorized`, not a fault of the forge's."""
+        import vcs_readings
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        for failure in (RuntimeError("sweep credential mint failed"), TimeoutError("sweep credential mint timed out")):
+            with self.subTest(failure=type(failure).__name__):
+                executor = _SweepExecutor()
+                executor.mint_sweep_credential = mock.Mock(side_effect=failure)
+                opener = self._opener({"items": []})
+                transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+                with self.assertRaises(providers.WorkspaceError) as raised:
+                    transport.api("GET", "search/issues")
+                self.assertEqual("FORGE_CREDENTIAL_UNAVAILABLE", raised.exception.fields.get("code"))
+                self.assertIs(failure, raised.exception.__cause__)
+                self.assertEqual([], opener.requests, "the forge is not asked without a token")
+                self.assertEqual("unauthorized", vcs_readings.connection_state(raised.exception))
+                self.assertNotIn(str(failure), str(raised.exception), "the helper's text stays out of the refusal")
+
+    def test_a_repository_that_is_not_managed_keeps_its_own_refusal(self):
+        import vcs_readings
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        executor = _SweepExecutor()
+        executor.mint_sweep_credential = mock.Mock(side_effect=PermissionError("acme/gitops is not a repository this install manages"))
+        transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=self._opener({"items": []}))
+        with self.assertRaises(PermissionError) as raised:
+            transport.api("GET", "search/issues")
+        self.assertEqual("unauthorized", vcs_readings.connection_state(raised.exception))
+
     def test_github_com_gets_an_http_transport_at_api_github_com(self):
         forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
         executor = _SweepExecutor()
@@ -22690,7 +23888,13 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.metrics = credential_proxy.ProxyMetrics()
         handler.replies = []
-        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        handler.reply_headers = []
+
+        def _capture_json(status, payload, headers=None):
+            handler.replies.append((status, payload))
+            handler.reply_headers.append(headers)
+
+        handler._json = _capture_json
         handler._busy(credential_proxy.CommandSlotUnavailable("held", bound=bound))
         return handler
 
@@ -22709,6 +23913,12 @@ class BusyReplyNamesItsBoundTest(unittest.TestCase):
                        credential_proxy_client.BUSY_BOUND_KEY: bound, "error": "held"})],
                     handler.replies,
                 )
+                expected_headers = (
+                    {credential_proxy.RETRY_AFTER_HEADER: str(credential_proxy.HANDOFF_DRAINING_RETRY_AFTER_SECONDS)}
+                    if bound == credential_proxy_client.ADMISSION_BOUND_DRAINING
+                    else None
+                )
+                self.assertEqual([expected_headers], handler.reply_headers)
                 self.assertIn(
                     f'{credential_proxy.ADMISSION_REFUSALS_METRIC}{{bound="{bound}",class="interactive"}} 1',
                     handler.metrics.render(),

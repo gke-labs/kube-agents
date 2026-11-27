@@ -96,6 +96,13 @@ const (
 	// through the session inject as before.
 	featureDriftBacklog = "drift-backlog"
 
+	// featureDriftOwnRelease is the /healthz feature a daemon advertises when
+	// it reads the own-release marks on a record posted to driftBacklogPath.
+	// A daemon that serves the route without it digests by count alone and
+	// words every row as late, so the detector marks nothing for it and a
+	// write to the install's own objects is carded as before.
+	featureDriftOwnRelease = "drift-own-release"
+
 	// injectRetries is how many times one failed call is retried. One, and only
 	// for a fault that a second attempt could plausibly clear (see
 	// retryableInjectFailure). The handler runs inside the batch's shared join
@@ -265,12 +272,23 @@ type DriftInjectPayload struct {
 	// partial picture as a complete one.
 	LookupError string `json:"lookup_error,omitempty"`
 
-	// Backlog and PublishTime are set on a record posted to driftBacklogPath.
-	// PublishTime is when the entry reached the topic; with Timestamp it says
-	// how late the record was. The daemon records neither today: the digest
-	// shows when the rows were recorded.
+	// Backlog and PublishTime are set on a record that reached the detector
+	// late and is posted to driftBacklogPath; a live own-release record posted
+	// there has neither. PublishTime is when the entry reached the topic; with
+	// Timestamp it says how late the record was. The daemon reads Backlog to
+	// tell a late own-release row from a live one, and stores PublishTime
+	// with the rest of the payload without reading it.
 	Backlog     bool   `json:"backlog,omitempty"`
 	PublishTime string `json:"publish_time,omitempty"`
+
+	// OwnRelease is which part of the own-release rule the record matched
+	// (DriftEvent.OwnRelease), OwnReleaseRevision the Helm revision it starts
+	// and OwnReleaseRevisionEnd the one it ends. The daemon digests a
+	// "release" row only when its principal's Helm upgrade was under way at
+	// Timestamp: between a start and that revision's end.
+	OwnRelease            string `json:"own_release,omitempty"`
+	OwnReleaseRevision    string `json:"own_release_revision,omitempty"`
+	OwnReleaseRevisionEnd string `json:"own_release_revision_end,omitempty"`
 }
 
 // DriftInjectResource is the object reference on the payload.
@@ -721,14 +739,32 @@ type driftInjectHandler struct {
 	// passes it to the joiner, which sets DriftEvent.Digest from it; Handle
 	// routes on that field.
 	backlogRoute bool
+
+	// ownReleaseRoute is whether the daemon also advertises
+	// featureDriftOwnRelease. The joiner marks own-release writes only then.
+	ownReleaseRoute bool
+}
+
+// digestRoutes is what the daemon said it takes on driftBacklogPath: late
+// records, and live records marked as the install's own release.
+type digestRoutes struct {
+	backlog    bool
+	ownRelease bool
+}
+
+// routes is the handler's two route facts, for newFilterFromFlags.
+func (h *driftInjectHandler) routes() digestRoutes {
+	return digestRoutes{backlog: h.backlogRoute, ownRelease: h.ownReleaseRoute}
 }
 
 // newDriftInjectHandler wires the injector into a driftEventHandler.
 func newDriftInjectHandler(inject *driftInjector) *driftInjectHandler {
+	backlogRoute := inject != nil && inject.Supports(featureDriftBacklog)
 	return &driftInjectHandler{
-		inject:       inject,
-		seen:         newInsertIDSet(seenInsertIDsCap),
-		backlogRoute: inject != nil && inject.Supports(featureDriftBacklog),
+		inject:          inject,
+		seen:            newInsertIDSet(seenInsertIDsCap),
+		backlogRoute:    backlogRoute,
+		ownReleaseRoute: backlogRoute && inject.Supports(featureDriftOwnRelease),
 	}
 }
 
@@ -806,8 +842,9 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 	injectCtx, cancelInject := context.WithTimeout(ctx, perRecordInjectBudget)
 	defer cancelInject()
 
-	// event.Digest, set by the joiner from the same route this handler holds,
-	// so the DRIFT line's backlog marker and the route taken are one decision.
+	// event.Digest, set by the joiner from the same routes this handler holds,
+	// so the DRIFT line's backlog and own_release markers and the route taken
+	// are one decision.
 	if event.Digest {
 		if err := h.sendBacklog(injectCtx, payloadForEvent(event)); err != nil {
 			h.counts.Failed++
@@ -946,10 +983,13 @@ func payloadForEvent(event DriftEvent) DriftInjectPayload {
 		ReconciledBy: event.ReconciledBy,
 	}
 
-	if event.Digest {
+	if event.late() {
 		payload.Backlog = true
 		payload.PublishTime = formatAuditTimestamp(record.PublishTime)
 	}
+	payload.OwnRelease = string(event.OwnRelease)
+	payload.OwnReleaseRevision = event.ReleaseRevision
+	payload.OwnReleaseRevisionEnd = event.ReleaseRevisionEnd
 
 	if event.LookupError != nil {
 		payload.LookupError = event.LookupError.Error()

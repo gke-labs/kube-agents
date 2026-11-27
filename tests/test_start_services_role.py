@@ -17,7 +17,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _SCRIPT = _REPO_ROOT / "deploy" / "shared" / "start-services.sh"
 _ROLE_CHECK_START = 'export CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-combined}"\n'
 _ROLE_CHECK_END = "\nesac\n"
-_START_BLOCK_START = "\nwrite_wif_credentials\nstart_credential_runtime\n"
+_START_BLOCK_START = "\nwrite_wif_credentials\n# Envoy before the runtime"
 _START_BLOCK_END = "\n# Only the credential-path services are waited on."
 _STUBS = "\n".join(
     f"{name}() {{ echo {name}; }}"
@@ -58,14 +58,15 @@ def _run(role: str) -> subprocess.CompletedProcess[str]:
 
 class StartServicesRoleTest(unittest.TestCase):
     def test_each_role_starts_its_processes(self) -> None:
-        runtime = ["write_wif_credentials", "start_credential_runtime"]
+        # Envoy first where it runs: the runtime is started with its pid.
+        runtime = ["write_wif_credentials", "start_envoy", "start_credential_runtime"]
         watchers = ["start_event_watcher", "start_drift_detector"]
         for role, started in (
-            ("combined", [*runtime, "start_envoy", *watchers]),
-            ("", [*runtime, "start_envoy", *watchers]),
-            ("broker", [*runtime, "start_envoy"]),
-            ("api-proxy", [*runtime, *watchers, "start_audit_report_store"]),
-            ("exec", [*runtime, "start_envoy"]),
+            ("combined", [*runtime, *watchers]),
+            ("", [*runtime, *watchers]),
+            ("broker", runtime),
+            ("api-proxy", ["write_wif_credentials", "start_credential_runtime", *watchers, "start_audit_report_store"]),
+            ("exec", runtime),
         ):
             with self.subTest(role=role):
                 result = _run(role)

@@ -1018,6 +1018,33 @@ source "{_COMMON_SH}"
         proc = self._run_common_func('get_registry_prefix', env={"REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX})
         self.assertEqual(proc.stdout.strip(), MOCK_CUSTOM_REGISTRY_PREFIX)
 
+    def test_get_candidate_registry_prefix(self):
+        """Unset or empty, a release reads commit images where it is published."""
+        registry = {"REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX}
+        for unset in ({}, {"CANDIDATE_REGISTRY_PREFIX": ""}):
+            proc = self._run_common_func('get_candidate_registry_prefix', env={**registry, **unset})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), MOCK_CUSTOM_REGISTRY_PREFIX)
+
+        for value in (MOCK_AR_REGISTRY_PREFIX, MOCK_AR_REGISTRY_PREFIX + "/"):
+            proc = self._run_common_func('get_candidate_registry_prefix', env={**registry, "CANDIDATE_REGISTRY_PREFIX": value})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), MOCK_AR_REGISTRY_PREFIX)
+
+    def test_release_registry_prefixes(self):
+        """The registry prefix first; a second line only for another registry."""
+        registry = {"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX}
+        for same in ({}, {"ADDITIONAL_RELEASE_REGISTRY_PREFIX": ""}, {"ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX + "/"}):
+            proc = self._run_common_func('release_registry_prefixes', env={**registry, **same})
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.split(), [MOCK_DEFAULT_REGISTRY_PREFIX])
+
+        proc = self._run_common_func(
+            'release_registry_prefixes', env={**registry, "ADDITIONAL_RELEASE_REGISTRY_PREFIX": MOCK_CUSTOM_REGISTRY_PREFIX + "/"}
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.split(), [MOCK_DEFAULT_REGISTRY_PREFIX, MOCK_CUSTOM_REGISTRY_PREFIX])
+
     def test_required_release_images_registry(self):
         cmd = 'echo "IMAGES=${REQUIRED_RELEASE_IMAGES[*]}"'
         proc = self._run_common_func(cmd)
@@ -2256,7 +2283,7 @@ class RegistryImageProbeTest(unittest.TestCase):
 
 
 class ArtifactRegistryImageProbeTest(unittest.TestCase):
-    """The docker-free probe for Artifact Registry.
+    """The Artifact Registry API probe, asked first whether or not docker is there.
 
     REGISTRY_PREFIX may name a private Artifact Registry repository. The Prow
     job image has no docker, and the GHCR fallback is anonymous, so without
@@ -2383,7 +2410,7 @@ class ArtifactRegistryImageProbeTest(unittest.TestCase):
                 url = f"https://{self._HOST}/v2/{self._REPOSITORY_PATH}/manifests/{reference}"
                 self.assertTrue(log_path.read_text().strip().endswith(url), log_path.read_text())
 
-    def test_registry_image_exists_falls_back_to_it_without_docker(self):
+    def test_registry_image_exists_asks_it_without_docker(self):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir, _, _ = self._bin(tmp)
             proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
@@ -2403,6 +2430,49 @@ class ArtifactRegistryImageProbeTest(unittest.TestCase):
                 bin_dir, _, _ = self._bin(tmp, **kwargs)
                 proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
                 self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("Artifact Registry could not be asked", proc.stderr)
+
+    def test_with_docker_present_artifact_registry_is_still_asked_first(self):
+        """A runner has docker, but its docker is not logged in to a private
+        repository, so `docker manifest inspect` reads every image there as
+        missing. The API's answer is the one that counts, either way: present
+        with a docker that would say no, absent with a docker that would say
+        yes, and docker is not called for either."""
+        for http_status, docker_has_it, found in ((200, False, True), (404, True, False)):
+            with self.subTest(http_status=http_status), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, _, _ = self._bin(tmp, http_status=http_status)
+                _, docker_log = create_mock_docker_binary(bin_dir, existing_images=[self._IMAGE] if docker_has_it else [])
+                proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
+                self.assertEqual(proc.returncode == 0, found, proc.stderr)
+                self.assertFalse(pathlib.Path(docker_log).exists(), "docker was asked after the API answered")
+
+    def test_docker_decides_only_when_artifact_registry_could_not_be_asked(self):
+        """No credential for the API (a job that never logged in to Google) is
+        not an answer, so docker's is taken: whatever its own login can see."""
+        for docker_has_it in (True, False):
+            with self.subTest(docker_has_it=docker_has_it), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, log_path, _ = self._bin(tmp, gcloud=False)
+                _, docker_log = create_mock_docker_binary(bin_dir, existing_images=[self._IMAGE] if docker_has_it else [])
+                proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
+                self.assertEqual(proc.returncode == 0, docker_has_it, proc.stderr)
+                self.assertIn("manifest inspect", pathlib.Path(docker_log).read_text())
+                self.assertFalse(log_path.exists(), "the registry was asked with no token")
+                # docker's "no" here may be a missing login, not a missing
+                # image, and the caller only prints "not found": say so.
+                self.assertEqual("may not be missing" in proc.stderr, not docker_has_it, proc.stderr)
+
+    def test_a_refused_probe_and_a_docker_without_the_image_names_both_causes(self):
+        """A 403 or a 503 from the API, on a runner whose docker is not logged
+        in: the answer is still "missing", but with the warning that it may
+        not be, so a deploy stopped by IAM or an outage does not read as a
+        publish that never ran."""
+        for http_status in (401, 403, 503):
+            with self.subTest(http_status=http_status), tempfile.TemporaryDirectory() as tmp:
+                bin_dir, _, _ = self._bin(tmp, http_status=http_status)
+                create_mock_docker_binary(bin_dir, existing_images=[])
+                proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("may not be missing", proc.stderr)
                 self.assertIn("Artifact Registry could not be asked", proc.stderr)
 
     def test_registry_image_status_picks_the_probe_by_host(self):
@@ -2474,6 +2544,28 @@ class RequiredReleaseImagesAtCandidateTest(unittest.TestCase):
             existing_images=[f"{MOCK_DEFAULT_REGISTRY_PREFIX}/{img}:{sha}" for img in images],
         )
         return str(bin_dir)
+
+    def test_the_gate_looks_in_the_registry_it_is_given(self):
+        """A second argument names the registry; without one it is the registry
+        prefix. CANDIDATE_REGISTRY_PREFIX alone moves no check: only a release's
+        own reads pass it, so a caller that installs from the registry prefix
+        keeps checking there."""
+        temp_dir, repo_dir, git = self._repo()
+        candidate = commit_required_release_images(repo_dir, git, MOCK_CANDIDATE_RELEASE_IMAGES)
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        create_mock_docker_binary(
+            bin_dir,
+            existing_images=[f"{MOCK_AR_REGISTRY_PREFIX}/{img}:{candidate}" for img in MOCK_CANDIDATE_RELEASE_IMAGES],
+        )
+        # No Google credential, so the Artifact Registry probe cannot ask and
+        # docker, which the release job logs in, answers.
+        create_mock_gcloud_token_binary(bin_dir, token="")
+        env = {**self._REGISTRY, "CANDIDATE_REGISTRY_PREFIX": MOCK_AR_REGISTRY_PREFIX}
+
+        given = self._run(f'check_commit_images_exist "{candidate}" "{MOCK_AR_REGISTRY_PREFIX}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
+        self.assertEqual(given.returncode, 0, given.stderr)
+        default = self._run(f'check_commit_images_exist "{candidate}"', cwd=repo_dir, bin_dir=str(bin_dir), env=env)
+        self.assertEqual(default.returncode, 1, default.stderr)
 
     def test_the_gate_accepts_a_candidate_with_every_image_its_own_list_names(self):
         """Red before the fix: the gate asked for this checkout's longer list."""

@@ -82,10 +82,13 @@ var gatewayProxyPath = regexp.MustCompile(`^` + regexp.QuoteMeta(gatewayProxyPat
 // the proxy speaks for the worker (#6706). An allowlist, because the
 // credential headers a gateway might honour are not a list this file can
 // keep complete.
+//
+// Accept-Encoding is not among them: the proxy watches each answer as it
+// passes (gatewayproxy_answercheck.go), so its transport asks for gzip
+// itself and decompresses, and the harness gets the answer plain.
 var gatewayProxyForwardedHeaders = map[string]bool{
 	"Content-Type":      true,
 	"Accept":            true,
-	"Accept-Encoding":   true,
 	"User-Agent":        true,
 	"X-Goog-Api-Client": true,
 }
@@ -102,6 +105,15 @@ type GatewayProxy struct {
 // harness's model calls to gateway, an http or https URL whose path, if any,
 // prefixes every forwarded path. Close stops it.
 func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) {
+	return StartGatewayProxyWith(gateway, log, GatewayProxyOptions{})
+}
+
+// StartGatewayProxyWith is StartGatewayProxy with opts.
+func StartGatewayProxyWith(gateway string, log *slog.Logger, opts GatewayProxyOptions) (*GatewayProxy, error) {
+	idle := opts.StreamIdle
+	if idle <= 0 {
+		idle = DefaultGatewayProxyStreamIdle
+	}
 	upstream, err := url.Parse(gateway)
 	if err != nil {
 		return nil, fmt.Errorf("gateway URL %q: %w", gateway, err)
@@ -153,7 +165,12 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 		Transport:     transport,
 		FlushInterval: -1, // stream each chunk as it comes: the answers are SSE
 		ModifyResponse: func(resp *http.Response) error {
+			// A stalled answer is cut after idle (gatewayproxy_idle.go).
+			watchIdle(resp, idle, log)
 			resp.Body = &cappedBody{r: resp.Body, left: gatewayProxyMaxResponseBytes}
+			// An answer cut short or carrying an error breaks the
+			// connection rather than ending it (gatewayproxy_answercheck.go).
+			checkAnswer(resp)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -198,6 +215,7 @@ func StartGatewayProxy(gateway string, log *slog.Logger) (*GatewayProxy, error) 
 		r.Body = http.MaxBytesReader(w, r.Body, gatewayProxyMaxRequestBytes)
 		ctx, cancel := context.WithTimeout(r.Context(), gatewayProxyCallTimeout)
 		defer cancel()
+		ctx = context.WithValue(ctx, cancelKey{}, cancel)
 		rp.ServeHTTP(w, r.WithContext(ctx))
 	})
 	srv := &http.Server{

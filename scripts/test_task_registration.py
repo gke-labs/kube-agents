@@ -290,6 +290,18 @@ class TestEveryTaskIsValid(unittest.TestCase):
             "false; bench-gate would refuse it after the cluster lease:",
         )
 
+    def test_each_line_of_the_permit_pairs_file_is_a_pair(self):
+        # Tree-level, so validate_all() does not carry it and this is the
+        # assertion that gates it.
+        findings = validator.permit_pair_problems()
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nhack/eval/permit-pairs.txt names two cases on each line as a pair: the same "
+            "ask and the same checks, for the platform agent and for a profile "
+            "(docs/designs/permit-pairs.md). These lines break that:\n  " + "\n  ".join(findings),
+        )
+
     def test_no_run_record_is_committed(self):
         # Tree-level like the sanitizer, so validate_all() does not carry it
         # and this is the assertion that gates it.
@@ -463,6 +475,22 @@ class TestTheValidatorItself(unittest.TestCase):
             validator._check_assertions({"type": "ledger_issue_contains", field: []}, "check 'x'", problems)
             self.assertEqual(len(problems), 1, problems)
             self.assertIn("can only pass", problems[0])
+
+    def test_a_delegated_to_check_with_only_min_children_zero_is_rejected(self):
+        """Every chain has at least zero children, so `min_children: 0` alone
+        asserts nothing; with another field set it is a real lower bound."""
+        problems = []
+        validator._check_assertions({"type": "delegated_to", "min_children": 0}, "check 'x'", problems)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("can only pass", problems[0])
+        for node in (
+            {"type": "delegated_to", "min_children": 0, "max_children": 1},
+            {"type": "delegated_to", "min_children": 1},
+            {"type": "delegated_to", "min_children": 0, "required_addressees": ["cluster"]},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
 
     def test_a_finding_scope_without_its_check_is_rejected(self):
         """The verifier's model refuses the pair after the cluster lease; this
@@ -1446,6 +1474,44 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "report_contains", "forbidden_patterns": ["{cluster: a}: no"]}),
         )
 
+    def test_model_placeholder_is_accepted_only_in_report_contains_pattern_lists(self):
+        for key in ("forbidden_patterns", "required_patterns", "any_of_patterns"):
+            with self.subTest(valid_key=key):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]})),
+                    [],
+                )
+        for key in ("required_phrases", "forbidden_phrases", "any_of_phrases"):
+            with self.subTest(phrase_key=key):
+                problem = self._only(
+                    "which only report_contains expands",
+                    verification_spec=self._entry(check={"type": "report_contains", key: ["{model}"]}),
+                )
+                self.assertIn(repr(key), problem)
+        for bad_check in (
+            {"type": "worker_commands", "forbidden_patterns": ["{model}"]},
+            {"type": "tool_called", "tool_names": ["x"], "scope": "workers", "agent": "cluster-{model}"},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"assignee": "{model}"}},
+        ):
+            with self.subTest(bad_check=bad_check):
+                self._only("which only report_contains expands", verification_spec=self._entry(check=bad_check))
+        for valid_non_placeholder in (
+            {"type": "report_contains", "forbidden_patterns": [r'\{"model": "model-default"\}']},
+            {"type": "worker_commands", "required_patterns": [r"jsonpath=\{\.spec\.model\}"]},
+            {"type": "tool_called", "tool_names": ["x"], "arguments": {"body": r'\{"model": "gemini"\}'}},
+        ):
+            with self.subTest(valid_non_placeholder=valid_non_placeholder):
+                self.assertEqual(
+                    self._validate(verification_spec=self._entry(check=valid_non_placeholder)),
+                    [],
+                )
+        for malformed in ("{ model }", "{Model}", "{model:default}"):
+            with self.subTest(malformed=malformed):
+                self._only(
+                    "malformed model placeholder",
+                    verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": [malformed]}),
+                )
+
     def test_a_slotless_overlay_role_is_rejected_in_fixture_roles(self):
         # `orphan-disks` is in the overlay with no slot, so `fixtures:` takes
         # it; the plural asks for a slot the runner never records.
@@ -1686,6 +1752,132 @@ class TestTheRunRecordGuard(unittest.TestCase):
 
     def test_a_file_outside_evidence_passes(self):
         self.assertEqual(self._findings(["a-case/fixture/results.json", "a-case/task.yaml"]), [])
+
+
+class TestThePermitPairRule(unittest.TestCase):
+    """permit_pair_problems() on a temporary pairs file and temporary cases."""
+
+    CHECKS = [{"name": "the-thing-was-done", "role": "objective", "check": {"type": "report_contains", "required_phrases": ["done"]}}]
+    SIDE_B = "[bench:profile name=cluster intent=confirm project=p1 location=us-x1 cluster=c1] Do the thing on this cluster."
+    SIDE_A = "The target of this task: project p1, location us-x1, cluster c1. Do the thing on this cluster."
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+        self.pairs_file = self.root / "permit-pairs.txt"
+        self.thirds = (self.root / "writers-b.txt", self.root / "writers-c.txt")
+        for path in self.thirds:
+            path.write_text("# a third\n")
+        self.pairs_file.write_text("# why\n\nalpha-a alpha-b  # the first pair\n")
+        self._case("alpha-a", prompt=self.SIDE_A)
+        self._case("alpha-b", prompt=self.SIDE_B)
+
+    def _case(self, case, **fields):
+        path = self.root / "tasks" / case / "task.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        spec = {"id": case, "infrastructure": {"deployer": "noop"}, "fixtures": ["a-role"], "verification_spec": self.CHECKS, **fields}
+        path.write_text(yaml.safe_dump({key: value for key, value in spec.items() if value is not None}))
+
+    def _problems(self):
+        task_files = {path.parent.name: path for path in sorted((self.root / "tasks").glob("*/task.yaml"))}
+        return validator.permit_pair_problems(self.pairs_file, task_files, self.thirds)
+
+    def _assert_one(self, needle):
+        problems = self._problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(needle, problems[0])
+        return problems[0]
+
+    def test_a_pair_has_no_finding(self):
+        self.assertEqual(self._problems(), [])
+
+    def test_no_pairs_file_is_no_finding(self):
+        self.pairs_file.unlink()
+        self.assertEqual(self._problems(), [])
+
+    def test_what_a_pair_may_differ_in(self):
+        """The fields that name the case, the wrapping of the ask, and the names of the check entries."""
+        renamed = [{**self.CHECKS[0], "name": "the-platform-agent-did-the-thing"}]
+        self._case("alpha-a", prompt=self.SIDE_A.replace(". Do", ".\n  Do"), verification_spec=renamed, name="A", expected_output="A does it", owner="someone", domain="other")
+        self.assertEqual(self._problems(), [])
+
+    def test_a_side_b_with_no_parameters_has_no_target_sentence(self):
+        self.assertEqual(validator.pair_side_a_prompt("[bench:profile name=fleet-audit] Run the audit."), "Run the audit.")
+
+    def test_another_ask_is_a_finding(self):
+        for label, prompt in (
+            ("more words", self.SIDE_A + " And one thing more."),
+            ("no target sentence", "Do the thing on this cluster."),
+            ("another target", self.SIDE_A.replace("cluster c1", "cluster c2")),
+        ):
+            with self.subTest(label):
+                self._case("alpha-a", prompt=prompt)
+                found = self._assert_one("the asks differ")
+                self.assertTrue(found.startswith("alpha-a / alpha-b: "), found)
+                self.assertIn("change the other side in the same pull request, or remove the pair's line", found)
+
+    def test_each_other_field_is_held_equal(self):
+        other_checks = [{**self.CHECKS[0], "check": {"type": "report_contains", "required_phrases": ["something else"]}}]
+        for label, fields, needle in (
+            ("other checks", {"verification_spec": other_checks}, "`verification_spec` differs (only an entry's name may)"),
+            ("one check more", {"verification_spec": self.CHECKS + other_checks}, "`verification_spec` differs"),
+            ("other fixtures", {"fixtures": ["b-role"]}, "`fixtures` differs"),
+            ("another deployer", {"infrastructure": {"deployer": "tofu"}}, "`infrastructure` differs"),
+            ("a field that one side lacks", {"requested_pull_requests": 2}, "`requested_pull_requests` differs"),
+            ("a marker on one side", {"expected_fail": True}, "`expected_fail` differs"),
+        ):
+            with self.subTest(label):
+                self._case("alpha-a", prompt=self.SIDE_A, **fields)
+                self._assert_one(needle)
+
+    def test_a_side_on_the_wrong_route_is_a_finding(self):
+        self._case("alpha-a", prompt=self.SIDE_B)
+        self.assertTrue(any("side A alpha-a opens with [bench:profile ...], so it does not go to the default route" in found for found in self._problems()))
+        self._case("alpha-a", prompt=self.SIDE_A)
+        self._case("alpha-b", prompt="Do the thing on this cluster.")
+        self._assert_one("side B alpha-b: no [bench:profile ...] directive")
+        self._case("alpha-b", prompt="[bench:profile intent=confirm] Do the thing on this cluster.")
+        self._assert_one("side B alpha-b: [bench:profile: name= is required")
+
+    def test_a_case_that_cannot_be_a_side_is_a_finding(self):
+        self.pairs_file.write_text("alpha-a no-such-case\n")
+        self._assert_one("no-such-case is not a case under bench/tasks/")
+        self.pairs_file.write_text("alpha-a alpha-b\n")
+        (self.root / "tasks" / "alpha-b" / "task.yaml").write_text("- a list\n")
+        self._assert_one("alpha-b: its task file is not a mapping")
+        (self.root / "tasks" / "alpha-b" / "task.yaml").write_text("{")
+        self._assert_one("could not be parsed as YAML")
+        self._case("alpha-b", prompt=None)
+        self._assert_one("a side has no prompt")
+
+    def test_a_line_that_is_not_two_case_ids_is_a_finding(self):
+        for line in ("alpha-a", "alpha-a alpha-b gamma"):
+            with self.subTest(line=line):
+                self.pairs_file.write_text(line + "\n")
+                self._assert_one("is not two case ids, side A then side B")
+
+    def test_a_case_in_the_file_twice_is_a_finding(self):
+        self._case("other-b", prompt=self.SIDE_B)
+        self.pairs_file.write_text("alpha-a alpha-b\nalpha-a other-b\n")
+        self._assert_one("alpha-a is in the file twice")
+
+    def test_the_two_sides_run_in_one_third_of_the_writers_part(self):
+        """A rebalance that moves one side leaves the two on different installs."""
+        self.thirds[1].write_text("alpha-b\n")
+        self._assert_one("the two sides are in different thirds of the writers part (writers-b.txt, writers-c.txt)")
+        self.thirds[1].write_text("alpha-b\nalpha-a\n")
+        self.assertEqual(self._problems(), [])
+        self.thirds[0].write_text("alpha-a\n")
+        self.thirds[1].write_text("alpha-b\n")
+        self._assert_one("different thirds")
+
+    def test_the_cli_reports_a_line_that_is_not_a_pair(self):
+        self._case("alpha-a", prompt=self.SIDE_A + " And one thing more.")
+        output, found = io.StringIO(), self._problems()
+        with mock.patch.object(validator, "permit_pair_problems", return_value=found), contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(validator.main([]), 1)
+        self.assertIn("not a permit pair: alpha-a / alpha-b: the asks differ", output.getvalue())
 
 
 class TestTheSanitizer(unittest.TestCase):

@@ -5,9 +5,10 @@
 # cluster's own agent triages it with nobody asking: the report names the
 # workload, the registry's refusal and the pull secret the pod names, and
 # proposes the fix for a person to authorize. The alert is the product's
-# first signal for this fault, and this case grades it. A daily audit finding
-# for a pull that stays broken is a separate change
-# (gke-labs/kube-agents#4809). The agent holds no Secret access, so the
+# first signal for this fault, and this case grades it. The daily finding
+# for a pull that stays broken is the obtainability-audit's
+# `image-pull-failing` check (3.28), which obtainability-image-pull-failing
+# grades. The agent holds no Secret access, so the
 # triage cannot say what the secret holds or whether it expired; it says
 # what the pod and the registry say. The customer scenario behind the case
 # is a pull secret that expired; the case claims what the plant shows, a

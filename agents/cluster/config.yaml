@@ -163,6 +163,7 @@ plugins:
     # the eval run, case and repetition to each model request's headers for the
     # replay proxy's log (plugins/eval_run_tag/__init__.py). Off, it registers nothing.
     - eval_run_tag
+    - model_identity
 
 # This template is copied verbatim into /opt/cluster-template rather than merged
 # with deploy/shared/defaults/config.yaml, so the probe has to be turned off

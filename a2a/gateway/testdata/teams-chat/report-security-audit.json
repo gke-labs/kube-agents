@@ -1,0 +1,25 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "**Security & RBAC audit: 7 findings, 2 critical.** 2 are new since the last run.\n\n- **critical** seeded-b and -c admit privileged pods\n- **critical** default SA is `cluster-admin` on seeded-c",
+    "actions": [
+      {
+        "data": {
+          "choice": 0,
+          "kageAction": "choice",
+          "label": "look at: seeded-b and -c admit privileged pods",
+          "reply": "look at: seeded-b and -c admit privileged pods"
+        },
+        "style": "positive",
+        "title": "look at: seeded-b and -c admit privileged pods",
+        "type": "Action.Submit"
+      },
+      {
+        "title": "Ledger issue #231 ↗",
+        "type": "Action.OpenUrl",
+        "url": "https://l/231"
+      }
+    ]
+  }
+]

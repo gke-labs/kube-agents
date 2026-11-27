@@ -1672,5 +1672,76 @@ class AgentPullRequestOnAHostQualifiedRepoTest(unittest.TestCase):
         )
 
 
+class SnapshotRefusalEnvelopeTest(BrokerCase):
+    """Verify `ForgeError` preserves `revision` and `entries` locally and across the sandbox hop."""
+
+    def test_direct_refusal_preserves_revision_and_entries(self):
+        entries = [
+            {"path": "docs", "type": "tree", "bytes": 4096},
+            {"path": "src", "type": "tree", "bytes": 20000000},
+        ]
+        self.broker.refuse["snapshot"] = vcs_client.VcsError(
+            "snapshot exceeds ceiling",
+            code="SNAPSHOT_TOO_LARGE",
+            detail="name paths to narrow",
+            revision="abc123def456",
+            entries=entries,
+        )
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("snapshot", {"maxBytes": 8388608}, REPO)
+        self.assertEqual(ctx.exception.reason, "SNAPSHOT_TOO_LARGE")
+        self.assertEqual(ctx.exception.revision, "abc123def456")
+        self.assertEqual(ctx.exception.entries, entries)
+
+    def test_sandbox_hop_round_trips_revision_and_entries(self):
+        entries = [{"path": "knowledge", "type": "tree", "bytes": 1024}]
+        self.broker.refuse["snapshot"] = vcs_client.VcsError(
+            "snapshot exceeds ceiling",
+            code="SNAPSHOT_TOO_LARGE",
+            detail="narrow with paths",
+            revision="feedface1234",
+            entries=entries,
+        )
+
+        def far_side(argv, **kwargs):
+            out = io_text("")
+            with mock.patch.object(sys, "stdin", io_text(kwargs["stdin"])), \
+                 mock.patch.object(sys, "stdout", out):
+                rc = forge.main(argv[2:])
+            return subprocess.CompletedProcess(argv, rc, stdout=out.getvalue(), stderr="")
+
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", lambda: True), \
+             mock.patch.object(sandbox_exec, "run", far_side):
+            with self.assertRaises(forge.ForgeError) as ctx:
+                forge.call("snapshot", {"maxBytes": 8388608}, REPO)
+
+        self.assertEqual(ctx.exception.reason, "SNAPSHOT_TOO_LARGE")
+        self.assertEqual(ctx.exception.revision, "feedface1234")
+        self.assertEqual(ctx.exception.entries, entries)
+
+    def test_sandbox_hop_round_trips_path_not_found_revision_without_entries(self):
+        self.broker.refuse["snapshot"] = vcs_client.VcsError(
+            "path not found",
+            code="PATH_NOT_FOUND",
+            revision="deadbeef9999",
+        )
+
+        def far_side(argv, **kwargs):
+            out = io_text("")
+            with mock.patch.object(sys, "stdin", io_text(kwargs["stdin"])), \
+                 mock.patch.object(sys, "stdout", out):
+                rc = forge.main(argv[2:])
+            return subprocess.CompletedProcess(argv, rc, stdout=out.getvalue(), stderr="")
+
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", lambda: True), \
+             mock.patch.object(sandbox_exec, "run", far_side):
+            with self.assertRaises(forge.ForgeError) as ctx:
+                forge.call("snapshot", {"paths": ["docs"]}, REPO)
+
+        self.assertEqual(ctx.exception.reason, "PATH_NOT_FOUND")
+        self.assertEqual(ctx.exception.revision, "deadbeef9999")
+        self.assertIsNone(ctx.exception.entries)
+
+
 if __name__ == "__main__":
     unittest.main()

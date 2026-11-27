@@ -125,6 +125,12 @@ class TranscriptSnapshot:
     # ``delegated_to`` reports as ``status="error"``; empty when the chain
     # delegated nothing.
     child_addressees: list[str] | None = None
+    # How many child tasks that chain minted, every delegation counted, so
+    # two to ``platform`` count 2 where ``child_addressees`` names it once.
+    # ``None`` when the run could not say, for the same reasons, which
+    # ``delegated_to``'s count bounds report as ``status="error"``; ``0`` when
+    # the chain delegated nothing.
+    child_count: int | None = None
 
 
 _current: TranscriptSnapshot | None = None
@@ -142,6 +148,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
     worker_card_parents: dict[str, str] | None = None,
     worker_runs: list[dict[str, Any]] | None = None,
     child_addressees: list[str] | None = None,
+    child_count: int | None = None,
 ) -> None:
     """Stash the just-finished run's transcript for the verifiers.
 
@@ -163,6 +170,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
         worker_card_parents=None if worker_card_parents is None else dict(worker_card_parents),
         worker_runs=None if worker_runs is None else [dict(r) for r in worker_runs],
         child_addressees=None if child_addressees is None else list(child_addressees),
+        child_count=child_count,
     )
 
 

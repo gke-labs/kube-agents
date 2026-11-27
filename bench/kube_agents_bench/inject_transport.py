@@ -173,6 +173,12 @@ LEAVE_LINE_MESSAGE_ID_SUFFIX = "-leave-line"
 # task's ``changeRequested``). A door not armed for it (A2A_INJECT_CONFIRM)
 # answers 400; the gateway refuses every other value, and so does this side.
 INTENT_FIELD = "intent"
+# The POST body's optional replyTo (``injectRequest.ReplyTo`` in
+# ``a2a/gateway/inject.go``): the task a relayed report on the conversation
+# was on, when the turn answers that report. The gateway attaches the report it
+# kept under that root in this conversation to the turn; an inject
+# conversation is not thread-keyed, so a turn without it carries none.
+REPLY_TO_FIELD = "replyTo"
 INTENT_CONFIRM = "confirm"
 INTENTS = frozenset({INTENT_CONFIRM})
 
@@ -188,6 +194,9 @@ ENTRY_TERMINAL = "terminal"
 # landing between one task's marker and the next is not graded as the answer.
 ENTRY_REPORT_FIELD = "report"
 ENTRY_REPLY_TO_FIELD = "replyTo"
+# On a relayed entry, the one post the gateway keeps under its root for the
+# next human turn: the card's settled report, not a progress line.
+ENTRY_KEPT_FIELD = "kept"
 
 # Trajectory entry names this transport records. The relay never posts
 # `activity` artifacts to a conversation (they are debug and audit views), so
@@ -269,6 +278,12 @@ PROBE_USAGE_PARTIAL_KEY = "usagePartial"
 # older than the field omits the key, which reads as ``None`` here, "can't
 # say", never as "delegated nothing" (``delegated_to`` errors on it).
 PROBE_CHILD_ADDRESSEES_KEY = "childAddressees"
+# How many child tasks the chain minted, every delegation counted, so two to
+# platform read 2 where ``childAddressees`` names platform once. Sent on every
+# read like the addressees: ``0`` when nothing was delegated, ``null`` for a
+# task the door could not find, and absent on an older door, which reads as
+# ``None``, "can't say", never as zero (``delegated_to`` errors on it).
+PROBE_CHILD_COUNT_KEY = "childCount"
 USAGE_READ_ATTEMPTS = 2
 # How the usage read went, on ``Fold.usage_read``, so a result with null
 # buckets can say why (``tokens_note`` on the harness's result): no read was made (the
@@ -435,6 +450,9 @@ REASON_HERMES_API_REFUSED = "hermes-api-refused"
 # The task waited out its deadline behind an earlier turn in the same session
 # and was never sent: the persona never saw the prompt.
 REASON_SESSION_BUSY = "session-busy"
+# The bridge recovered a panic while handling the task and ended it failed
+# with no answer: the bridge's own fault, not the persona's.
+REASON_INTERNAL_PANIC = "internal-panic"
 INFRASTRUCTURE_REASONS = frozenset(
     {
         REASON_BRIDGE_SHUTDOWN,
@@ -448,6 +466,7 @@ INFRASTRUCTURE_REASONS = frozenset(
         REASON_HERMES_API_UNREACHABLE,
         REASON_HERMES_API_REFUSED,
         REASON_SESSION_BUSY,
+        REASON_INTERNAL_PANIC,
     }
 )
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
@@ -725,6 +744,15 @@ def _child_addressees(raw: Any) -> list[str] | None:
     return list(raw)
 
 
+def _child_count(raw: Any) -> int | None:
+    """The probe's ``childCount``, or ``None`` when it can't say: absent, null,
+    a bool, a float, or negative. A bad value is never read as zero, which
+    would vouch for a chain that delegated nothing."""
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
 def _usage_counts(raw: Any) -> dict[str, int | None] | None:
     """A usage object's two counts, ``{"input": n, "output": n}``, a count that
     cannot be read as ``None``; ``None`` whole when ``raw`` is no object."""
@@ -855,6 +883,10 @@ class Fold:
     # Whether the read that ended the wait carried no trace the fold could
     # adopt, so ``activity`` is an earlier read's (:meth:`note_trace_stale`).
     activity_stale: bool = False
+    # Inputs read from the session pod's own capture for parts that arrived
+    # without one, by the part's index in ``activity``
+    # (:meth:`fill_inputs`, :mod:`kube_agents_bench.session_trajectory`).
+    captured_inputs: dict[int, Any] = field(default_factory=dict)
     progress: str = ""
     # The front door's and the chain's children's token counts, from the
     # read after the terminal that asks for them (:meth:`InjectTask._read_usage`);
@@ -870,6 +902,10 @@ class Fold:
     # (:meth:`InjectTask._note`) and the read after the terminal last;
     # ``None`` until a read answers with it.
     child_addressees: list[str] | None = None
+    # How many children the chain minted (:data:`PROBE_CHILD_COUNT_KEY`), kept
+    # from the same reads as ``child_addressees``; ``None`` until one answers
+    # with it.
+    child_count: int | None = None
     terminal: str = ""
     terminal_source: str = ""
     terminal_reason: str = ""
@@ -916,6 +952,28 @@ class Fold:
         self.activity_dropped = dropped
         self.activity_malformed = malformed
         self.activity_stale = False
+        self.captured_inputs = {}
+
+    def call_parts(self) -> list[tuple[int, dict[str, Any]]]:
+        """The parts :meth:`activity_entries` writes as calls, each with its
+        index in ``activity``, in stream order: not the bridge's truncated
+        stand-in, not a card worker's, not one with no tool name."""
+        out: list[tuple[int, dict[str, Any]]] = []
+        for index, part in enumerate(self.activity or []):
+            if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
+                continue
+            worker = part.get(ACTIVITY_WORKER_KEY)
+            if worker is not None and (not isinstance(worker, str) or worker.startswith(ACTIVITY_WORKER_PREFIXES)):
+                continue
+            tool = part.get(ACTIVITY_TOOL_KEY)
+            if isinstance(tool, str) and tool:
+                out.append((index, part))
+        return out
+
+    def fill_inputs(self, inputs: dict[int, Any]) -> None:
+        """Take the inputs the session pod's capture holds for parts that
+        carry none, by part index (``session_trajectory.merge``)."""
+        self.captured_inputs = dict(inputs)
 
     def note_trace_stale(self) -> None:
         """The read that ended the wait carried no trace this fold could adopt.
@@ -938,8 +996,9 @@ class Fold:
         "status": ...}``, the api transport's ``ToolCall.to_dict`` shape,
         with the part's own status word (``completed``, ``error``,
         ``interrupted``) or the api shape's ``called`` when the part has
-        none. A part with no ``input`` maps to empty args; an input that is
-        not an object is kept under the key it arrived by. The bridge's
+        none. A part with no ``input`` takes the one the session pod's
+        capture holds for it (:meth:`fill_inputs`), or maps to empty args;
+        an input that is not an object is kept under the key it arrived by. The bridge's
         ``truncated`` stand-in for calls past its budget is a count and not
         a call: its ``dropped`` joins the door's ``activityDropped`` in the
         marker and no entry is written for it, and a part with no tool name
@@ -975,7 +1034,7 @@ class Fold:
         dropped = self.activity_dropped
         malformed = self.activity_malformed
         input_truncated = 0
-        for part in self.activity:
+        for index, part in enumerate(self.activity):
             if part.get(ACTIVITY_STATUS_KEY) == ACTIVITY_STATUS_TRUNCATED:
                 # The stand-in exists only because calls were dropped; a
                 # count this side cannot read is still a loss, on
@@ -997,6 +1056,11 @@ class Fold:
                 malformed += 1
                 continue
             raw_input = part.get(ACTIVITY_INPUT_KEY)
+            if raw_input is None:
+                # The part's own input wins whenever it has one (a gateway
+                # that still publishes inputs); the session pod's capture
+                # fills only a part that arrived without one.
+                raw_input = self.captured_inputs.get(index)
             if isinstance(raw_input, dict):
                 args = raw_input
                 if (
@@ -1178,6 +1242,8 @@ class Fold:
             self.reports.append({
                 "kind": kind, "messageId": entry_message_id, "text": text,
                 "replyTo": str(entry.get(ENTRY_REPLY_TO_FIELD) or ""), "inWindow": self.in_window,
+                "kept": entry.get(ENTRY_KEPT_FIELD) is True,
+                "seq": entry["seq"],
             })
             self._record(EVENT_ENTRY_POST if kind == ENTRY_POST else EVENT_ENTRY_EDIT,
                          {"messageId": entry_message_id, ENTRY_REPORT_FIELD: True}, text)
@@ -1299,6 +1365,9 @@ class Probe:
     # The body's ``childAddressees`` (:data:`PROBE_CHILD_ADDRESSEES_KEY`):
     # ``None`` when the key was absent, null, or not a list of strings.
     child_addressees: list[str] | None = None
+    # The body's ``childCount`` (:data:`PROBE_CHILD_COUNT_KEY`): ``None`` when
+    # the key was absent, null, or not a non-negative integer.
+    child_count: int | None = None
     last_post: str = ""
     error: str = ""
     # The conversation's A2A contextId, from the gateway's session record;
@@ -1363,6 +1432,7 @@ class Probe:
             child_usage=_usage_counts(raw.get(PROBE_CHILD_USAGE_KEY)),
             usage_partial=raw.get(PROBE_USAGE_PARTIAL_KEY) is True,
             child_addressees=_child_addressees(raw.get(PROBE_CHILD_ADDRESSEES_KEY)),
+            child_count=_child_count(raw.get(PROBE_CHILD_COUNT_KEY)),
             last_post=str(last_post.get("text") or "") if isinstance(last_post, dict) else "",
             error=str(raw.get("error") or ""),
             context_id=str(raw.get("contextId") or ""),
@@ -1553,6 +1623,7 @@ class InjectTask:
         profile: str = "",
         parameters: dict[str, str] | None = None,
         intent: str = "",
+        reply_to: str = "",
     ) -> None:
         # Refused here, before anything is sent: a typo would otherwise cost a
         # lease to learn from the door's 400.
@@ -1571,6 +1642,13 @@ class InjectTask:
         # parameters (profile_hook, #5945); empty sends the turn as any other.
         self.profile = profile
         self.parameters = dict(parameters or {})
+        # The task whose relayed report the turn answers (REPLY_TO_FIELD);
+        # empty sends the turn under no report, as every turn was sent before.
+        self.reply_to = reply_to
+        # The conversation's session record (its contextId) as the last read
+        # the door answered reported it, kept across a transport failure so a
+        # caller that has to clean up after the turn still knows its session.
+        self.last_context_id = ""
         self.token = token
         self.author = author
         # The backend message id, which the gateway's ingress log joins to the
@@ -1672,6 +1750,8 @@ class InjectTask:
                 payload["parameters"] = self.parameters
         if self.intent:
             payload[INTENT_FIELD] = self.intent
+        if self.reply_to:
+            payload[REPLY_TO_FIELD] = self.reply_to
         self.unanswered_post = True
         try:
             body = _request(
@@ -1728,6 +1808,39 @@ class InjectTask:
                 self.note,
             )
         return self.task_id
+
+    def await_relayed_report(self, root: str, deadline: float) -> dict[str, Any] | None:
+        """Read the conversation until a relayed report post about ``root`` lands.
+
+        A post the door marks ``report`` (:data:`ENTRY_REPORT_FIELD`, kept
+        apart in :attr:`Fold.reports`) whose ``replyTo`` names ``root``: the
+        task whose turn filed the work, which is the root the gateway keeps
+        the report by for the next human turn on the conversation. An edit
+        is not one (it rewrites a post already relayed), and neither is a
+        relayed post about another task or a post on another conversation:
+        the read route serves this conversation's transcript alone.
+
+        Returns that report (:attr:`Fold.reports`' shape, with its ``seq``),
+        or ``None`` when none landed by ``deadline`` (``time.monotonic()``).
+        The reads are unprobed and name no task, so they start nothing and
+        ask the record nothing; the transcript is read from its start.
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached or was lost.
+        """
+        fold = Fold(self.task_id)
+        after = 0
+        while True:
+            for report in fold.reports:
+                if report["kind"] == ENTRY_POST and report["kept"] and report["replyTo"] == root:
+                    return report
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            body = self._poll("", after, remaining, probe=False)
+            after, fresh = self._absorb(fold, body, after)
+            if not fresh:
+                time.sleep(min(POLL_PAUSE_SECONDS, max(0.0, deadline - time.monotonic())))
 
     def leave_line(self) -> bool:
         """Take a turn the gateway queued at the session cap out of its line.
@@ -1963,6 +2076,7 @@ class InjectTask:
             adopted = False
             if answered is not None:
                 probe = answered
+                self.last_context_id = answered.context_id or self.last_context_id
                 adopted = self._note(fold, task_id, answered)
                 if answered.could_look and answered.concerns(task_id) and not fold.final:
                     if answered.final:
@@ -2038,6 +2152,8 @@ class InjectTask:
             fold.usage_read = USAGE_READ_ANSWERED
             if answered.child_addressees is not None:
                 fold.child_addressees = answered.child_addressees
+            if answered.child_count is not None:
+                fold.child_count = answered.child_count
             if answered.usage is None and answered.child_usage is None and not answered.usage_partial:
                 return
             fold.usage = answered.usage
@@ -2094,6 +2210,8 @@ class InjectTask:
             # (the deadline, a transient error) still has it.
             if probe.child_addressees is not None:
                 fold.child_addressees = probe.child_addressees
+            if probe.child_count is not None:
+                fold.child_count = probe.child_count
         if probe.could_look and probe.concerns(task_id) and not probe.final and not fold.final:
             if probe.reached_working:
                 # The read shows the latest state; ``working`` may have come

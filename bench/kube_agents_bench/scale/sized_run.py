@@ -198,6 +198,7 @@ def run(
     *, project: str, host_cluster: str, host_context: str, namespace: str,
     check_fleet: Callable[[], dict[str, Any]], soak_seconds: int = SOAK_SECONDS,
     install: collect.Install | None = None, during_soak: Callable[[], None] | None = None,
+    before_reset: Callable[[], None] | None = None,
     clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[RunRecord, dict[str, Any]]:
     """Reset the install, run the burst and soak windows, and return what was read and the verdict.
@@ -209,6 +210,12 @@ def run(
     others = tuple(job for job in wanted if job not in first_run)
     record = RunRecord(started=clock())
     record.fleet_check = check_fleet()
+    if before_reset is not None:
+        # The reset deletes the install's session records; this keeps them first.
+        try:
+            before_reset()
+        except Exception as exc:  # noqa: BLE001 -- keeping the records never stops the run
+            record.errors.append(f"the records before the reset were not kept: {exc}")
     LOG.info("resetting the install's state")
     operations.reset(host_context, namespace)
     record.started = clock()

@@ -134,7 +134,7 @@ func TestPersonaIntegrityIsLogged(t *testing.T) {
 	} {
 		var buf bytes.Buffer
 		log := slog.New(slog.NewTextHandler(&buf, nil))
-		if _, err := renderPersona(ProfileWorkerConfig{PersonaDir: tc.dir, Harness: persona.ClaudeCode}, persona.Delegate{}, log); err != nil {
+		if _, _, err := renderPersona(ProfileWorkerConfig{PersonaDir: tc.dir, Harness: persona.ClaudeCode}, persona.Delegate{}, log); err != nil {
 			t.Fatal(err)
 		}
 		if !strings.Contains(buf.String(), tc.want) || !strings.Contains(buf.String(), tc.level) {

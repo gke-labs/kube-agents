@@ -2968,6 +2968,73 @@ class PlatformFrontDoorTest(unittest.TestCase):
             self.assertIn("developer_knowledge", updated)
 
 
+class BuiltinScheduleSuspendStepTest(unittest.TestCase):
+    """Step 2.6 hands the operator's suspend setting to the roster merge.
+
+    PlatformAgent spec.schedules reaches the pod as KUBE_AGENTS_BUILTIN_SCHEDULES. The
+    scaffold script's own tests cover what the setting does; this runs the shipped step
+    to prove the variable gets there, and that a start without it changes nothing.
+    """
+
+    _STEP = 'if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLATE" ] && [ -f "$SCAFFOLD" ]; then'
+
+    def _start(self, root, setting):
+        template = root / "platform-template"
+        (template / "cron").mkdir(parents=True, exist_ok=True)
+        roster = {"jobs": [{"id": "compliance-audit", "enabled": True}, {"id": "stall-watch", "enabled": True}]}
+        (template / "cron" / "jobs.json").write_text(json.dumps(roster), encoding="utf-8")
+        home = root / "data" / "profiles" / "platform"
+        (home / "cron").mkdir(parents=True, exist_ok=True)
+        (home / "profile.yaml").write_text("name: platform\n", encoding="utf-8")
+        if not (home / "cron" / "jobs.json").exists():
+            (home / "cron" / "jobs.json").write_text(json.dumps(roster), encoding="utf-8")
+        venv = root / "install" / ".venv" / "bin"
+        venv.mkdir(parents=True, exist_ok=True)
+        wrapper = venv / "python3"
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        script = "set -e\n"
+        for name in ("platform_is_front_door", "platform_sync_items"):
+            script += _extract_shell_function(name) + "\n"
+        script += _extract_shell_block(self._STEP)
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PLATFORM_TEMPLATE": str(template),
+            "TARGET_DIR": str(root / "data"),
+            "INSTALL_DIR": str(root / "install"),
+            "SCAFFOLD": str(_REPO / "agents" / "platform" / "scripts" / "profile_scaffold.py"),
+        }
+        if setting is not None:
+            env["KUBE_AGENTS_BUILTIN_SCHEDULES"] = setting
+        proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        jobs = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8"))["jobs"]
+        return {j["id"]: j["enabled"] for j in jobs}, proc
+
+    def test_the_setting_reaches_the_merge_and_lifts_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            enabled, proc = self._start(root, '{"suspendAll":true,"overrides":{"stall-watch":false}}')
+            self.assertNotIn("WARN", proc.stderr)
+            self.assertEqual(enabled, {"compliance-audit": False, "stall-watch": True})
+            enabled, _ = self._start(root, '{"suspendAll":false,"overrides":{}}')
+            self.assertEqual(enabled, {"compliance-audit": True, "stall-watch": True})
+
+    def test_a_start_without_the_variable_follows_the_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            enabled, proc = self._start(pathlib.Path(tmp), None)
+            self.assertNotIn("WARN", proc.stderr)
+            self.assertEqual(enabled, {"compliance-audit": True, "stall-watch": True})
+
+    def test_an_unreadable_setting_warns_and_leaves_the_roster_as_it_was(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self._start(root, '{"suspendAll":true,"overrides":{}}')
+            enabled, proc = self._start(root, "{not json")
+            self.assertIn("WARN: platform profile force-sync failed", proc.stderr)
+            self.assertEqual(enabled, {"compliance-audit": False, "stall-watch": False})
+
+
 class ApiKeyPinCheckTest(unittest.TestCase):
     """The startup self-check for issue #786.
 

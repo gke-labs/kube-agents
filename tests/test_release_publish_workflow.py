@@ -35,6 +35,23 @@ _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "release-publish.yml"
 _GATE_JOB = "evaluate-schedule"
 _PUBLISH_JOB = "publish-release"
 _FORK_GUARD = "github.repository == 'gke-labs/kube-agents'"
+# The sign-in to the Artifact Registry repositories the job reads or writes.
+# It comes before the eligibility check, which is the first read, and
+# publishes nothing.
+_ARTIFACT_REGISTRY_AUTH_STEP = "Authenticate to Google Cloud for the Artifact Registry repositories"
+_ARTIFACT_REGISTRY_HOSTS_STEP = "Resolve the Artifact Registry hosts"
+_CANDIDATE_LOGIN_STEP = "Log in to the candidate registry"
+_ADDITIONAL_LOGIN_STEP = "Log in to the additional release registry"
+_ARTIFACT_REGISTRY_LOGIN_STEPS = (
+    _ARTIFACT_REGISTRY_HOSTS_STEP,
+    _ARTIFACT_REGISTRY_AUTH_STEP,
+    _CANDIDATE_LOGIN_STEP,
+    _ADDITIONAL_LOGIN_STEP,
+)
+_HOSTS_SCRIPT = "./scripts/release/resolve_artifact_registry_hosts.sh"
+_CANDIDATE_HOST = "steps.artifact-registry-hosts.outputs.candidate"
+_ADDITIONAL_HOST = "steps.artifact-registry-hosts.outputs.additional"
+_ACCESS_TOKEN = "${{ steps.artifact-registry-auth.outputs.access_token }}"
 
 
 def _load():
@@ -168,6 +185,7 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
                 "Generate Release Bot Token",
                 "Checkout repository",
                 "Calculate Next Release Version",
+                *_ARTIFACT_REGISTRY_LOGIN_STEPS,
                 "Verify Release Eligibility",
             )
         ]
@@ -240,6 +258,74 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
             with self.subTest(step=step):
                 self.assertEqual(self._step(job, step)["env"]["RELEASE_LINE"], "${{ inputs.release_line }}")
         self.assertNotIn("RELEASE_LINE", self._step(_PUBLISH_JOB, "Create Git Tag").get("env", {}))
+
+
+class RegistryWiringTest(unittest.TestCase):
+    """The publish job reads the commit's images from vars.CANDIDATE_REGISTRY_PREFIX
+    and publishes to vars.ADDITIONAL_RELEASE_REGISTRY_PREFIX beside the registry prefix.
+
+    Unset, every script falls back to the one registry and no sign-in step
+    runs. For an Artifact Registry repository in either, the job signs in to
+    Google once before the first read and logs docker in to each host.
+    """
+
+    def setUp(self):
+        self.job = _load()["jobs"][_PUBLISH_JOB]
+        self.steps = self.job["steps"]
+        self.names = [step.get("name") for step in self.steps]
+
+    def _step(self, name):
+        return self.steps[self.names.index(name)]
+
+    def test_every_step_reads_the_same_two_variables(self):
+        """Job-level, so the eligibility check, the promotion, the signing and
+        the chart cannot disagree; no step overrides either."""
+        for variable in ("CANDIDATE_REGISTRY_PREFIX", "ADDITIONAL_RELEASE_REGISTRY_PREFIX"):
+            self.assertEqual(self.job["env"][variable], f"${{{{ vars.{variable} }}}}")
+            for step in self.steps:
+                self.assertNotIn(variable, step.get("env", {}), step.get("name"))
+
+    def test_the_sign_in_comes_before_the_first_read(self):
+        first_read = self.names.index("Verify Release Eligibility")
+        positions = [self.names.index(name) for name in _ARTIFACT_REGISTRY_LOGIN_STEPS]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(positions[-1], first_read)
+
+    def test_the_hosts_come_from_the_script_before_any_credential_exists(self):
+        """The script validates each host; the workflow tests no variable itself."""
+        hosts = self._step(_ARTIFACT_REGISTRY_HOSTS_STEP)
+        self.assertEqual(hosts["id"], "artifact-registry-hosts")
+        self.assertEqual(hosts["run"], _HOSTS_SCRIPT)
+        self.assertNotIn("if", hosts)
+        self.assertLess(self.names.index(_ARTIFACT_REGISTRY_HOSTS_STEP), self.names.index(_ARTIFACT_REGISTRY_AUTH_STEP))
+        for step in self.steps:
+            self.assertNotIn("docker.pkg.dev", str(step.get("if", "")), step.get("name"))
+
+    def test_each_step_runs_only_for_a_host_the_script_resolved(self):
+        self.assertEqual(
+            self._step(_ARTIFACT_REGISTRY_AUTH_STEP).get("if"), f"{_CANDIDATE_HOST} != '' || {_ADDITIONAL_HOST} != ''"
+        )
+        self.assertEqual(self._step(_CANDIDATE_LOGIN_STEP).get("if"), f"{_CANDIDATE_HOST} != ''")
+        self.assertEqual(self._step(_ADDITIONAL_LOGIN_STEP).get("if"), f"{_ADDITIONAL_HOST} != ''")
+
+    def test_docker_logs_in_to_the_resolved_host_with_the_minted_token(self):
+        auth = self._step(_ARTIFACT_REGISTRY_AUTH_STEP)
+        self.assertEqual(auth["id"], "artifact-registry-auth")
+        self.assertEqual(auth["with"]["token_format"], "access_token")
+        for name, host in ((_CANDIDATE_LOGIN_STEP, _CANDIDATE_HOST), (_ADDITIONAL_LOGIN_STEP, _ADDITIONAL_HOST)):
+            login = self._step(name)
+            self.assertEqual(login["with"]["registry"], f"${{{{ {host} }}}}")
+            self.assertEqual(login["with"]["username"], "oauth2accesstoken")
+            self.assertEqual(login["with"]["password"], _ACCESS_TOKEN)
+
+    def test_helm_is_handed_the_token_for_the_additional_registry(self):
+        """Helm keeps its own logins and does not read docker's."""
+        chart = self._step("Package, Publish and Sign Helm Chart")
+        self.assertEqual(chart["env"]["ADDITIONAL_RELEASE_REGISTRY_TOKEN"], _ACCESS_TOKEN)
+
+    def test_the_job_may_mint_the_google_credential(self):
+        self.assertEqual(self.job["permissions"]["id-token"], "write")
+
 
 if __name__ == "__main__":
     unittest.main()

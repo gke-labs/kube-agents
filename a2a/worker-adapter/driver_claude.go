@@ -20,6 +20,11 @@ const (
 	// the agent SDK passes it alongside --input-format stream-json, the
 	// shape harnessCommand builds.
 	harnessResumeFlag = "--resume"
+	// claudeSkillTool is the tool Claude Code loads a skill with (the
+	// skillTool of lib/persona/claudecode), and claudeSkillInputKey the key
+	// of its input that names the skill.
+	claudeSkillTool     = "Skill"
+	claudeSkillInputKey = "skill"
 )
 
 func (claudeDriver) Harness() persona.Harness { return persona.ClaudeCode }
@@ -90,6 +95,32 @@ func (claudeDecoder) Decode(line []byte) ([]Event, error) {
 	return nil, nil
 }
 
+// rawString is raw as a JSON string, or "" when it is absent or another
+// shape.
+func rawString(raw json.RawMessage) string {
+	var s string
+	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// rawTrue reports whether raw is the JSON value true.
+func rawTrue(raw json.RawMessage) bool {
+	var b bool
+	return len(raw) > 0 && json.Unmarshal(raw, &b) == nil && b
+}
+
+// claudeSkillName is the skill a Skill call's input names, or "" when the
+// input names none as a string.
+func claudeSkillName(input json.RawMessage) string {
+	var fields map[string]json.RawMessage
+	if len(input) == 0 || json.Unmarshal(input, &fields) != nil {
+		return ""
+	}
+	return rawString(fields[claudeSkillInputKey])
+}
+
 // toolResultBlockType is a user line's content block that answers a tool call.
 const toolResultBlockType = "tool_result"
 
@@ -112,7 +143,11 @@ func (ev harnessEvent) assistantEvents() []Event {
 				out = append(out, Event{Kind: EventProgress, Text: block.Text})
 			}
 		case "tool_use":
-			out = append(out, Event{Kind: EventActivity, Tool: block.Name, Input: block.Input})
+			e := Event{Kind: EventActivity, Tool: block.Name, Input: block.Input, CallID: rawString(block.ID)}
+			if block.Name == claudeSkillTool {
+				e.SkillCall, e.Skill = true, claudeSkillName(block.Input)
+			}
+			out = append(out, e)
 		}
 	}
 	return out
@@ -120,10 +155,11 @@ func (ev harnessEvent) assistantEvents() []Event {
 
 // toolResultEvents is one EventToolResult per tool_result block on a user
 // line: a line carries one block per tool call it answers, and parallel calls
-// share a line. A block's content goes on the event as the answer's scrub
-// reads it (toolResultRaw): a JSON string as it is, a list of content blocks
-// as one JSON list of its text blocks' texts (an image's data is not read).
-// A block with no content is still an event, with none.
+// share a line. It carries the id of the call the block answers and the
+// block's error flag. A block's content goes on the event as the answer's
+// scrub reads it (toolResultRaw): a JSON string as it is, a list of content
+// blocks as one JSON list of its text blocks' texts (an image's data is not
+// read). A block with no content is still an event, with none.
 func (ev harnessEvent) toolResultEvents() []Event {
 	if ev.Message == nil {
 		return nil
@@ -133,7 +169,7 @@ func (ev harnessEvent) toolResultEvents() []Event {
 		if block.Type != toolResultBlockType {
 			continue
 		}
-		e := Event{Kind: EventToolResult}
+		e := Event{Kind: EventToolResult, CallID: rawString(block.ToolUseID), Failed: rawTrue(block.IsError)}
 		if len(block.Content) > 0 {
 			e.ToolResult = toolResultRaw(block.Content)
 		}
@@ -317,6 +353,13 @@ type harnessBlock struct {
 	// on a user message: a JSON string, or a list of content blocks (text,
 	// image). Read only for the answer's scrub (toolResultEvents).
 	Content json.RawMessage `json:"content,omitempty"`
+	// ID is a tool_use block's id, ToolUseID the same id on the tool_result
+	// block that answers it, and IsError that block's error flag. Each is
+	// held raw and read on its own (rawString, rawTrue): an off-shape one is
+	// that field dropped, never the line with the tool call.
+	ID        json.RawMessage `json:"id,omitempty"`
+	ToolUseID json.RawMessage `json:"tool_use_id,omitempty"`
+	IsError   json.RawMessage `json:"is_error,omitempty"`
 }
 
 // userMessage is the stream-json stdin shape for both the opening prompt and

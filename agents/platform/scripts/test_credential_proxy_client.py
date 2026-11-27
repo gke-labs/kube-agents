@@ -1526,6 +1526,68 @@ class VcsCallErrorTest(unittest.TestCase):
             with self.subTest(answer=answer), self._no_token_file, self._answer(json.dumps(answer).encode()):
                 self.assertEqual(credential_proxy_client.vcs_call(self.endpoint, "capabilities", {}), answer)
 
+    def test_a_draining_503_refusal_is_retried(self):
+        draining = json.dumps(
+            {
+                "status": "busy",
+                "code": "CREDENTIAL_PROXY_BUSY",
+                "bound": "draining",
+                "before_admission": True,
+                "error": "draining",
+            }
+        ).encode()
+        ok_body = json.dumps({"baseBranch": "main"}).encode()
+        calls = 0
+
+        def open_req(request, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "Service Unavailable", {"Retry-After": "1"}, io.BytesIO(draining)
+                )
+            return io.BytesIO(ok_body)
+
+        sleeps = []
+        with self._no_token_file, patch.object(credential_proxy_client, "open_broker_request", open_req):
+            answer = credential_proxy_client.vcs_call(
+                self.endpoint,
+                "capabilities",
+                {},
+                clock=lambda: 0.0,
+                sleep_fn=sleeps.append,
+                rng=type("R", (), {"uniform": staticmethod(lambda a, b: b)})(),
+            )
+        self.assertEqual({"baseBranch": "main"}, answer)
+        self.assertEqual(2, calls)
+        self.assertEqual(1, len(sleeps))
+
+    def test_a_forge_429_rate_limit_is_not_retried(self):
+        rate_limited = json.dumps({"error": "rate limited", "code": "FORGE_RATE_LIMITED"}).encode()
+        calls = 0
+
+        def open_req(request, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", {"Retry-After": "1"}, io.BytesIO(rate_limited)
+            )
+
+        sleeps = []
+        with self._no_token_file, patch.object(credential_proxy_client, "open_broker_request", open_req):
+            with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+                credential_proxy_client.vcs_call(
+                    self.endpoint,
+                    "proposal-claim",
+                    {},
+                    clock=lambda: 0.0,
+                    sleep_fn=sleeps.append,
+                )
+        self.assertEqual(429, caught.exception.status)
+        self.assertEqual("FORGE_RATE_LIMITED", caught.exception.payload.get("code"))
+        self.assertEqual(1, calls)
+        self.assertEqual([], sleeps)
+
 
 class TestCallerCredential(SubmittedPayloadTestCase):
     """The client half of the broker's authentication.
@@ -4353,6 +4415,232 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         text = self.worker_kubeconfig.read_text(encoding="utf-8")
         self.assertIn(f"current-context: {self.TARGET_CTX}", text)
         self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+
+class LoopbackKubeProxyKubeconfigTest(unittest.TestCase):
+    """A profile worker's `KUBE_PROXY_URL` is its adapter's loopback proxy, plain http on
+    127.0.0.1, which attaches the credentials itself. The kubeconfig for it names no CA and
+    no token file; every other URL, plain http to another host included, gets both."""
+
+    LOOPBACK_URL = "http://127.0.0.1:41873"
+    HTTPS_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+    TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+    NOT_LOOPBACK = (
+        HTTPS_URL,
+        "https://127.0.0.1:8443",
+        "http://kube-proxy.kubeagents-system.svc:8443",
+        "http://127.0.0.2:8443",
+        "http://localhost:8443",
+        "http://127.0.0.1",
+        "http://127.0.0.1:8443/prefix",
+        "http://127.0.0.1:8443@elsewhere",
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.kubeconfig = self.root / ".kubeconfig"
+
+    def build(self, proxy_url, context=None):
+        import yaml
+
+        return yaml.safe_load(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                context or self.HOST_CTX, proxy_url=proxy_url, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            )
+        )
+
+    def merge(self, proxy_url):
+        import yaml
+
+        credential_proxy_client._merge_context_into_kubeconfig_file(
+            self.kubeconfig, self.TARGET_CTX, proxy_url, self.CA_FILE, self.TOKEN_FILE
+        )
+        return yaml.safe_load(self.kubeconfig.read_text(encoding="utf-8"))
+
+    def test_the_loopback_kubeconfig_names_no_ca_and_no_token_file(self):
+        doc = self.build(self.LOOPBACK_URL)
+        self.assertEqual(
+            [{"name": self.HOST_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.HOST_CTX}"}}],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+
+    def test_everything_else_in_the_loopback_kubeconfig_is_as_for_any_proxy(self):
+        loopback, https = self.build(self.LOOPBACK_URL), self.build(self.HTTPS_URL)
+        for key in ("apiVersion", "kind", "contexts", "current-context"):
+            self.assertEqual(https[key], loopback[key], key)
+        self.assertEqual(self.HOST_CTX, loopback["current-context"])
+
+    def test_a_trailing_slash_on_the_loopback_url_changes_nothing(self):
+        with patch.dict(os.environ, {"KUBE_PROXY_URL": self.LOOPBACK_URL + "/"}):
+            import yaml
+
+            doc = yaml.safe_load(credential_proxy_client.build_kube_proxy_kubeconfig(self.HOST_CTX))
+        self.assertEqual({"server": f"{self.LOOPBACK_URL}/clusters/{self.HOST_CTX}"}, doc["clusters"][0]["cluster"])
+        self.assertEqual({}, doc["users"][0]["user"])
+
+    def test_any_other_url_keeps_the_ca_and_the_token_file(self):
+        for proxy_url in self.NOT_LOOPBACK:
+            with self.subTest(proxy_url=proxy_url):
+                self.assertFalse(credential_proxy_client._is_kube_proxy_loopback(proxy_url))
+                doc = self.build(proxy_url)
+                self.assertEqual(self.CA_FILE, doc["clusters"][0]["cluster"]["certificate-authority"])
+                self.assertEqual({"tokenFile": self.TOKEN_FILE}, doc["users"][0]["user"])
+
+    def test_a_merge_for_the_loopback_writes_no_ca_and_no_token_file(self):
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.LOOPBACK_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        doc = self.merge(self.LOOPBACK_URL)
+        self.assertEqual(
+            [
+                {"name": self.HOST_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.HOST_CTX}"}},
+                {"name": self.TARGET_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.TARGET_CTX}"}},
+            ],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+        self.assertEqual(self.HOST_CTX, doc["current-context"], "a merge never moves the current context")
+        self.assertEqual([self.HOST_CTX, self.TARGET_CTX], [c["name"] for c in doc["contexts"]])
+
+    def test_a_second_merge_for_the_loopback_finds_the_context_current(self):
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.LOOPBACK_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        self.merge(self.LOOPBACK_URL)
+        before = self.kubeconfig.read_bytes()
+        self.merge(self.LOOPBACK_URL)
+        self.assertEqual(before, self.kubeconfig.read_bytes())
+
+    def test_a_merge_for_the_loopback_replaces_an_entry_that_named_a_ca_and_a_token_file(self):
+        """A kubeconfig written for an https proxy, then merged for the loopback: the context's
+        cluster loses its CA and the shared user its token file."""
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.TARGET_CTX, proxy_url=self.HTTPS_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        doc = self.merge(self.LOOPBACK_URL)
+        self.assertEqual(
+            [{"name": self.TARGET_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.TARGET_CTX}"}}],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+
+    def test_a_merge_for_any_other_url_keeps_the_ca_and_the_token_file(self):
+        self.kubeconfig.write_text(
+            credential_proxy_client.build_kube_proxy_kubeconfig(
+                self.HOST_CTX, proxy_url=self.HTTPS_URL, ca_file=self.CA_FILE, token_file=self.TOKEN_FILE
+            ),
+            encoding="utf-8",
+        )
+        doc = self.merge(self.HTTPS_URL)
+        for cluster in doc["clusters"]:
+            self.assertEqual(self.CA_FILE, cluster["cluster"]["certificate-authority"])
+        self.assertEqual(
+            [{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {"tokenFile": self.TOKEN_FILE}}],
+            doc["users"],
+        )
+
+    def test_a_bare_kubectl_in_a_task_reads_the_host_context_the_adapter_names(self):
+        """The wrapper has the client make the default kubeconfig when there is none; its current
+        context is `KUBE_PROXY_HOST_CONTEXT`, which the worker adapter sets to the task's target."""
+        home_config = self.root / "home" / ".kube" / "config"
+        home_config.parent.parent.mkdir()
+        environ = {
+            "KUBE_PROXY_URL": self.LOOPBACK_URL,
+            "KUBE_PROXY_HOST_CONTEXT": self.TARGET_CTX,
+            "CREDENTIAL_PROXY_TOKEN_FILE": self.TOKEN_FILE,
+        }
+        with patch.dict(os.environ, environ), \
+                patch.object(credential_proxy_client, "_caller_default_kubeconfig_path", return_value=home_config), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.root / "absent" / "config"):
+            os.environ.pop("KUBE_PROXY_CA_FILE", None)
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(["get", "pods"])
+        import yaml
+
+        doc = yaml.safe_load(home_config.read_text(encoding="utf-8"))
+        self.assertEqual(self.TARGET_CTX, doc["current-context"])
+        self.assertEqual(
+            {"server": f"{self.LOOPBACK_URL}/clusters/{self.TARGET_CTX}"}, doc["clusters"][0]["cluster"]
+        )
+        self.assertEqual({}, doc["users"][0]["user"])
+
+    # The host context the worker adapter gives a task that has no cluster
+    # (kubeProxyNoTargetContext in a2a/worker-adapter/kubeproxy.go): not a GKE context name.
+    NO_TARGET_CTX = "no-cluster-for-this-task"
+
+    def ensure_for_a_bare_kubectl(self, environ):
+        """What `--ensure-kubectl-context` leaves as the default kubeconfig for a `kubectl get pods`
+        under `environ`, or None when it writes none."""
+        import yaml
+
+        home_config = self.root / "home" / ".kube" / "config"
+        home_config.parent.parent.mkdir()
+        with patch.dict(os.environ, environ), \
+                patch.object(credential_proxy_client, "_caller_default_kubeconfig_path", return_value=home_config), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.root / "absent" / "config"):
+            for name in ("KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT", "KUBECONFIG"):
+                if name not in environ:
+                    os.environ.pop(name, None)
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(["get", "pods"])
+        if not home_config.exists():
+            return None
+        return yaml.safe_load(home_config.read_text(encoding="utf-8"))
+
+    def test_a_bare_kubectl_in_a_task_with_no_cluster_asks_the_loopback(self):
+        """A task with no cluster gets a placeholder host context, so the kubeconfig a bare kubectl
+        reads points at the loopback, which says why there is nothing to read. Without one, kubectl
+        had no kubeconfig and reported a refused connection to localhost:8080."""
+        self.assertIsNone(credential_proxy_client.parse_gke_context(self.NO_TARGET_CTX))
+        doc = self.ensure_for_a_bare_kubectl(
+            {"KUBE_PROXY_URL": self.LOOPBACK_URL, "KUBE_PROXY_HOST_CONTEXT": self.NO_TARGET_CTX}
+        )
+        self.assertEqual(self.NO_TARGET_CTX, doc["current-context"])
+        self.assertEqual(
+            [{"name": self.NO_TARGET_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.NO_TARGET_CTX}"}}],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+        self.assertEqual(
+            [{"name": self.NO_TARGET_CTX, "context": {"cluster": self.NO_TARGET_CTX, "user": credential_proxy_client.KUBE_PROXY_USER_NAME}}],
+            doc["contexts"],
+        )
+
+    def test_without_a_host_context_no_default_kubeconfig_is_written_as_before(self):
+        """The client itself invents no context, for the loopback or any other proxy: the placeholder
+        is the adapter's to give."""
+        for proxy_url in (self.LOOPBACK_URL, self.HTTPS_URL):
+            with self.subTest(proxy_url=proxy_url):
+                self.assertIsNone(self.ensure_for_a_bare_kubectl({"KUBE_PROXY_URL": proxy_url}))
+                shutil.rmtree(self.root / "home")
+
+    def test_a_host_context_behind_any_other_proxy_is_written_as_before(self):
+        doc = self.ensure_for_a_bare_kubectl(
+            {
+                "KUBE_PROXY_URL": self.HTTPS_URL,
+                "KUBE_PROXY_HOST_CONTEXT": self.HOST_CTX,
+                "KUBE_PROXY_CA_FILE": self.CA_FILE,
+                "CREDENTIAL_PROXY_TOKEN_FILE": self.TOKEN_FILE,
+            }
+        )
+        self.assertEqual(self.HOST_CTX, doc["current-context"])
+        self.assertEqual(
+            {"server": f"{self.HTTPS_URL}/clusters/{self.HOST_CTX}", "certificate-authority": self.CA_FILE},
+            doc["clusters"][0]["cluster"],
+        )
+        self.assertEqual({"tokenFile": self.TOKEN_FILE}, doc["users"][0]["user"])
 
 
 class KubeconfigLockOwnerTest(unittest.TestCase):

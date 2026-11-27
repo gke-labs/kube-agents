@@ -504,6 +504,8 @@ func (l *loader) validateMCP(m MCP) {
 			l.add(MCPFile, field, "server name must not contain \"__\"")
 		} else if slices.Contains(BuiltinTools, name) {
 			l.add(MCPFile, field, "server name is a built-in tool name (%s); a tools entry could not tell them apart", strings.Join(BuiltinTools, ", "))
+		} else if name == ReservedServer {
+			l.add(MCPFile, field, "server name %q is reserved for the worker's own delegate server", ReservedServer)
 		}
 		switch {
 		case s.Broker == "":

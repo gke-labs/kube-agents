@@ -291,6 +291,13 @@ the scale project it holds only what a run needs:
 | Object admin under `sized-fleet-` in the state bucket, and list on the bucket | Keep the OpenTofu state, and nothing else in that bucket.                           |
 | Object admin on the results bucket                                            | Write the verdict, the measurements and the cost record.                            |
 
+The install step looks for the newest `main` commit whose images are published and installs the
+images built from this repository from the same registry: `REGISTRY_PREFIX` when the job sets it,
+else GHCR. For an Artifact Registry repository the lookup is made as this identity and the pulls as
+the host cluster's node account, so each needs `roles/artifactregistry.reader` on that repository.
+`hack/sized_fleet_testbed.sh` grants that role to the fleet's own node account, on the scale
+project, and to neither of these.
+
 Like the reconciler, the identity could do more on the scale project than one run needs; what
 bounds it is that only `main`-only jobs run as it.
 
