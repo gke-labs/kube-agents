@@ -4,25 +4,31 @@
 credential shapes and must-keep text that the credential broker's tool-output
 redactor and the answer scrubber already read. This holds the LiteLLM
 pre-call hook (`charts/kube-agents/files/litellm_redaction_callback.py`) to
-the same list, at every position where a tool's output reaches the model:
+the same list, at these positions where a tool's output reaches the model:
 
 - an Anthropic `tool_result` whose content is a string;
 - an Anthropic `tool_result` whose content is a list of text blocks;
 - an OpenAI-wire `role: tool` message;
-- a Gemini `functionResponse`'s response;
+- a Gemini `functionResponse`'s response, and the same under its snake_case
+  key `function_response`;
 - core-agent's bash result as it sends it: a Gemini `functionResponse`
   whose response is the object `{"exit_code", "stderr", "stdout"}`
   (a2a/worker-adapter/testdata/coreagent/tool-step.jsonl), with the
   output in `stdout` and, separately, in `stderr`;
-- the same Gemini `functionResponse` under the streaming call type as well
-  (`generateContent` and `streamGenerateContent`), which a Gemini-speaking
-  harness may use either of.
+- the same Gemini `functionResponse` under the streaming call type as well.
+  The hook doesn't read the call type, so this row pins that the
+  `streamGenerateContent` route takes the same path; whether LiteLLM calls
+  the hook on that route at all is not something a unit test can see.
+
+The hook also walks a Responses-API `function_call_output`. No current
+harness sends one, so it isn't built here.
 
 A redact case's secret must not survive, nor any 8-character fragment of it,
-as the fixture's own description states. A keep case's text must come out
-byte-identical, except where the gateway is deliberately wider than the
-broker (`DELIBERATELY_WIDER`). Over-masking there costs the model some
-context; a miss would forward the credential.
+as the fixture's own description states. A keep case's whole request must
+come out byte-identical, except where the gateway is deliberately wider than
+the broker (`DELIBERATELY_WIDER`), whose exact output is pinned at every
+position. Over-masking there costs the model some context; a miss would
+forward the credential.
 
 The hook runs with IP pseudonymisation off and no operator rules, so only the
 credential shapes act on the text.
@@ -31,6 +37,7 @@ credential shapes act on the text.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import pathlib
@@ -46,16 +53,23 @@ FIXTURE = _REPO_ROOT / "tests" / "conformance" / "fixtures" / "credential-shapes
 TOOL_OUTPUT_SCOPE = "tool-output"
 FRAGMENT_LENGTH = 8
 
-# Keep cases the gateway masks on purpose, with the reason. The gateway is a
-# backstop for output that never passed the broker, so it keeps the audit
-# redactor's wider forms.
+# Keep cases the gateway masks on purpose: the reason, and the exact text the
+# gateway gives at every position, so only the known values may change. The
+# gateway is a backstop for output that never passed the broker, so it keeps
+# the audit redactor's wider forms (#6822, which chose them).
 DELIBERATELY_WIDER = {
-    "bearer-and-basic-in-prose": (
-        "AuditRedactor masks any `bearer` or `basic` followed by twelve value "
-        "characters; the broker's tool-output form needs a header's context or "
-        "a value with a digit or symbol in it. At the gateway, a masked word "
-        "costs context and a missed header value would forward a credential."
-    ),
+    "bearer-and-basic-in-prose": {
+        "why": (
+            "AuditRedactor masks any `bearer` or `basic` followed by twelve value "
+            "characters; the broker's tool-output form needs a header's context or "
+            "a value with a digit or symbol in it. At the gateway, a masked word "
+            "costs context and a missed header value would forward a credential (#6822)."
+        ),
+        "gateway_text": (
+            "Following the basic [REDACTED_SECRET], the Bearer [REDACTED_SECRET] flow still "
+            "returned 401; basic [REDACTED_SECRET] did not help.\n"
+        ),
+    },
 }
 
 
@@ -79,6 +93,20 @@ def _gemini_streaming_shapes(text: str):
             call_type,
             lambda r: r["contents"][0]["parts"][0]["functionResponse"]["response"]["output"],
         )
+
+
+def _gemini_snake_case_shapes(text: str):
+    """The Gemini functionResponse row under its snake_case key."""
+    yield (
+        "gemini function_response (snake_case)",
+        {
+            "contents": [
+                {"role": "user", "parts": [{"function_response": {"name": "run_command", "response": {"output": text}}}]}
+            ]
+        },
+        "agenerate_content",
+        lambda r: r["contents"][0]["parts"][0]["function_response"]["response"]["output"],
+    )
 
 
 def _core_agent_shapes(text: str):
@@ -178,6 +206,7 @@ class TestGatewayMeetsTheCredentialShapesFixture(unittest.TestCase):
                     self.assertEqual([], sorted(f for f in fragments if f in out), "a fragment of the secret survived")
             for name, request, call_type, read_back in (
                 *_gemini_streaming_shapes(case["text"]),
+                *_gemini_snake_case_shapes(case["text"]),
                 *_core_agent_shapes(case["text"]),
             ):
                 with self.subTest(case=case["id"], position=name):
@@ -185,33 +214,32 @@ class TestGatewayMeetsTheCredentialShapesFixture(unittest.TestCase):
                     self.assertNotIn(secret, out)
                     self.assertEqual([], sorted(f for f in fragments if f in out), "a fragment of the secret survived")
 
-    def test_every_keep_case_is_kept_at_every_walked_position(self) -> None:
-        for case in (c for c in self.cases if c["expect"] == "keep" and c["id"] not in DELIBERATELY_WIDER):
-            for name, request, call_type, read_back in _shapes(case["text"]):
-                with self.subTest(case=case["id"], position=name):
-                    self.assertEqual(case["text"], read_back(self._through_the_hook(request, call_type)))
-            for name, request, call_type, read_back in (
-                *_gemini_streaming_shapes(case["text"]),
-                *_core_agent_shapes(case["text"]),
-            ):
-                with self.subTest(case=case["id"], position=name):
-                    self.assertEqual(case["text"], read_back(self._through_the_hook(request, call_type)))
+    def _every_shape(self, text: str):
+        return (*_shapes(text), *_gemini_streaming_shapes(text), *_gemini_snake_case_shapes(text), *_core_agent_shapes(text))
 
-    def test_a_deliberately_wider_case_is_still_in_the_fixture_and_still_wider(self) -> None:
-        # The list must not outlive its reason: a case the fixture dropped, or
-        # one the gateway now keeps, comes off it.
+    def test_every_keep_case_is_kept_at_every_walked_position(self) -> None:
+        # The whole request, not only the read-back field: a hook that rewrote
+        # `exit_code`, the empty `stderr` or a sibling field must fail too.
+        for case in (c for c in self.cases if c["expect"] == "keep" and c["id"] not in DELIBERATELY_WIDER):
+            for name, request, call_type, _ in self._every_shape(case["text"]):
+                with self.subTest(case=case["id"], position=name):
+                    want = copy.deepcopy(request)
+                    self.assertEqual(want, self._through_the_hook(request, call_type))
+
+    def test_a_deliberately_wider_case_gives_its_pinned_text_at_every_position(self) -> None:
+        # The list must not outlive its reason, and the gateway must not get
+        # wider still: a case the fixture dropped, or one whose gateway text
+        # changed (kept, masked more, or prose mangled), fails here.
         by_id = {c["id"]: c for c in self.cases}
-        for case_id in DELIBERATELY_WIDER:
+        for case_id, entry in DELIBERATELY_WIDER.items():
             with self.subTest(case=case_id):
                 self.assertIn(case_id, by_id, "listed as deliberately wider but not a tool-output case")
                 case = by_id[case_id]
                 self.assertEqual("keep", case["expect"])
-                _, request, call_type, read_back = _shapes(case["text"])[0]
-                self.assertNotEqual(
-                    case["text"],
-                    read_back(self._through_the_hook(request, call_type)),
-                    "the gateway now keeps this case; take it off DELIBERATELY_WIDER",
-                )
+                self.assertNotEqual(case["text"], entry["gateway_text"])
+            for name, request, call_type, read_back in self._every_shape(by_id.get(case_id, {}).get("text", "")):
+                with self.subTest(case=case_id, position=name):
+                    self.assertEqual(entry["gateway_text"], read_back(self._through_the_hook(request, call_type)))
 
 
 if __name__ == "__main__":

@@ -138,8 +138,10 @@ SOURCES: dict[str, Source] = {
         ),
     ),
     # C1 runs every tool-output case of this file through the broker's exec
-    # and MCP relay replies. The answer scrubber's tests read the same file,
-    # so a case is added here once for both.
+    # and MCP relay replies. The answer scrubber's tests and the gateway
+    # hook's (tests/test_litellm_redaction_shapes.py) read the same file, so a
+    # case is added here once for all three; a tool-output keep case the
+    # gateway masks on purpose goes on that test's DELIBERATELY_WIDER list.
     "credential_shapes_fixture": Source(
         "tests/conformance/fixtures/credential-shapes.json",
         ('"version": 1', '"cases"', '"tool-output"'),
