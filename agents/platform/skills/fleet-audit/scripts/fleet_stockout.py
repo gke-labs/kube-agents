@@ -7,7 +7,7 @@ which `audit_report.py finish --manifest-file` cross-checks the published
 document against; the checks it runs are defined in
 governance/stockout_prevention_sop.md.
 
-**All fourteen checks are converted.** Twelve read structures this repository's
+**All fifteen checks are converted.** Thirteen read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
 `StatefulSet`/`StorageClass`/`Node` dump, a separate chunked `CapacityBuffer`
 read (`capacitybuffers.autoscaling.x-k8s.io`), the node pools (the discovery

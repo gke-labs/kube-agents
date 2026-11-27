@@ -457,7 +457,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other thirteen are capacity faults no
+        # other fourteen are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
