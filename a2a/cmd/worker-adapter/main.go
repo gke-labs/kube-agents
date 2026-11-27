@@ -172,6 +172,20 @@ func run() int {
 	// `worker-adapter warm-ready` is a warm session pod's readiness probe:
 	// exit 0 once the adapter's loopback status endpoint answers, which it
 	// does from when its task watcher's consumer exists (workeradapter.runWarm).
+	// `worker-adapter trajectory <task id>` prints a task's tool-call
+	// capture from this pod's loopback port (workeradapter.FetchTrajectory):
+	// what the evals read with kubectl exec.
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.TrajectoryCommand {
+		if len(os.Args) != 3 {
+			fmt.Fprintf(os.Stderr, "usage: worker-adapter %s <task id>\n", workeradapter.TrajectoryCommand)
+			return 2
+		}
+		if err := workeradapter.FetchTrajectory(context.Background(), workeradapter.TrajectoryAddr, os.Args[2], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if len(os.Args) > 1 && os.Args[1] == lib.SessionWarmReadyCommand {
 		return warmReady(warmStatusURL(), lib.SessionWarmReadyWaitSeconds*time.Second)
 	}
@@ -266,6 +280,24 @@ func run() int {
 			log.Error("session worker failed", "err", err)
 			return 1
 		}
+	}
+
+	// The session's tool-call capture for the evals, on loopback only. A
+	// port that can't be bound costs the capture, never the session. The
+	// port stays open until Run returns, not just until a signal arrives, so
+	// the calls of a turn being stopped can still be read while it winds
+	// down. Not dumpable, so the agent's processes (same uid) can't reach
+	// the capture through this process's /proc entries.
+	if err := workeradapter.HideFromSameUID(); err != nil {
+		log.Warn("trajectory capture: couldn't mark the adapter not dumpable", "err", err)
+	}
+	trajCtx, trajStop := context.WithCancel(context.Background())
+	defer trajStop()
+	traj := workeradapter.NewTrajectoryStore()
+	if _, err := workeradapter.ServeTrajectory(trajCtx, traj, workeradapter.TrajectoryAddr, log); err != nil {
+		log.Warn("trajectory capture: the read port couldn't be bound; the session runs without it", "addr", workeradapter.TrajectoryAddr, "err", err)
+	} else {
+		cfg.Trajectory = traj
 	}
 
 	res, err := workeradapter.Run(ctx, cfg)

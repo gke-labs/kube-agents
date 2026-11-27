@@ -2520,13 +2520,13 @@ class BootDiskPoolVoteTest(unittest.TestCase):
 
     @staticmethod
     def seeded_fleet():
-        """The eval fleet's shape: four Standard clusters, ten pools, nine on
+        """The eval fleet's shape: four Standard clusters, eleven pools, ten on
         20 GB and one cluster's only pool on 50 GB."""
         def pools(*names, gb=20):
             return [pool(name, disk_gb=gb) for name in names]
 
         return [
-            cluster("a", nodePools=pools("default-pool", "idle-batch-pool", "pinned-inference-pool", "declared-zonal-pool", "missing-reservation-pool")),
+            cluster("a", nodePools=pools("default-pool", "idle-batch-pool", "pinned-inference-pool", "declared-zonal-pool", "missing-reservation-pool", "dev-reserved-pool")),
             cluster("b", nodePools=pools("default-pool", "no-surge-pool")),
             cluster("c", nodePools=pools("default-pool", gb=50)),
             cluster("d", nodePools=pools("default-pool", "second-zone-pool")),
@@ -2545,13 +2545,13 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         self.assertIsNone(fd.pool_boot_disk({"name": "p"}))
 
     def test_the_odd_pool_is_filed_on_the_pool_at_base_severity(self):
-        # Nine of ten pools agree: r = 0.90, k = 1, no rung of the ladder.
+        # Ten of eleven pools agree: r = 0.91, k = 1, no rung of the ladder.
         _, candidates = fd.compute_drift(self.seeded_fleet(), now=NOW)
         (finding,) = self.boot_disk(candidates, "c")
         self.assertEqual(finding["object"], "NodePool/default-pool")
         self.assertEqual(finding["namespace"], "")
         self.assertEqual(finding["severity"], "major")
-        self.assertIn("=pd-balanced/20 in 9/10 node pools of cohort standard/prod", finding["excerpt"])
+        self.assertIn("=pd-balanced/20 in 10/11 node pools of cohort standard/prod", finding["excerpt"])
         self.assertIn("observed: pd-balanced/50", finding["excerpt"])
         self.assertIn("(base major, none)", finding["excerpt"])
         for name in "abd":
@@ -2569,7 +2569,7 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         # Bare names here: `collect_fleet` qualifies them before the vote.
         self.assertIn("a/default-pool", peers)
         self.assertNotIn("c/default-pool", peers)
-        self.assertIn("+3 more", peers)
+        self.assertIn("+4 more", peers)
 
     def test_every_cluster_with_a_voting_pool_ran_the_check(self):
         checks_run, _ = fd.compute_drift(self.seeded_fleet(), now=NOW)
@@ -2709,7 +2709,7 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         fleet[2]["nodePools"] = [pool("default-pool", disk_gb=20), pool("win", image="WINDOWS_LTSC_CONTAINERD", disk_gb=200)]
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual(self.boot_disk(candidates, "c"), [])
-        self.assertEqual(len(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), 10)
+        self.assertEqual(len(fd.facet_tokens(fd.FACETS_BY_SLUG["boot-disk"], fleet)), 11)
 
     def test_an_auto_provisioned_pool_does_not_vote_and_is_not_filed(self):
         """GKE names, deletes and re-creates these pools, so a finding on one
@@ -2718,7 +2718,7 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         fleet[1]["nodePools"].append(pool("nap-e2-standard-4-ab12", disk_gb=200, autoprovisioned=True))
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual(self.boot_disk(candidates, "b"), [])
-        self.assertIn("in 9/10 node pools", self.boot_disk(candidates, "c")[0]["excerpt"])
+        self.assertIn("in 10/11 node pools", self.boot_disk(candidates, "c")[0]["excerpt"])
 
     def test_a_cluster_of_only_auto_provisioned_pools_declares_the_facet(self):
         """A shape, not a gap: nothing the owner can change gives these pools
@@ -2739,7 +2739,7 @@ class BootDiskPoolVoteTest(unittest.TestCase):
         fleet[1]["nodePools"].append(pool("unread", disk_gb=None))
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual(self.boot_disk(candidates, "b"), [])
-        self.assertIn("in 9/10 node pools", self.boot_disk(candidates, "c")[0]["excerpt"])
+        self.assertIn("in 10/11 node pools", self.boot_disk(candidates, "c")[0]["excerpt"])
 
     def test_many_odd_pools_on_one_cluster_count_as_one_facet_for_the_split_guard(self):
         """§3.6 counts facets, not findings: six odd pools are one facet."""
@@ -2803,14 +2803,14 @@ class KubeletConfigPoolVoteTest(unittest.TestCase):
 
     @classmethod
     def seeded_fleet(cls):
-        """The eval fleet's shape: four Standard clusters, ten pools, nine
+        """The eval fleet's shape: four Standard clusters, eleven pools, ten
         carrying only GKE's defaults and one cluster's only pool with
         `podPidsLimit` set, as the API returns it: an int64 in a string."""
         def pools(*names, **extra):
             return [pool(name, kubelet={**cls.GKE_DEFAULTS, **extra}) for name in names]
 
         return [
-            cluster("a", nodePools=pools("default-pool", "idle-batch-pool", "pinned-inference-pool", "declared-zonal-pool", "missing-reservation-pool")),
+            cluster("a", nodePools=pools("default-pool", "idle-batch-pool", "pinned-inference-pool", "declared-zonal-pool", "missing-reservation-pool", "dev-reserved-pool")),
             cluster("b", nodePools=pools("default-pool", "no-surge-pool")),
             cluster("c", nodePools=pools("default-pool", podPidsLimit="4096")),
             cluster("d", nodePools=pools("default-pool", "second-zone-pool")),
@@ -2896,13 +2896,13 @@ class KubeletConfigPoolVoteTest(unittest.TestCase):
         self.assertIsNone(fd.pool_kubelet_config({"name": "p", "config": "n1-standard-1"}))
 
     def test_the_odd_pool_is_filed_on_the_pool_at_base_severity(self):
-        # Nine of ten pools agree: r = 0.90, k = 1, no rung of the ladder.
+        # Ten of eleven pools agree: r = 0.91, k = 1, no rung of the ladder.
         checks_run, candidates = fd.compute_drift(self.seeded_fleet(), now=NOW)
         (finding,) = self.kubelet(candidates, "c")
         self.assertEqual(finding["object"], "NodePool/default-pool")
         self.assertEqual(finding["namespace"], "")
         self.assertEqual(finding["severity"], "major")
-        self.assertIn(".nodePools[].config.kubeletConfig=UNSET in 9/10 node pools of cohort standard/prod", finding["excerpt"])
+        self.assertIn(".nodePools[].config.kubeletConfig=UNSET in 10/11 node pools of cohort standard/prod", finding["excerpt"])
         self.assertIn("observed: podPidsLimit=4096", finding["excerpt"])
         self.assertIn("(base major, none)", finding["excerpt"])
         self.assertIn("CPU, PID or log-rotation limits", finding["impact"])
@@ -2924,14 +2924,14 @@ class KubeletConfigPoolVoteTest(unittest.TestCase):
         fleet[2]["nodePools"] = [pool("default-pool"), pool("win", image="WINDOWS_LTSC_CONTAINERD", kubelet={"podPidsLimit": "4096"})]
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual(self.kubelet(candidates, "c"), [])
-        self.assertEqual(len(fd.facet_tokens(fd.FACETS_BY_SLUG["kubelet-config"], fleet)), 10)
+        self.assertEqual(len(fd.facet_tokens(fd.FACETS_BY_SLUG["kubelet-config"], fleet)), 11)
 
     def test_an_auto_provisioned_pool_does_not_vote_and_is_not_filed(self):
         fleet = self.seeded_fleet()
         fleet[1]["nodePools"].append(pool("nap-e2-standard-4-ab12", autoprovisioned=True, kubelet={"cpuManagerPolicy": "static"}))
         _, candidates = fd.compute_drift(fleet, now=NOW)
         self.assertEqual(self.kubelet(candidates, "b"), [])
-        self.assertIn("in 9/10 node pools", self.kubelet(candidates, "c")[0]["excerpt"])
+        self.assertIn("in 10/11 node pools", self.kubelet(candidates, "c")[0]["excerpt"])
 
     def test_a_cluster_of_only_auto_provisioned_pools_declares_the_facet(self):
         fleet = self.seeded_fleet()

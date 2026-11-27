@@ -1,6 +1,7 @@
 # Telemetry and Log Shipping for Profile Pods
 
-> **STATUS: draft for a decision.** Nothing here ships. This is the telemetry design for the epic
+> **STATUS: draft for a decision.** One part here ships: the adapter's per-tool line, with the task
+> id as its one task key ("The activity of a task"). This is the telemetry design for the epic
 > [#6526](https://github.com/gke-labs/kube-agents/issues/6526), for its group
 > [#6674](https://github.com/gke-labs/kube-agents/issues/6674). Each network rule, port and record
 > below needs the decision of the security approver before any code, and the approver confirms
@@ -285,4 +286,5 @@ For #6674:
 
 What these lines need from other work: the broker lines and the log-read line change
 `credential_proxy.py`, so they take their turn in the order of work on that file. The per-tool line
-waits for the work of the hooks design ([`profile-worker-hooks.md`](profile-worker-hooks.md)).
+of the hooks design ([`profile-worker-hooks.md`](profile-worker-hooks.md)) is in the adapter with
+the task id; its other task keys wait for "The task keys".
