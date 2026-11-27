@@ -33,6 +33,19 @@
 # the teardown, or the exit trap on a failed apply, puts back the copy of
 # each it did not (store.sh), so the stream keeps its memory.
 #
+# Where the report store's files are depends on FLEET_AUDIT_REPORT_STORE, which
+# the operator renders on the sandbox's shell container and which is read here
+# from the pod spec (report_store). Unset, empty or `file`: on the sandbox's own
+# volume beside the digest record, and store.sh runs once, in the sandbox.
+# `broker` (#6110): the shell writes through the credential broker, whose files
+# are under the same root on the gateway pod's data volume, so store.sh renames
+# each `latest.json` in the agent container and the digest record, which stays
+# in the sandbox's scratch, in the sandbox. Before that, seed.py has the broker
+# copy in the sandbox's local copy of each stream, which the scripts would
+# otherwise do on their first touch and so bring the renamed `latest.json`
+# back. Any other value fails the apply before it changes anything, and the
+# destroy before it puts anything back.
+#
 # arm.py (beside this file) marks the job due with Hermes' own `trigger_job`, as
 # the `oobe` job's first-run audits stage does, and waits for the run to end. The
 # profile's cron tick claims the mark and the scheduler delivers the run through
@@ -64,6 +77,7 @@ locals {
   python    = "/opt/hermes/.venv/bin/python3"
   arm_b64   = base64encode(file("${path.module}/arm.py"))
   store_b64 = base64encode(file("${path.module}/store.sh"))
+  seed_b64  = base64encode(file("${path.module}/seed.py"))
   # audit_report.py: REPORTS_DIR.
   store = "/opt/data/fleet-audit/reports/${var.audit_job}"
   # manifest_delta.py: SCRATCH_DIR and DIGEST_FILE_TEMPLATE.
@@ -89,6 +103,7 @@ resource "null_resource" "audit_chat_report" {
     digest            = local.digest
     arm_b64           = local.arm_b64
     store_b64         = local.store_b64
+    seed_b64          = local.seed_b64
   }
 
   provisioner "local-exec" {
@@ -104,6 +119,7 @@ resource "null_resource" "audit_chat_report" {
       # inside a trap, hence `set +e`.
       moved=""
       fired=""
+      store_kind=""
       on_exit() {
         status=$?
         trap '' TERM INT
@@ -139,16 +155,61 @@ resource "null_resource" "audit_chat_report" {
             -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- \
             ${local.python} - "$@"
       }
+      # `file` or `broker`, from the env the operator rendered on the sandbox's
+      # shell container; any other value is an error that names it.
+      report_store() {
+        local out value
+        # The value on the first line; a valueFrom on the entry or any envFrom on
+        # the container after it, which the spec does not resolve.
+        out="$(kubectl get pod -n "${var.agent_namespace}" "${var.sandbox_pod}" \
+          -o jsonpath='{.spec.containers[?(@.name=="${var.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${var.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${var.sandbox_container}")].envFrom}')" || return 1
+        value="$(printf '%s\n' "$out" | sed -n 1p)"
+        if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${var.sandbox_container} container of ${var.sandbox_pod} is set indirectly (valueFrom or envFrom), so which report store to use is unknown." >&2
+          return 1
+        fi
+        case "$value" in
+          "" | file) echo file ;;
+          broker) echo broker ;;
+          *)
+            echo "ERROR: FLEET_AUDIT_REPORT_STORE='$value' on the ${var.sandbox_container} container of ${var.sandbox_pod} is neither 'file' nor 'broker', so which report store to use is unknown." >&2
+            return 1
+            ;;
+        esac
+      }
       store() {
+        if [ "$store_kind" != broker ]; then
+          printf '%s' '${local.store_b64}' | base64 -d | \
+            kubectl exec -i -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- \
+              sh -s "$1" "${local.store}" "${local.digest}"
+          return
+        fi
+        # Both halves, even when the first fails, so a restore puts back all it can.
+        local status=0
+        printf '%s' '${local.store_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "deployment/${var.agent_deployment}" \
+            -c "${var.agent_container}" --pod-running-timeout=${local.pod_wait}s -- \
+            sh -s "$1" "${local.store}" "" || status=1
         printf '%s' '${local.store_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- \
-            sh -s "$1" "${local.store}" "${local.digest}"
+            sh -s "$1" "" "${local.digest}" || status=1
+        return "$status"
       }
+      seed() {
+        printf '%s' '${local.seed_b64}' | base64 -d | \
+          kubectl exec -i -n "${var.agent_namespace}" "${var.sandbox_pod}" -c "${var.sandbox_container}" -- \
+            python3 - "${var.audit_job}" "${local.store}"
+      }
+
+      store_kind="$(report_store)"
 
       arm clean "${local.home}"
 
       arm idle "${local.home}" "${var.audit_job}" "${var.own_wait}"
 
+      if [ "$store_kind" = broker ]; then
+        seed
+      fi
       moved=1
       store move
 
@@ -182,10 +243,42 @@ resource "null_resource" "audit_chat_report" {
           -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
           ${self.triggers.python} - clean "${self.triggers.home}" \
         || echo "WARNING: could not remove the state file; the next run removes it first." >&2
-      printf '%s' '${self.triggers.store_b64}' | base64 -d \
-        | kubectl exec -i -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" -c "${self.triggers.sandbox_container}" -- \
-          sh -s restore "${self.triggers.store}" "${self.triggers.digest}" \
-        || echo "WARNING: could not restore the renamed store files." >&2
+
+      # As in the apply: `file` or `broker` from the shell container's env in the
+      # sandbox pod's spec. Any other value, one set indirectly (a valueFrom on the
+      # entry, or any envFrom on the container), or a spec that cannot be read,
+      # puts nothing back rather than guess where the renamed files are.
+      out="$(kubectl get pod -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" \
+        -o jsonpath='{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].value}{"\n"}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")].valueFrom}{.spec.containers[?(@.name=="${self.triggers.sandbox_container}")].envFrom}')" \
+        || { echo "ERROR: could not read the spec of ${self.triggers.sandbox_pod}; the renamed store files stay renamed." >&2; exit 1; }
+      store_kind="$(printf '%s\n' "$out" | sed -n 1p)"
+      if [ -n "$(printf '%s\n' "$out" | sed -n '2,$p')" ]; then
+        echo "ERROR: FLEET_AUDIT_REPORT_STORE on the ${self.triggers.sandbox_container} container of ${self.triggers.sandbox_pod} is set indirectly (valueFrom or envFrom), so which report store to use is unknown; the renamed store files stay renamed." >&2
+        exit 1
+      fi
+      case "$store_kind" in
+        "" | file)
+          printf '%s' '${self.triggers.store_b64}' | base64 -d \
+            | kubectl exec -i -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" -c "${self.triggers.sandbox_container}" -- \
+              sh -s restore "${self.triggers.store}" "${self.triggers.digest}" \
+            || echo "WARNING: could not restore the renamed store files." >&2
+          ;;
+        broker)
+          printf '%s' '${self.triggers.store_b64}' | base64 -d \
+            | kubectl exec -i -n "${self.triggers.namespace}" "deployment/${self.triggers.deployment}" \
+              -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
+              sh -s restore "${self.triggers.store}" "" \
+            || echo "WARNING: could not restore the renamed store files." >&2
+          printf '%s' '${self.triggers.store_b64}' | base64 -d \
+            | kubectl exec -i -n "${self.triggers.namespace}" "${self.triggers.sandbox_pod}" -c "${self.triggers.sandbox_container}" -- \
+              sh -s restore "" "${self.triggers.digest}" \
+            || echo "WARNING: could not restore the renamed digest record." >&2
+          ;;
+        *)
+          echo "ERROR: FLEET_AUDIT_REPORT_STORE='$store_kind' on the ${self.triggers.sandbox_container} container of ${self.triggers.sandbox_pod} is neither 'file' nor 'broker', so which report store to use is unknown; the renamed store files stay renamed." >&2
+          exit 1
+          ;;
+      esac
     EOT
   }
 }

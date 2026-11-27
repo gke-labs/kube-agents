@@ -20,8 +20,10 @@ that it was paused, and pauses it again when its wait is over or the stack is
 torn down, so the lane's pause holds for the cases that follow. For a case
 that asks for it, a fired run that does not finish in time is not a failure of
 the stack. `store.sh` sets the stream's stored report and its digest record
-aside, and puts back what the run did not replace. The apply's own script is
-run here against stand-ins for `kubectl` and `gcloud`. How the wait and idle
+aside, and puts back what the run did not replace. The apply's and the
+destroy's own scripts are run here against stand-ins for `kubectl` and
+`gcloud`, for each value of the report store switch on the sandbox's shell
+container: the file store, the broker store (#6110), and one that is neither. How the wait and idle
 steps read the scheduler's rows, and the fire step's refusal of a disabled
 job, are tested in test_audit_chat_report_posted.py.
 """
@@ -53,6 +55,7 @@ _VARIABLES_TF = _STACK / "variables.tf"
 _UNFINISHED_VARIABLE = "unfinished_run_is_a_result"
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
 _APPLY_BLOCK = 0
+_DESTROY_BLOCK = 1
 _UNFINISHED_TERNARY_RE = re.compile(r'\$\{var\.' + _UNFINISHED_VARIABLE + r' \? "([^"]*)" : "([^"]*)"\}')
 _RUN_WAIT = "5"
 _STORE_DIR = "/store"
@@ -74,14 +77,42 @@ _INTERPOLATIONS = {
     "local.python": "python3",
     "local.arm_b64": base64.b64encode(b"arm").decode(),
     "local.store_b64": base64.b64encode(b"store").decode(),
+    "local.seed_b64": base64.b64encode(b"seed").decode(),
     "local.store": _STORE_DIR,
     "local.digest": _DIGEST_FILE,
     "local.pod_wait": "5",
 }
-# Stand-ins on PATH. `kubectl` writes the command line it was asked to run in
-# the pod, everything after `--`, to $STUB_LOG, and fails the one whose words
-# include $STUB_FAIL; `gcloud` succeeds.
+# The destroy's `${self.triggers.*}`: the apply's values, by trigger name.
+_TRIGGERS = {
+    "namespace": _INTERPOLATIONS["var.agent_namespace"],
+    "deployment": _INTERPOLATIONS["var.agent_deployment"],
+    "container": _INTERPOLATIONS["var.agent_container"],
+    "sandbox_pod": _INTERPOLATIONS["var.sandbox_pod"],
+    "sandbox_container": _INTERPOLATIONS["var.sandbox_container"],
+    "host_cluster": "host",
+    "host_location": "us-east4",
+    "host_project": "example-project",
+    "pod_wait": "5",
+    "home": _AGENT_HOME,
+    "python": "python3",
+    "arm_b64": _INTERPOLATIONS["local.arm_b64"],
+    "store_b64": _INTERPOLATIONS["local.store_b64"],
+    "store": _STORE_DIR,
+    "digest": _DIGEST_FILE,
+}
+# Stand-ins on PATH. `kubectl get` (the switch read from the pod spec) logs its
+# jsonpath to $STUB_GETS and prints $STUB_STORE, or fails when $STUB_FAIL is
+# `get`. `kubectl exec` writes the command line it was asked to run in the pod,
+# everything after `--`, to $STUB_LOG and the pod it names to $STUB_TARGETS, and
+# fails the one whose words include $STUB_FAIL; `gcloud` succeeds.
 _KUBECTL_STUB = """#!/bin/sh
+if [ "$1" = get ]; then
+  for word in "$@"; do case "$word" in jsonpath=*) printf '%s\\n' "$word" >> "$STUB_GETS" ;; esac; done
+  [ "$STUB_FAIL" = get ] && exit 1
+  printf '%s' "$STUB_STORE"
+  exit 0
+fi
+echo "$5" >> "$STUB_TARGETS"
 in_pod=""
 seen=0
 for word in "$@"; do
@@ -242,8 +273,8 @@ class ArmTest(unittest.TestCase):
 
 
 
-class StoreTest(unittest.TestCase):
-    """`store.sh` on a store with a report, its run ring and the digest record."""
+class _StoreCase(unittest.TestCase):
+    """A store with a report, its run ring and the digest record."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -258,6 +289,10 @@ class StoreTest(unittest.TestCase):
         self.digest.parent.mkdir()
         self.digest.write_text("previous digest", encoding="utf-8")
         self.store = root / "reports" / _JOB
+
+
+class StoreTest(_StoreCase):
+    """`store.sh` on a store with a report, its run ring and the digest record."""
 
     def _run(self, command):
         subprocess.run(["sh", str(_STORE), command, str(self.store), str(self.digest)], check=True)
@@ -312,8 +347,8 @@ class CaseTest(unittest.TestCase):
         self.assertIn(f'variable "{_UNFINISHED_VARIABLE}"', _VARIABLES_TF.read_text(encoding="utf-8"))
 
 
-class ApplyTest(unittest.TestCase):
-    """The apply's script, rendered as Terraform would and run against the stand-ins."""
+class _ScriptCase(unittest.TestCase):
+    """The stack's scripts, rendered as Terraform would and run against the stand-ins."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -326,25 +361,51 @@ class ApplyTest(unittest.TestCase):
             stub.write_text(body, encoding="utf-8")
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "in-pod.log"
-        self.env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "STUB_LOG": str(self.log)}
+        self.targets = self.tmp / "targets.log"
+        self.gets = self.tmp / "gets.log"
+        self.env = {
+            **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "STUB_LOG": str(self.log),
+            "STUB_TARGETS": str(self.targets),
+            "STUB_GETS": str(self.gets),
+        }
 
-    def _apply(self, unfinished_is_result, failing_step=_NO_FAILURE):
+    def _run(self, script, failing_step, store):
+        self.done = subprocess.run(
+            ["bash", "-c", script], env={**self.env, "STUB_FAIL": failing_step, "STUB_STORE": store},
+            capture_output=True, text=True, check=False,
+        )
+        lines = self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+        return self.done.returncode, [line.split() for line in lines]
+
+    def _apply(self, unfinished_is_result, failing_step=_NO_FAILURE, store=""):
         """Run the apply script; return its exit status and the in-pod command lines, in order."""
         script = _HEREDOC_RE.findall(_MAIN_TF.read_text(encoding="utf-8"))[_APPLY_BLOCK]
         script = _UNFINISHED_TERNARY_RE.sub(lambda m: m.group(1 if unfinished_is_result else 2), script)
         for name, value in _INTERPOLATIONS.items():
             script = script.replace("${" + name + "}", value)
         self.assertNotRegex(script, r"\$\{(var|local)\.", "the apply script has an interpolation this test does not render")
-        done = subprocess.run(
-            ["bash", "-c", script], env={**self.env, "STUB_FAIL": failing_step},
-            capture_output=True, text=True, check=False,
-        )
-        lines = self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
-        return done.returncode, [line.split() for line in lines]
+        return self._run(script, failing_step, store)
+
+    def _destroy(self, store=""):
+        """Run the destroy script; return its exit status and the in-pod command lines, in order."""
+        script = _HEREDOC_RE.findall(_MAIN_TF.read_text(encoding="utf-8"))[_DESTROY_BLOCK]
+        for name, value in _TRIGGERS.items():
+            script = script.replace("${self.triggers." + name + "}", value)
+        self.assertNotRegex(script, r"\$\{(self|var|local)\.", "the destroy script has an interpolation this test does not render")
+        return self._run(script, _NO_FAILURE, store)
+
+    def _targets(self):
+        return self.targets.read_text(encoding="utf-8").splitlines()
 
     def _steps(self, commands):
         """`arm`'s steps are `python3 - <step> ...`; `store`'s are `sh -s <step> ...`."""
         return [words[2] for words in commands]
+
+
+class ApplyTest(_ScriptCase):
+    """The apply's script, rendered as Terraform would and run against the stand-ins."""
 
     def test_an_apply_fires_and_waits_and_cleans_nothing_after(self):
         status, commands = self._apply(unfinished_is_result=False)
@@ -378,6 +439,110 @@ class ApplyTest(unittest.TestCase):
         status, commands = self._apply(unfinished_is_result=False, failing_step="move")
         self.assertNotEqual(status, 0)
         self.assertEqual(self._steps(commands), ["clean", "idle", "move", "restore"])
+
+
+_SANDBOX = _INTERPOLATIONS["var.sandbox_pod"]
+_AGENT = "deployment/" + _INTERPOLATIONS["var.agent_deployment"]
+_SWITCH_ENTRY = '.spec.containers[?(@.name=="shell")].env[?(@.name=="FLEET_AUDIT_REPORT_STORE")]'
+_SWITCH_JSONPATH = (
+    f'jsonpath={{{_SWITCH_ENTRY}.value}}{{"\\n"}}{{{_SWITCH_ENTRY}.valueFrom}}'
+    '{.spec.containers[?(@.name=="shell")].envFrom}'
+)
+
+
+class ReportStoreSwitchTest(_ScriptCase):
+    """Where store.sh runs, by the switch read from the sandbox's pod spec."""
+
+    def test_the_switch_is_read_from_the_shell_containers_env(self):
+        self._apply(unfinished_is_result=False)
+        self.assertEqual(self.gets.read_text(encoding="utf-8").splitlines(), [_SWITCH_JSONPATH])
+
+    def test_the_file_store_runs_store_sh_once_in_the_sandbox(self):
+        for value in ("", "file"):
+            with self.subTest(value=value):
+                for path in (self.log, self.targets):
+                    path.unlink(missing_ok=True)
+                status, commands = self._apply(unfinished_is_result=False, store=value)
+                self.assertEqual(status, 0)
+                self.assertEqual(self._steps(commands), ["clean", "idle", "move", "fire", "wait"])
+                self.assertEqual(commands[2], ["sh", "-s", "move", _STORE_DIR, _DIGEST_FILE])
+                self.assertEqual(self._targets()[2], _SANDBOX)
+
+    def test_the_broker_store_seeds_then_moves_the_store_in_the_agent_and_the_record_in_the_sandbox(self):
+        status, commands = self._apply(unfinished_is_result=False, store="broker")
+        self.assertEqual(status, 0, self.done.stderr)
+        self.assertEqual(commands[2], ["python3", "-", _INTERPOLATIONS["var.audit_job"], _STORE_DIR])
+        self.assertEqual(commands[3], ["sh", "-s", "move", _STORE_DIR])
+        self.assertEqual(commands[4], ["sh", "-s", "move", _DIGEST_FILE])
+        self.assertEqual(self._targets()[2:5], [_SANDBOX, _AGENT, _SANDBOX])
+        self.assertEqual(self._steps(commands)[5:], ["fire", "wait"])
+
+    def test_a_failed_broker_apply_restores_both_halves(self):
+        status, commands = self._apply(unfinished_is_result=False, failing_step="fire", store="broker")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(commands[-2:], [["sh", "-s", "restore", _STORE_DIR], ["sh", "-s", "restore", _DIGEST_FILE]])
+        self.assertEqual(self._targets()[-2:], [_AGENT, _SANDBOX])
+
+    def test_an_unknown_switch_fails_the_apply_before_it_changes_anything(self):
+        status, commands = self._apply(unfinished_is_result=False, store="Broker")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(commands, [])
+        self.assertIn("FLEET_AUDIT_REPORT_STORE='Broker'", self.done.stderr)
+
+    def test_a_switch_set_indirectly_fails_the_apply_and_the_destroy(self):
+        for printed in ('\n{"configMapKeyRef":{"key":"store"}}', 'broker\n[{"configMapRef":{"name":"env"}}]'):
+            with self.subTest(printed=printed):
+                self.log.unlink(missing_ok=True)
+                status, commands = self._apply(unfinished_is_result=False, store=printed)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(commands, [])
+                self.assertIn("set indirectly (valueFrom or envFrom)", self.done.stderr)
+                self.log.unlink(missing_ok=True)
+                status, commands = self._destroy(store=printed)
+                self.assertNotEqual(status, 0)
+                self.assertEqual([c for c in commands if c[:2] == ["sh", "-s"]], [])
+                self.assertIn("set indirectly (valueFrom or envFrom)", self.done.stderr)
+
+    def test_an_unreadable_pod_spec_fails_the_apply_before_it_changes_anything(self):
+        status, commands = self._apply(unfinished_is_result=False, failing_step="get")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(commands, [])
+
+    def test_the_file_store_destroy_restores_in_the_sandbox(self):
+        status, commands = self._destroy(store="file")
+        self.assertEqual(status, 0)
+        self.assertEqual(commands[-1], ["sh", "-s", "restore", _STORE_DIR, _DIGEST_FILE])
+        self.assertEqual(self._targets()[-1], _SANDBOX)
+
+    def test_the_broker_store_destroy_restores_both_halves(self):
+        status, commands = self._destroy(store="broker")
+        self.assertEqual(status, 0)
+        self.assertEqual(commands[-2:], [["sh", "-s", "restore", _STORE_DIR], ["sh", "-s", "restore", _DIGEST_FILE]])
+        self.assertEqual(self._targets()[-2:], [_AGENT, _SANDBOX])
+
+    def test_an_unknown_switch_fails_the_destroy_and_restores_nothing(self):
+        status, commands = self._destroy(store="s3")
+        self.assertNotEqual(status, 0)
+        self.assertEqual([c for c in commands if c[:2] == ["sh", "-s"]], [])
+        self.assertIn("FLEET_AUDIT_REPORT_STORE='s3'", self.done.stderr)
+
+
+class StoreHalvesTest(_StoreCase):
+    """`store.sh` with one path empty, as the broker store runs it in each container."""
+
+    def test_an_empty_digest_moves_and_restores_only_the_store(self):
+        subprocess.run(["sh", str(_STORE), "move", str(self.store), ""], check=True)
+        self.assertFalse(self.latest.exists())
+        self.assertEqual(self.digest.read_text(encoding="utf-8"), "previous digest")
+        subprocess.run(["sh", str(_STORE), "restore", str(self.store), ""], check=True)
+        self.assertEqual(self.latest.read_text(encoding="utf-8"), "previous report")
+
+    def test_an_empty_store_moves_and_restores_only_the_digest_record(self):
+        subprocess.run(["sh", str(_STORE), "move", "", str(self.digest)], check=True)
+        self.assertTrue(self.latest.exists())
+        self.assertFalse(self.digest.exists())
+        subprocess.run(["sh", str(_STORE), "restore", "", str(self.digest)], check=True)
+        self.assertEqual(self.digest.read_text(encoding="utf-8"), "previous digest")
 
 
 if __name__ == "__main__":

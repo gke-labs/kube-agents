@@ -8107,3 +8107,131 @@ func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) 
 		})
 	}
 }
+
+func TestSlackConnectedFalseSetsDegradedWhileKeepingReadyTrue(t *testing.T) {
+	r, stored, state := settledA2AInstall(t)
+	ctx := context.Background()
+	// Mark all rendered Deployments and StatefulSets ready so updateStatusReady
+	// reaches Ready=True / Phase=Ready before SlackConnected=False is evaluated.
+	var deps appsv1.DeploymentList
+	if err := r.List(ctx, &deps, client.InNamespace(stored.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for i := range deps.Items {
+		d := &deps.Items[i]
+		want := int32(1)
+		if d.Spec.Replicas != nil && *d.Spec.Replicas > want {
+			want = *d.Spec.Replicas
+		}
+		d.Status.Replicas = want
+		d.Status.ReadyReplicas = want
+		d.Status.AvailableReplicas = want
+		if err := r.Status().Update(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stss appsv1.StatefulSetList
+	if err := r.List(ctx, &stss, client.InNamespace(stored.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for i := range stss.Items {
+		s := &stss.Items[i]
+		want := int32(1)
+		if s.Spec.Replicas != nil && *s.Spec.Replicas > want {
+			want = *s.Spec.Replicas
+		}
+		s.Status.Replicas = want
+		s.Status.ReadyReplicas = want
+		if err := r.Status().Update(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stored.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+	}
+	if err := r.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{
+		Type:               slackConnectedConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             slackConnectedReasonFailed,
+		Message:            slackConnectedFailedMessage,
+		ObservedGeneration: stored.Generation,
+	})
+	if err := r.Status().Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase != readyPhase || stored.Status.Phase != readyPhase {
+		t.Fatalf("phase = %q / %q, want %q (conditions: %+v)", phase, stored.Status.Phase, readyPhase, stored.Status.Conditions)
+	}
+	ready := meta.FindStatusCondition(stored.Status.Conditions, readyConditionType)
+	if ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready = %+v, want True", ready)
+	}
+	degraded := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonSlackConnectionFailed || degraded.Message != slackConnectedFailedMessage {
+		t.Fatalf("Degraded = %+v, want True/%s with SlackConnected message", degraded, conditionReasonSlackConnectionFailed)
+	}
+
+	// Ranks above spec resource refusals (InvalidCredentialProxyResources).
+	stored.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{
+		Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Mi")}},
+	}}
+	if err := r.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+		t.Fatal(err)
+	}
+	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d == nil || d.Reason != conditionReasonSlackConnectionFailed {
+		t.Fatalf("Degraded with spec resource refusal = %+v, want %s to outrank resource refusal", d, conditionReasonSlackConnectionFailed)
+	}
+
+	// Ranks below A2ABusStreamsMissing.
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{
+		Type:    busStreamsPresentConditionType,
+		Status:  metav1.ConditionFalse,
+		Reason:  busStreamsReasonMissing,
+		Message: "Missing from the A2A bus: TASKS.",
+	})
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+		t.Fatal(err)
+	}
+	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d == nil || d.Reason != conditionReasonA2ABusStreamsMissing {
+		t.Fatalf("Degraded with missing bus streams = %+v, want %s to outrank %s", d, conditionReasonA2ABusStreamsMissing, conditionReasonSlackConnectionFailed)
+	}
+
+	// When BusStreamsPresent recovers and SlackConnected turns True, Degraded falls back to the resource refusal, then clears once valid.
+	meta.RemoveStatusCondition(&stored.Status.Conditions, busStreamsPresentConditionType)
+	meta.SetStatusCondition(&stored.Status.Conditions, metav1.Condition{
+		Type:               slackConnectedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             slackConnectedReasonConnected,
+		Message:            slackConnectedUpMessage,
+		ObservedGeneration: stored.Generation,
+	})
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+		t.Fatal(err)
+	}
+	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d == nil || d.Reason != conditionReasonInvalidCredentialProxyResources {
+		t.Fatalf("Degraded after Slack recovery with invalid resources = %+v, want %s", d, conditionReasonInvalidCredentialProxyResources)
+	}
+
+	stored.Spec.Deployment = nil
+	if err := r.Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state); err != nil {
+		t.Fatal(err)
+	}
+	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d != nil {
+		t.Fatalf("Degraded after Slack and resource recovery = %+v, want removed", d)
+	}
+}
