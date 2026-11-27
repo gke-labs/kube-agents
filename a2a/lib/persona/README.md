@@ -187,12 +187,20 @@ worker refuses `antigravity`, which has no persona adapter yet.
     rules can't express a compound command; registration, the harness's
     before-tool check, deny rules and core-agent's shell denylist still
     hold, and the read tools aren't workspace-scoped there (the shell reads
-    anywhere it can reach anyway). The shell's boundary is the sandbox and
-    the broker, as on Claude Code. Without the shell, the read tools stay
-    inside the workspace. Search is server-side and
-    not gated per call, as WebSearch is on Claude Code, and works only where
-    the model endpoint offers it beside function calls (Gemini 3 or later,
-    by model name).
+    anywhere it can reach anyway). Two of core-agent's own gate checks
+    still narrow that shell, best effort and neither a boundary: a scan of a
+    command's visible write targets (a top-level redirection, or a `cp`,
+    `mv`, `mkdir`, `tee` and the like) refuses one outside the workspace and
+    the temp directories, which a write through an interpreter (`bash -c`,
+    `python3 -c`) passes unseen; and its search gate refuses a search-shaped
+    command such as `grep -rn` or `find .` while the native `grep` and
+    `glob` tools are registered. The shell's boundary is the pod's sandbox
+    and the broker, as on Claude Code. Without the shell, the read
+    tools stay inside the workspace. Search is server-side and not gated
+    per call, as WebSearch is on Claude Code, and works only where the
+    model endpoint offers it beside function calls (Gemini 3 or later, by
+    model name). A side call, such as the summary that compacts a long
+    history, goes out with no server-side tool on any model name.
   - Each `SKILL.md` frontmatter is written back with only the keys the
     harness reads, read as exactly one YAML document between exact `---`
     lines.

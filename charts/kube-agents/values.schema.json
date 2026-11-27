@@ -1966,6 +1966,9 @@
         "networkPolicy": {
           "type": "object"
         },
+        "schedules": {
+          "type": "object"
+        },
         "integration": {
           "type": "object",
           "additionalProperties": false,

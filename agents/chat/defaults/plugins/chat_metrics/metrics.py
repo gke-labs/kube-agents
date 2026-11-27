@@ -111,6 +111,10 @@ ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "is
 PROPOSALS_COUNTS_URL = "http://127.0.0.1:8699/v1/proposals/opened/counts"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 PROPOSALS_READ_TIMEOUT_SECONDS = 2
+# Session KV is on the pod's loopback: a proxy from the environment must not
+# get the read and its bearer token, and urllib does not leave out a loopback
+# host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # Beside the counts, rendered only with them: seconds since the last
 # successful ledger read, on a monotonic clock. 0 right after a good read; it
 # grows while failed reads keep serving the last counts, so a scraper can tell
@@ -327,7 +331,7 @@ class ProposalsOpenedGauge:
         if not key:
             raise ProposalsReadError(f"{SESSION_KV_KEY_ENV} is not set")
         request = urllib.request.Request(self._url, headers={"Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(request, timeout=PROPOSALS_READ_TIMEOUT_SECONDS) as response:  # nosec B310 -- a fixed loopback http URL
+        with _SESSION_KV_OPENER.open(request, timeout=PROPOSALS_READ_TIMEOUT_SECONDS) as response:
             if response.status != HTTPStatus.OK:
                 raise ProposalsReadError(f"status {response.status}")
             answer = json.loads(response.read())

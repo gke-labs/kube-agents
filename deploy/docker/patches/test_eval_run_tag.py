@@ -189,6 +189,53 @@ class LlmRequestTest(unittest.TestCase):
             self.assertEqual(eval_run_tag._fetch_session_tag("s"), "")
             self.assertFalse(eval_run_tag.record_session_tag("s", TAG))
 
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_session_kv(self):
+        # Session KV is on the pod's loopback address. With a proxy variable and no
+        # NO_PROXY entry for it, urllib hands the request and its bearer token to the proxy.
+        import http.server
+        import json
+        import socket
+        import threading
+        import urllib.request
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, self.headers.get("Authorization")))
+                answer = json.dumps({eval_run_tag.EVAL_RUN_KEY: TAG}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            do_GET = do_PUT = _answer  # noqa: N815 - the stdlib's names
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.object(eval_run_tag, "SESSION_KV_URL", url), \
+                mock.patch.dict(os.environ, {eval_run_tag.SESSION_KV_KEY_ENV: "k", "http_proxy": proxy, "HTTP_PROXY": proxy}), \
+                mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            self.assertTrue(eval_run_tag.record_session_tag("s", TAG))
+            self.assertEqual(eval_run_tag._fetch_session_tag("s"), TAG)
+        path = eval_run_tag.SESSION_EVAL_RUN_PATH.format(session_id="s")
+        self.assertEqual(seen, [("PUT", path, "Bearer k"), ("GET", path, "Bearer k")])
+
 
 # ---------------------------------------------------------------------------
 # The board

@@ -80,6 +80,10 @@ SESSION_EVAL_RUN_PATH = "/v1/sessions/{session_id}/eval-run"
 EVAL_RUN_KEY = "eval_run"
 HTTP_NOT_FOUND = 404
 SESSION_KV_TIMEOUT_SECONDS = 2.0
+#: Session KV is on the pod's loopback address: a proxy from the environment
+#: must not get the request and its bearer token, and urllib does not leave
+#: out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 #: A session with no record is asked again after this long; a found tag never
 #: changes (first write wins), so it is kept for the life of the process.
 MISS_CACHE_TTL_SECONDS = 30.0
@@ -133,7 +137,7 @@ def _session_kv(method: str, session_id: str, payload: Optional[dict] = None) ->
     url = SESSION_KV_URL + SESSION_EVAL_RUN_PATH.format(session_id=urllib.parse.quote(session_id, safe=""))
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
+    with _SESSION_KV_OPENER.open(request, timeout=SESSION_KV_TIMEOUT_SECONDS) as response:
         loaded = json.loads(response.read() or b"{}")
     return loaded if isinstance(loaded, dict) else {}
 

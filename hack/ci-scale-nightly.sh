@@ -18,7 +18,9 @@
 #
 #   1. sweep    delete any sized fleet an aborted run left
 #   2. install  the host cluster's install on the newest main commit with published
-#               images, at the size's tier
+#               images, at the size's tier. REGISTRY_PREFIX, when set, names the
+#               registry this repository's images are looked up in and pulled
+#               from; unset, GHCR
 #   3. up       build the fleet and its workloads
 #   4. run      the burst and soak windows and the verdict; --down deletes the fleet
 #               when the run ends, and an EXIT trap here deletes it whenever `run`

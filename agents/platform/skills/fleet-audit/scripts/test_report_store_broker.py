@@ -67,6 +67,9 @@ class FakeBroker:
         self.down: int | None = None
         # Answer every request 302 to this base URL, when set.
         self.redirect_to: str | None = None
+        # False: a broker from before run-start records (#6812), which
+        # answers their route 404 `not_found` as for any route it lacks.
+        self.run_starts = True
         broker = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -117,7 +120,9 @@ class FakeBroker:
         if path == PREFIX:
             rows = [
                 {"audit_id": audit, "key": key,
-                 "newest_run": max(s["runs"]) if s["runs"] else None, "latest_finished_at": None}
+                 "newest_run": max(s["runs"]) if s["runs"] else None, "latest_finished_at": None,
+                 **({"last_run_start": report_status.newest_run_start(
+                     [json.loads(b) for b in s["starts"].values()])} if s.get("starts") else {})}
                 for (audit, key), s in sorted(self.streams.items()) if s["runs"] or s["latest"]
             ]
             return 200, rows
@@ -143,6 +148,19 @@ class FakeBroker:
                 return 204, None
         if rest == ["runs"] and method == "GET":
             return 200, sorted((store or {"runs": {}})["runs"], reverse=True)
+        if len(rest) == 2 and rest[0] == "runs" and rest[1].startswith(report_status.RUN_START_PREFIX):
+            if not self.run_starts:
+                return 404, {"status": "not_found"}
+            run_id = rest[1][len(report_status.RUN_START_PREFIX):]
+            if method == "GET":
+                data = ((store or {}).get("starts") or {}).get(run_id)
+                return (200, data) if data is not None else (404, {"error": "not found"})
+            if method == "PUT":
+                # As the listener: a record never creates a store.
+                if store is None:
+                    return 404, {"error": "not found"}
+                store.setdefault("starts", {})[run_id] = body
+                return 204, None
         if len(rest) == 2 and rest[0] == "runs":
             if method == "GET":
                 data = (store or {"runs": {}})["runs"].get(rest[1])
@@ -396,6 +414,75 @@ class TestTheHttpStore(BrokerTestCase):
                     else:
                         store.read_latest(audit, repo)
         self.assertEqual([], self.broker.requests)
+
+
+class TestRunStartRecords(BrokerTestCase):
+    """The run-start record (#6812) through the broker: the run route, a reserved name."""
+
+    def setUp(self):
+        super().setUp()
+        audit_report._RUN_START_LOGGED.clear()
+        self.addCleanup(audit_report._RUN_START_LOGGED.clear)
+
+    def record(self, run_id="task-1", minutes=0, **done):
+        return report_status.run_start_record(run_id, (NOW + timedelta(minutes=minutes)).isoformat(), True, **done)
+
+    def test_a_record_rides_the_run_route_and_stays_out_of_the_ring(self):
+        self.put_remote(0)
+        store = self.store()
+        report_status.write_run_start(store, AUDIT, REPO, self.record())
+        self.assertEqual([("PUT", f"{PREFIX}/{AUDIT}/{KEY}/runs/started-task-1")], self.broker.calls("PUT"))
+        self.assertEqual([stamp_name(NOW)], store.list_runs(AUDIT, REPO))
+        self.assertEqual(self.record(), report_status.read_run_start(store, AUDIT, REPO, "task-1"))
+        self.assertIsNone(report_status.read_run_start(store, AUDIT, REPO, "task-2"))
+        self.assertEqual("task-1", report_status.unfinished_run_of(self.store(), AUDIT, REPO)["run_id"])
+        report_status.write_run_start(
+            store, AUDIT, REPO, self.record(done_at=(NOW + timedelta(minutes=5)).isoformat(), outcome="UPDATED")
+        )
+        self.assertIsNone(report_status.unfinished_run_of(self.store(), AUDIT, REPO))
+
+    def test_a_run_id_that_is_no_label_is_refused_before_any_request(self):
+        self.put_remote(0)
+        self.broker.requests.clear()
+        for bad in ("Task-1", "../latest", "", "a" * 64):
+            with self.subTest(run_id=bad), self.assertRaises(ValueError):
+                report_status.read_run_start(self.store(), AUDIT, REPO, bad)
+        self.assertEqual([], self.broker.requests)
+
+    def test_an_older_broker_refusing_the_name_never_stops_start(self):
+        self.put_remote(0)
+        self.broker.run_starts = False
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.record_run_start(AUDIT, REPO, "task-1", True, NOW)
+            audit_report.record_run_start(AUDIT, REPO, "task-2", True, NOW)
+            marked = audit_report.mark_run_done(AUDIT, "task-1", [REPO], "UPDATED", NOW)
+        self.assertFalse(marked)
+        self.assertEqual(1, err.getvalue().count("does not take run-start records yet"), err.getvalue())
+        self.assertNotIn("not marked done", err.getvalue())
+        # Older readers: the stream list carries no record, and nothing is shown.
+        self.assertIsNone(report_status.unfinished_run_of(self.store(), AUDIT, REPO))
+
+    def test_a_first_run_through_the_broker_is_untracked_and_quiet(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.record_run_start(AUDIT, REPO, "task-1", True, NOW)
+        self.assertNotIn("run-start", err.getvalue())
+        self.assertEqual({}, self.broker.streams.get((AUDIT, KEY), {}).get("starts") or {})
+
+    def test_finish_marks_its_own_run_by_id_through_the_broker(self):
+        self.put_remote(0)
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.record_run_start(AUDIT, REPO, "task-old", True, NOW)
+            audit_report.record_run_start(AUDIT, REPO, "task-new", True, NOW + timedelta(minutes=30))
+            self.assertTrue(audit_report.mark_run_done(AUDIT, "task-old", [REPO], "UPDATED", NOW))
+            # A run with no record of its own writes no done mark.
+            self.assertFalse(audit_report.mark_run_done(AUDIT, "task-none", [REPO], "UPDATED", NOW))
+        starts = self.broker.stream(AUDIT, KEY)["starts"]
+        self.assertEqual({"task-old", "task-new"}, set(starts))
+        self.assertIn("done_at", json.loads(starts["task-old"]))
+        self.assertNotIn("done_at", json.loads(starts["task-new"]))
+        self.assertEqual("task-new", report_status.unfinished_run_of(self.store(), AUDIT, REPO)["run_id"])
 
 
 class TestSelection(BrokerTestCase):
@@ -1024,6 +1111,18 @@ class TestSeed(BrokerTestCase):
         self.assertEqual(4, len(self.remote_runs()))
         self.assertEqual(self.envelope(5), self.broker.stream(AUDIT, KEY)["latest"])
         self.assertIn("seeded compliance-audit in acme/fleet into the broker", err.getvalue())
+
+    def test_a_run_start_record_seeds_first(self):
+        """`start` writes its run-start record before anything else touches the
+        broker, so on the first run after the switch the record seeds the local
+        history in first; otherwise the listener has no store for it yet and the
+        run goes untracked (#6812)."""
+        self.plant_local()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.record_run_start(AUDIT, REPO, "task-1", True, NOW + timedelta(minutes=5))
+        self.assertIn("seeded compliance-audit in acme/fleet into the broker", err.getvalue())
+        self.assertEqual({"task-1"}, set(self.broker.stream(AUDIT, KEY)["starts"]))
+        self.assertEqual("task-1", report_status.unfinished_run_of(self.store(str(self.local)), AUDIT, REPO)["run_id"])
 
 
 if __name__ == "__main__":

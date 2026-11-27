@@ -6,8 +6,12 @@
 # and replies with an interim line ("checking cluster namespaces and pods").
 # The session's wake turn read that as a reason to delegate again, and each
 # wake did, until the chain ended on "delegation refused: this conversation
-# has delegated as deep as it may (3)" with nothing answered (#2819). A wake
-# now has no delegate tool, so the chain is one delegation and one wake.
+# has delegated as deep as it may (3)" with nothing answered (#2819). Since
+# #6861 a wake under the depth bound may delegate again, and its guide tells
+# it not to for anything a result says is still running or will follow. A
+# wake at the bound gets no tool, so a loop now ends in an answer without a
+# refusal notice, which the check below can't see; #7245 adds a child count
+# so the case can assert exactly one delegation.
 #
 # A second check counts the chain's child tasks (#7245): at most one. Once a
 # wake may delegate again (#6861), a wake that loops gets no tool at the
