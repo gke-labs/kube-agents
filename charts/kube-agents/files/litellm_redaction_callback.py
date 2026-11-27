@@ -50,10 +50,11 @@ payload of any other type is refused. Generation
 settings and the gateway's own bookkeeping are not walked. A request the hook
 cannot walk is refused: one that carries no conversation, input or prompt, a
 `messages` or `contents` that is not a list of objects, anything at a
-payload position that is not binary base64, or nesting past the
-interpreter's recursion limit (tool-call arguments too deep to decode, or any
-value too deep to copy and walk), answered with 400 since the same request is
-refused every time. Model responses are not touched.
+payload position that is not binary base64, or nesting the hook can't follow
+(tool-call arguments too deep to decode, or any value too deep to copy and
+walk: the copy and walk take about two frames a level, so roughly half the
+interpreter's recursion limit, less the caller's stack), answered with 400
+since the same request is refused every time. Model responses are not touched.
 
 Two failure modes are deliberate. A rule that does not load raises at import,
 which stops the gateway pod at startup rather than letting it forward
@@ -264,8 +265,8 @@ TOOL_USE_TYPE = "tool_use"
 TOOL_USE_INPUT_KEY = "input"
 DATA_KEY = "data"
 
-# What a refusal says about JSON nested past the recursion limit; it names no
-# key or value.
+# What a refusal says about JSON nested too deeply for the hook to follow;
+# it names no key or value.
 DEEP_NESTING_REFUSAL = "JSON nested too deeply to walk"
 
 

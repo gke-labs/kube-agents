@@ -91,9 +91,10 @@ _PNG_BASE64 = "iVBORw0KGgo="
 _PDF_BASE64 = "JVBERi0xLjQK"  # %PDF-1.4
 _WAV_BASE64 = "UklGRiQAAABXQVZFZm10IA=="  # RIFF....WAVE
 # Nesting depths, against the interpreter's recursion limit (1000 by
-# default): past the limit the copy and walk can't go, past it by far the
-# JSON decoder can't either, and at a quarter of it arguments were walked
-# before the deep-nesting refusal existed and still are.
+# default). The copy and walk take about two frames a level, so they stop near
+# half the limit and twice it is well past; a hundred times it is past what
+# the JSON decoder takes on a default stack; and at a quarter of it arguments
+# were walked before the deep-nesting refusal existed and still are.
 _TOO_DEEP_TO_WALK = 2 * sys.getrecursionlimit()
 _TOO_DEEP_TO_DECODE = 100 * sys.getrecursionlimit()
 _DEEP_BUT_WALKABLE = sys.getrecursionlimit() // 4

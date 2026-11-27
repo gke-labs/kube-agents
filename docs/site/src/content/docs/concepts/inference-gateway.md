@@ -295,7 +295,7 @@ A few fields are left as they came. They are kept only where the provider APIs p
 - provider-encrypted content, which the provider checks byte for byte. That is a Responses reasoning item's `encrypted_content`, and in the assistant's turn a web search result's `encrypted_content`, the `reasoning_details` data and signature, and the `thought_signature` LiteLLM carries on the message and its tool calls;
 - binary payloads of a listed type (common images, PDF, audio and video) that decode as base64 and start the way their media type does. A payload of any other type is refused.
 
-A request the hook cannot walk is refused with 400, since the same request is refused every time and a caller shouldn't retry it. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, anything at one of the payload positions above that is not binary base64, or JSON nested too deeply for the hook to follow: tool-call arguments too deep to decode, or any value too deep to walk.
+A request the hook cannot walk is refused with 400, since the same request is refused every time and a caller shouldn't retry it. That is one with no conversation, input or prompt, a `messages` or `contents` that is not a list of objects, or anything at one of the payload positions above that is not binary base64. JSON nested too deeply for the hook to follow is refused the same way: tool-call arguments too deep to decode, or any value too deep to walk.
 
 Content the provider holds from elsewhere, such as a cached-content or uploaded-file reference, is not something this hook sees.
 
