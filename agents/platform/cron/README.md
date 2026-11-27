@@ -1172,8 +1172,8 @@ rule outlives the memory of why:
   in-flight note per stream on the sandbox pod's own volume, at
   `/opt/data/scratch/inflight_<audit>.json` in that pod (the script runs in
   the sandbox shell, whose `/opt/data` is its own PVC, not the gateway volume
-  this README otherwise calls "the volume"), holding the stream id and a start
-  time, honoured for two hours and removed by a `finish` that published or
+  this README otherwise calls "the volume"), holding the stream id, a start
+  time and the run id, honoured for two hours and removed by a `finish` that published or
   died (exit 0 or 1); `finish --dry-run` and a `finish` that exited 2 keep it,
   so a note beside a rejected document is a live run, not a stale one. The note spans one
   `start`-`finish` pair, so a multi-repository loop reclaims it at each
@@ -1229,7 +1229,11 @@ last scheduled run's stored document when the collector manifest digests the
 same, which is what spares a static fleet the by-hand drafting every day. It
 is in the prompt and not in the SOP, because a scheduled run and an on-demand
 run read the same SOP: an SOP that passed the flag would let every on-demand
-run of its stream go silent, or be closed from a stored document.
+run of its stream go silent, or be closed from a stored document. `start`
+needs no flag: it marks the run's run-start record scheduled by itself, for a
+Hermes cron run or a profile task under a builtin schedule's trigger, so a
+reader can tell a scheduled run that did not finish from an on-demand one
+([report store design §5](../../../docs/designs/fleet-audit-report-store.md#5-liveness)).
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
 prompt has the phrase `pass --scheduled to precheck and finish` (`pass
