@@ -1569,3 +1569,26 @@ func TestReloadedClientCAFilesThatShareACertificateAreReportedOnce(t *testing.T)
 		t.Errorf("the shared CA was reported %d times after two transitions, want 2", got)
 	}
 }
+
+// A bundle rotated into sharing a CA certificate after the server was built and before its
+// first handshake is reported at that handshake, once.
+func TestClientCAFilesThatShareACertificateBeforeTheFirstHandshakeAreReported(t *testing.T) {
+	const nowShare = "now share a CA certificate"
+	p := newCertProxy(t)
+	p.start(t, Options{}, append(append(p.mtlsArgs(), p.headerArgs()...), "--auth-mode=mtls,requestheader")...)
+	writeBundle(t, p.gatewayCAFile, append(slices.Clone(p.gateways.pem), p.workloads.pem...))
+	p.clock.passCheckInterval()
+	if logs := p.logs.String(); strings.Contains(logs, nowShare) {
+		t.Fatalf("logs = %s, want nothing reported before a handshake", logs)
+	}
+
+	workload := certCase{cert: p.workloads.workload(t, testWorkloadURI), status: http.StatusOK, username: testWorkloadURI, authenticator: authModeMTLS}
+	p.check(t, workload, nil)
+	if got := strings.Count(p.logs.String(), nowShare); got != 1 {
+		t.Fatalf("the shared CA was reported %d times at the first handshake, want once; logs = %s", got, p.logs.String())
+	}
+	p.check(t, workload, nil)
+	if got := strings.Count(p.logs.String(), nowShare); got != 1 {
+		t.Errorf("the shared CA was reported %d times after a second handshake, want once", got)
+	}
+}

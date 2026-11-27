@@ -325,6 +325,9 @@ func buildFromArgs(t *testing.T, args []string) (proxyConfig, error) {
 	}
 	written := parse(args)
 	cfg := parse(withLocalFiles(t, args))
+	// As newServer does for Run: the example's listener is the binary's own, so a
+	// certificate mode needs its serving files.
+	cfg.clientCert.ownListener = true
 	mode, err := k8sapiproxy.ParseMode(cfg.modeRaw)
 	if err != nil {
 		return written, err
@@ -693,8 +696,9 @@ func TestEgressGatewayReadmeVariantsStartTheBinary(t *testing.T) {
 			t.Errorf("--auth-mode=%q --partition-by-caller=%q --requestheader-partition-headers=%q, want front proxy callers partitioned by a header",
 				cfg.authMode, cfg.partitionByCaller, cfg.clientCert.headerPartitionHeaders)
 		}
-		if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" {
-			t.Error("the variant serves no TLS, which a client certificate needs")
+		// Left out, the flags take default paths this pod does not mount.
+		if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" || cfg.tlsCertFile == defaultTLSCertFile || cfg.tlsKeyFile == defaultTLSKeyFile {
+			t.Errorf("--tls-cert-file=%q --tls-key-file=%q, want the serving files a client certificate needs, named by the manifest", cfg.tlsCertFile, cfg.tlsKeyFile)
 		}
 	})
 
@@ -729,8 +733,10 @@ func TestModuleReadmeCertificateModeCommandsStartTheBinary(t *testing.T) {
 			if cfg.authMode != wantMode {
 				t.Errorf("--auth-mode=%q, want %q", cfg.authMode, wantMode)
 			}
-			if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" || cfg.upstreamURL == "" {
-				t.Errorf("--tls-cert-file=%q --tls-key-file=%q --upstream-url=%q, want all three set", cfg.tlsCertFile, cfg.tlsKeyFile, cfg.upstreamURL)
+			// A command that leaves the serving files out gets the flags' default paths,
+			// which exist only in the kube-agents deployment.
+			if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" || cfg.tlsCertFile == defaultTLSCertFile || cfg.tlsKeyFile == defaultTLSKeyFile || cfg.upstreamURL == "" {
+				t.Errorf("--tls-cert-file=%q --tls-key-file=%q --upstream-url=%q, want all three given by the command", cfg.tlsCertFile, cfg.tlsKeyFile, cfg.upstreamURL)
 			}
 		})
 	}

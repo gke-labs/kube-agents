@@ -679,7 +679,8 @@ type handshakeConfig struct {
 // handshake; a peer that presents none still connects, which is what a health probe and a
 // bearer-token caller do. The configuration is built once per version of the pool.
 //
-// onReload, when not nil, is called each time a handshake finds the client CAs reloaded.
+// onReload, when not nil, is called at the first handshake and each time a later one finds
+// the client CAs reloaded.
 func verifyClientCertificates(base *tls.Config, clientCAs *certreload.CAPool, onReload func()) func(*tls.ClientHelloInfo) (*tls.Config, error) {
 	// Cloned now, before the server starts and before base gets this func: net/http adds
 	// protocols to base once it serves, and every other field of base carries over.
@@ -691,7 +692,9 @@ func verifyClientCertificates(base *tls.Config, clientCAs *certreload.CAPool, on
 		if cached != nil && cached.pool == pool {
 			return cached.config, nil
 		}
-		if cached != nil && onReload != nil {
+		// On the first handshake too: a bundle may have been rotated between the server's
+		// construction, when onReload's own snapshot was taken, and now.
+		if onReload != nil {
 			onReload()
 		}
 		config := template.Clone()
