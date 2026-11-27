@@ -1481,6 +1481,19 @@ const (
 // throughout.
 const a2aGatewayProgressDeadlineSeconds int32 = 1800
 
+// a2aGatewayProxyEnvNames is the set of HTTP/HTTPS proxy environment variable
+// names forwarded as literals from spec.deployment.env onto the A2A gateway
+// container so outbound chat adapters (such as Slack Socket Mode and Web API)
+// inherit corporate proxy settings across upgrades without new CRD fields.
+var a2aGatewayProxyEnvNames = map[string]bool{
+	"HTTP_PROXY":  true,
+	"HTTPS_PROXY": true,
+	"NO_PROXY":    true,
+	"http_proxy":  true,
+	"https_proxy": true,
+	"no_proxy":    true,
+}
+
 func a2aNATSImage() string {
 	if override := os.Getenv(a2aNATSImageEnvVar); override != "" {
 		return override
@@ -7406,6 +7419,31 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 	return out
 }
 
+// a2aGatewayProxyEnv returns the literal HTTP/HTTPS proxy environment entries
+// from spec.deployment.env in declaration order. ValueFrom entries and all
+// non-proxy variables are ignored so the gateway container receives corporate
+// proxy settings without inheriting unrelated agent configuration or Secret refs.
+func a2aGatewayProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent == nil || agent.Spec.Deployment == nil {
+		return nil
+	}
+	var out []corev1.EnvVar
+	seen := make(map[string]int)
+	for _, entry := range agent.Spec.Deployment.Env {
+		if !a2aGatewayProxyEnvNames[entry.Name] || entry.ValueFrom != nil {
+			continue
+		}
+		ev := corev1.EnvVar{Name: entry.Name, Value: entry.Value}
+		if idx, dup := seen[entry.Name]; dup {
+			out[idx] = ev
+			continue
+		}
+		seen[entry.Name] = len(out)
+		out = append(out, ev)
+	}
+	return out
+}
+
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
 // docs/designs/spec-chatops-gateway.md). Which chat backends it starts are
 // the install's: the Google Chat env and relay token when a2aChatArmed, the
@@ -7860,6 +7898,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// cutoff and the profile names file's path, absent until then, so an
 	// unlatched gateway's template is unchanged.
 	env = append(env, a2aProfileSupervisorCutoffEnv(agent)...)
+	env = append(env, a2aGatewayProxyEnv(agent)...)
 	pullRefs := resolveImagePullSecrets(agent.Spec.Deployment)
 	if len(pullRefs) > 0 {
 		refNames := make([]string, 0, len(pullRefs))

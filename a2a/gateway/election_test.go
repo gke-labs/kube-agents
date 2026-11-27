@@ -435,7 +435,7 @@ func electedRig(t *testing.T, r *rig) *rig {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	client, err := lib.Connect(ctx, r.url, lib.WithName("gateway-test-b"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	client, err := connectClientTest(ctx, r.url, lib.WithName("gateway-test-b"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
 	if err != nil {
 		t.Fatalf("gateway client: %v", err)
 	}
