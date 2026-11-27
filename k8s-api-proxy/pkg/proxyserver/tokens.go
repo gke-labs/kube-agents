@@ -1,4 +1,4 @@
-package main
+package proxyserver
 
 import (
 	"bytes"

@@ -1859,7 +1859,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         operator = h.text("broker_split_go")
         manifests = h.text("manifests_go")
         kube_proxy_manifests = h.text("kube_proxy_manifests_go")
-        kube_proxy_main = h.text("k8s_api_proxy_main_go")
+        kube_proxy_server = h.text("k8s_api_proxy_server_go")
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
@@ -1905,7 +1905,7 @@ class C1IsolationIsStructural(unittest.TestCase):
                 )
                 read_name = self._one_match(
                     r'%s\s*=\s*"([^"]+)"' % const_name,
-                    kube_proxy_main,
+                    kube_proxy_server,
                     "k8s-api-proxy's %s" % const_name,
                 )
                 self.assertEqual(

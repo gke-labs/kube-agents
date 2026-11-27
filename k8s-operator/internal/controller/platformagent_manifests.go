@@ -1071,6 +1071,7 @@ var DefaultBuiltInPlugins = []string{
 	"pr_opened",
 	"chat_metrics",
 	"eval_run_tag",
+	"model_identity",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes

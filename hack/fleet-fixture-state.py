@@ -202,9 +202,10 @@ BLOB_SHA_SHORT = 8
 PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots", "reservation": "reservations"}
 PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network|snapshot|reservation)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
 # A reservation is the project's, and the node pool that names it is a
-# cluster's. So this one project subject is also for a cluster role: the
-# missing-reservation-pool role asserts on its pool and on the absence of the
-# reservation that the pool names. It is a state subject only: no probe takes
+# cluster's. So this one project subject is also for a cluster role: each of
+# the two reservation roles (missing-reservation-pool and
+# missing-reservation-autoscaled) asserts on its pool and on the absence of
+# the reservation that the pool names. It is a state subject only: no probe takes
 # it, because a probe passes when an object is there.
 RESERVATION_KIND = "reservation"
 # The collection `source_disk_gone` reads beside a snapshot subject.
