@@ -340,6 +340,8 @@ The daily stuck-task report shows a **Retry** and a **Drop** button under each t
 
 On Google Chat, the report shows the same buttons. Google Chat draws every button under the message, so the report numbers its tasks and labels each button with the task's number: "Retry 1" and "Drop 1". The task's line then ends with "✓ Retrying." or "Dropped.", who pressed, and the time in UTC. A press that did not land keeps the buttons and says so on the line.
 
+On Microsoft Teams, with the gateway's Teams backend armed, the report shows **Retry** and **Drop** under each task, as on Slack. The task's line then ends as on Google Chat, and the buttons go. A press that did not land keeps the buttons and says so. After a gateway restart, a press on an older report still acts, and its result is posted as a new message.
+
 ### Files a card produced
 
 The gateway does not attach a file the card names in its `artifacts` list ([What the gateway changes on Slack](#what-the-gateway-changes-on-slack)); the agent still has to declare the file for it to leave the sandbox. Its terminal and file tools run in a separate sandbox pod, so a file it writes is on a volume the gateway cannot read. Only the paths the `artifacts` list names are copied across to the gateway for delivery, and only for as long as the delivery takes.
@@ -434,7 +436,7 @@ A reply you type in the conversation answers the question the same way, with you
 
 On Microsoft Teams, with the gateway's Teams backend armed, the same messages arrive as one card: the bold first sentence, the detail, a plan's steps or a report's rows, the "why" section drawn open, and the buttons under it. A choice button and a typed reply answer as on Google Chat, and the card then shows `✓ <your name>: <the button, or your reply's first words>` by your Teams display name. When the card cannot be edited, as for one posted before a gateway restart, that line is posted as a new message.
 
-An install with `adaptiveCards: false` gets the text with no buttons; type the answer there. The stuck-task report's Retry and Drop are not drawn on Teams.
+An install with `adaptiveCards: false` gets the text with no buttons; type the answer there.
 
 ### Follow-ups while a task runs
 
