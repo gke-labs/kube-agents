@@ -93,6 +93,8 @@ access to every namespace, and is the choice to make deliberately.
 
 Capacity is shared too. `--max-in-flight` (24 by default) caps the requests one replica forwards
 at once across all tenants, so one tenant's concurrent requests can get another's answered `429`.
+The example does not set `--max-in-flight-per-caller` or `--max-long-running-per-caller`, which
+bound what one username holds of that capacity and how many watches it opens.
 
 ## The sandbox kubeconfig and kubectl versions
 

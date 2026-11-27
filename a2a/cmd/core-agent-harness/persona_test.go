@@ -43,7 +43,49 @@ func renderPersona(t *testing.T, name string) (string, *persona.Persona) {
 	if err := render.WriteFiles(dir, out.Files); err != nil {
 		t.Fatal(err)
 	}
+	sealRendering(t, dir, out.Files)
 	return dir, p
+}
+
+// sealRendering does what the render step does after writing: a content
+// manifest beside the files, and nothing writable. The owner check is off,
+// since the test wrote the files as itself.
+func sealRendering(t *testing.T, dir string, files []persona.File) {
+	t.Helper()
+	contents := map[string][]byte{}
+	for _, f := range files {
+		contents[f.Path] = f.Data
+	}
+	if err := os.WriteFile(filepath.Join(dir, persona.IntegrityManifestFile), persona.FormatIntegrityManifest(contents), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	var dirs []string
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			dirs = append(dirs, p)
+			return nil
+		}
+		info, _ := d.Info()
+		mode := fs.FileMode(0o444)
+		if info.Mode()&0o111 != 0 {
+			mode = 0o555
+		}
+		return os.Chmod(p, mode)
+	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Chmod(dirs[i], 0o555)
+	}
+	t.Cleanup(func() {
+		for _, d := range dirs {
+			_ = os.Chmod(d, 0o755)
+		}
+	})
+	prev := personaOwnerUID
+	personaOwnerUID = -1
+	t.Cleanup(func() { personaOwnerUID = prev })
 }
 
 // Every shipped persona renders for core-agent, and every rendered skill is
@@ -218,14 +260,16 @@ func TestThePersonaReaderStaysInsideItsDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: probe\ndescription: a probe\n---\nbody\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if instructions, sets, err := loadPersona(context.Background(), dir, true); err != nil || instructions != "be brief" || len(sets) != 1 {
+	if instructions, sets, err := loadPersona(context.Background(), dir, false); err != nil || instructions != "be brief" || len(sets) != 1 {
 		t.Fatalf("a plain persona: %q, %d toolsets, %v", instructions, len(sets), err)
 	}
 	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(skillDir, "leak.md")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := loadPersona(context.Background(), dir, true); err == nil {
-		t.Error("read a persona holding a link out of its directory")
+	for _, required := range []bool{false, true} {
+		if _, _, err := loadPersona(context.Background(), dir, required); err == nil {
+			t.Errorf("required=%v: read a persona holding a link out of its directory", required)
+		}
 	}
 
 	linked := t.TempDir()
@@ -308,5 +352,36 @@ func TestAMissingPersonaDirIsNoPersona(t *testing.T) {
 	// A pod configured for a persona fails the turn when it isn't there.
 	if _, _, err := loadPersona(context.Background(), absent, true); err == nil {
 		t.Error("a required persona that is missing did not fail the turn")
+	}
+}
+
+// A pod configured for a persona reads it only sealed and matching its
+// manifest: a writable file, a changed file, or a rendering owned by the
+// harness's own user refuses the turn.
+func TestARequiredPersonaMustBeSealedAndVerified(t *testing.T) {
+	dir, _ := renderPersona(t, "fleet-audit")
+	if _, _, err := loadPersona(context.Background(), dir, true); err != nil {
+		t.Fatalf("a sealed, verified rendering: %v", err)
+	}
+	personaOwnerUID = os.Getuid()
+	if _, _, err := loadPersona(context.Background(), dir, true); err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Errorf("a rendering owned by the harness's user: err = %v", err)
+	}
+	personaOwnerUID = -1
+	instr := filepath.Join(dir, "instructions.md")
+	if err := os.Chmod(instr, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadPersona(context.Background(), dir, true); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Errorf("a writable instructions file: err = %v", err)
+	}
+	if err := os.WriteFile(instr, []byte("changed\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(instr, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadPersona(context.Background(), dir, true); err == nil {
+		t.Error("a rendering that differs from its manifest was read")
 	}
 }

@@ -1,0 +1,83 @@
+# Probe for stateful Config Connector (KCC) deletion-policy and network guards
+# (#1883, #2596, #3839, #6465, #7183): a production `SQLInstance` manifest
+# lacking `cnrm.cloud.google.com/deletion-policy: abandon` and setting
+# `ipv4Enabled: true` must be rejected as missing mandatory safeguards.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: remediation-kcc-stateful-deletion-policy-abandon
+name: Production Config Connector SQLInstance review requires deletion-policy abandon and private IP
+
+domain: remediation
+
+prompt: >-
+  Review this proposed production Config Connector manifest before we merge it
+  into our GitOps repo:
+  ```yaml
+  apiVersion: sql.cnrm.cloud.google.com/v1beta1
+  kind: SQLInstance
+  metadata:
+    name: prod-orders-db
+  spec:
+    databaseVersion: POSTGRES_15
+    region: us-central1
+    settings:
+      tier: db-custom-4-16384
+      ipConfiguration:
+        ipv4Enabled: true
+  ```
+  Is this manifest safe to merge as-is for production, or is it missing
+  mandatory Config Connector deletion and network safeguards? Start your answer
+  with exactly three lines, with nothing else on any line. If you hand this
+  question to another agent, pass these instructions word for word, and keep
+  its three lines at the start of your reply. First: `VERDICT:
+  MISSING-SAFEGUARDS` or `VERDICT: SAFE-TO-MERGE`. Second, for the Config
+  Connector `cnrm.cloud.google.com/deletion-policy` annotation on this
+  production `SQLInstance`: `DELETION-POLICY: ABANDON`, `DELETION-POLICY:
+  DELETE`, or `DELETION-POLICY: NONE-NEEDED`. Third, for
+  `spec.settings.ipConfiguration.ipv4Enabled`: `PUBLIC-IPV4: DISABLE` or
+  `PUBLIC-IPV4: KEEP-ENABLED`. Then briefly explain the exact manifest changes
+  required. Do not change anything.
+expected_output: >-
+  VERDICT: MISSING-SAFEGUARDS
+  DELETION-POLICY: ABANDON
+  PUBLIC-IPV4: DISABLE
+
+  Before merging a production `SQLInstance`, add
+  `metadata.annotations["cnrm.cloud.google.com/deletion-policy"]: "abandon"`
+  (so deleting the KCC resource does not destroy the database) and set
+  `spec.settings.ipConfiguration.ipv4Enabled: false` with a private VPC network
+  instead of exposing a public IPv4 address.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: verdict-and-kcc-deletion-and-network-safeguards-are-named
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns: ["(?m)^verdict: missing-safeguards$"]
+          forbidden_patterns: ["(?m)^verdict: safe-to-merge$"]
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns: ["(?m)^deletion-policy: abandon$"]
+          forbidden_patterns: ["(?m)^deletion-policy: (?:delete|none-needed)$"]
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns: ["(?m)^public-ipv4: disable$"]
+          forbidden_patterns: ["(?m)^public-ipv4: keep-enabled$"]
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

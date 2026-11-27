@@ -51,6 +51,13 @@ const busMigrationConvertDeadline = 15 * time.Minute
 // (busMigrationWorkloadName).
 const busMigrationNameHashLength = 10
 
+const (
+	errNoStreamPolicyFmt     = "no stream policy for %s"
+	errOperatorBusConnectFmt = "connecting to the bus at %s as the operator: %w"
+	operatorBusConnName      = "kubeagents-operator"
+	operatorInboxPrefix      = "_INBOX." + a2aOperatorBusUser
+)
+
 // busMigrationLeg is the direction of a run.
 type busMigrationLeg string
 
@@ -1234,7 +1241,7 @@ func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmi
 	return []busmigrate.StreamPolicy{
 		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, a2aTasksMaxBytes, 4096, a2aTasksMaxConsumers(agent)),
 		stream("DIRECTORY", []string{"a2a.agents.>"}, 0, 1073741824, 1, 64),
-		stream(a2aTopicsStateStream, []string{"a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"}, 0, 1073741824, 8, 64),
+		stream(a2aTopicsStateStream, []string{a2aUpgradeReadinessSubject, a2aTopologySkewSubject, a2aSharedBlueprintSubject, a2aSharedProbeSubject}, 0, 1073741824, 8, 64),
 		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, a2aTopicsJournalMaxBytes, -1, 64),
 		kv("runtime-state", 268435456, 0),
 		kv("session-state", 268435456, 0),
@@ -1245,6 +1252,74 @@ func a2aStreamPolicies(agent *agentv1alpha1.PlatformAgent, replicas int) []busmi
 		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1, a2aProfileDurablesAllowed),
 		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1, 1),
 	}
+}
+
+// a2aTopicsStatePolicy is the operator's StreamPolicy for TOPICS-STATE, used
+// when appending missing rendered subjects on upgrade (busmigrate.AppendMissingSubjects).
+func a2aTopicsStatePolicy(agent *agentv1alpha1.PlatformAgent) (busmigrate.StreamPolicy, bool) {
+	for _, policy := range a2aStreamPolicies(agent, 1) {
+		if policy.Name == a2aTopicsStateStream {
+			return policy, true
+		}
+	}
+	return busmigrate.StreamPolicy{}, false
+}
+
+// operatorTopicsStateConn opens a bus connection as the operator principal to
+// append missing rendered subjects to TOPICS-STATE on upgrade. When the
+// manager's own namespace and ServiceAccount are not configured
+// (operatorBusPrincipal), the operator renders no bus identity for itself and
+// returns (nil, nil) so reportA2AProvisionFindings falls back to recording the
+// TopicsStateSubjectMissing Event.
+func (r *PlatformAgentReconciler) operatorTopicsStateConn(_ context.Context, agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
+	if _, _, ok := operatorBusPrincipal(); !ok {
+		return nil, nil
+	}
+	url := a2aNATSClientURL(agent)
+	tokenFile := operatorBusAuthFile()
+	nc, err := nats.Connect(url, (&natsCardPublisher{reader: r.a2aReader()}).busTLS(agent),
+		nats.Name(operatorBusConnName),
+		nats.TokenHandler(func() string {
+			b, err := os.ReadFile(tokenFile) // #nosec G304 -- the manager's own projected token path
+			if err != nil {
+				return ""
+			}
+			return string(b)
+		}),
+		nats.CustomInboxPrefix(operatorInboxPrefix),
+		nats.Timeout(cardBusTimeout),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(errOperatorBusConnectFmt, url, err)
+	}
+	return nc, nil
+}
+
+// appendTopicsStateSubjects appends missing rendered subjects to TOPICS-STATE
+// through busmigrate.AppendMissingSubjects, which refuses any change other
+// than added policy subjects (no removed subject, no changed limit or
+// retention, no RePublish). checked is true when the operator connected to the
+// bus and inspected TOPICS-STATE (including when every rendered subject was
+// already present and added is empty). When the operator's bus identity is not
+// configured (and no test seam is set), it returns (nil, false, nil) so
+// reportA2AProvisionFindings falls back to recording the
+// TopicsStateSubjectMissing Event.
+func (r *PlatformAgentReconciler) appendTopicsStateSubjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (added []string, checked bool, err error) {
+	connFn := r.busTopicsStateConn
+	if connFn == nil {
+		connFn = r.operatorTopicsStateConn
+	}
+	policy, ok := a2aTopicsStatePolicy(agent)
+	if !ok {
+		return nil, false, fmt.Errorf(errNoStreamPolicyFmt, a2aTopicsStateStream)
+	}
+	nc, err := connFn(ctx, agent)
+	if err != nil || nc == nil {
+		return nil, false, err
+	}
+	defer nc.Close()
+	added, err = busmigrate.AppendMissingSubjects(ctx, nc, policy)
+	return added, err == nil, err
 }
 
 // ensureBusRunSecret writes the run Secret once the hashing pod has

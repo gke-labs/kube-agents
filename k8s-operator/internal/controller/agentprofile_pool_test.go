@@ -548,16 +548,20 @@ func TestGateOffRemovesThePoolsWhateverElseFails(t *testing.T) {
 // documented limit it stays inside Autopilot's 10Gi per pod, so a profile at
 // the limit still schedules.
 func TestTheWorkerFitsAutopilotUpToTheToolLimit(t *testing.T) {
-	agent := a2aTestAgent()
-	profile := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
-		for i := 0; i < profileWorkerAutopilotToolLimit; i++ {
-			p.Spec.Tools = append(p.Spec.Tools, agentv1alpha1.AgentProfileTool{Name: fmt.Sprintf("tool%d", i), Image: fmt.Sprintf("registry.example/tool%d:1", i)})
+	// A core-agent profile's pod adds the persona render's emptyDir.
+	for _, harness := range []string{"", coreAgentHarnessType} {
+		agent := a2aTestAgent()
+		profile := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+			for i := 0; i < profileWorkerAutopilotToolLimit; i++ {
+				p.Spec.Tools = append(p.Spec.Tools, agentv1alpha1.AgentProfileTool{Name: fmt.Sprintf("tool%d", i), Image: fmt.Sprintf("registry.example/tool%d:1", i)})
+			}
+			p.Spec.Harness.Type = harness
+		})
+		spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false)
+		req := spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage]
+		if ceiling := resource.MustParse("10Gi"); req.Cmp(ceiling) > 0 {
+			t.Errorf("harness %q: with %d tools the worker requests %s of ephemeral storage, past Autopilot's 10Gi per pod", harness, profileWorkerAutopilotToolLimit, req.String())
 		}
-	})
-	spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false)
-	req := spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage]
-	if ceiling := resource.MustParse("10Gi"); req.Cmp(ceiling) > 0 {
-		t.Errorf("with %d tools the worker requests %s of ephemeral storage, past Autopilot's 10Gi per pod", profileWorkerAutopilotToolLimit, req.String())
 	}
 }
 

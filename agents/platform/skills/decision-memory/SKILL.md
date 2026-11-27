@@ -5,7 +5,7 @@ description: Check, recall, and explain infrastructure decisions and lessons in 
 
 # Task
 
-The GitOps repository stores infrastructure decisions and operational lessons as reviewed Operational Knowledge Framework (OKF) records (`DEC-YYYY-NNN` and `LES-YYYY-NNN`) under `knowledge/` (`decision/`, `lesson/`, `decisions/`, `lessons/`, or paths declared in `.kube-agents/intent.yaml`).
+The GitOps repository stores infrastructure decisions and operational lessons as reviewed Open Knowledge Format (OKF) records (`DEC-YYYY-NNN` and `LES-YYYY-NNN`) under `knowledge/` (`decision/`, `lesson/`, `decisions/`, `lessons/`, or paths declared in `.kube-agents/intent.yaml`).
 The `index` subcommand also ingests external ADRs (`docs/adr/`), RFCs (`docs/rfcs/`), and runbooks (`docs/runbooks/` or `knowledge/runbooks/`) into the Hindsight `kube-agents-decisions` bank for `--semantic` recall.
 Use this skill to check recorded guards before you modify a file or review a change.
 Every record update requires a pull request that a human merges.

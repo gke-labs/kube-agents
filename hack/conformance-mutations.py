@@ -2000,6 +2000,87 @@ Mutation(
         "turned off",
     ),
     Mutation(
+        "C1-broker-exec-output-unredacted",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        stdout, stdout_count = redact_tool_output(stdout, stdout_cut_at)\n"
+         "        stderr, stderr_count = redact_tool_output(stderr, result.stderr_cut_at)\n",
+         "        stdout_count = stderr_count = 0\n"),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "drop the redaction from the exec reply on the grounds that the sandbox "
+        "side redacts -- it does for the shell, but a profile worker's or a "
+        "session pod's model then reads a token from a ConfigMap as kubectl "
+        "printed it",
+    ),
+    Mutation(
+        "C1-broker-mcp-reply-unredacted",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role not in roles or not body:\n",
+         "    if True:\n"),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "pass the MCP relay's reply through untouched because the upstream is "
+        "Google's -- a document a tool returns can still quote a token, and "
+        "the profile worker's model reads it",
+    ),
+    Mutation(
+        "C1-broker-json-escape-boundary-dropped",
+        "agents/platform/scripts/credential_shapes.py",
+        ("        source = JSON_ESCAPE_BOUNDARY + source[len(_WORD_BOUNDARY):]\n",
+         "        pass\n"),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "keep the shapes' plain word boundary in tool output, as in the log -- a "
+        "token after a `\\n` escape in kubectl -o json output then has the "
+        "escape's `n` in front of it and passes",
+    ),
+    Mutation(
+        "C1-broker-private-key-armour-only",
+        "agents/platform/scripts/credential_shapes.py",
+        ("    PRIVATE_KEY_SHAPE_NAME: PRIVATE_KEY_BLOCK,\n",
+         ""),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "redact the PEM armour line in tool output as the log does -- the key "
+        "body between the armour lines then reaches the model",
+    ),
+    Mutation(
+        "C1-broker-url-password-without-json-escapes",
+        "agents/platform/scripts/credential_shapes.py",
+        ('_URL_PASSWORD_CHAR = r"(?:[^\\s/?#\\[\\]\\"\'<>{}\\\\|^`,;]|" + _JSON_ESCAPE + r")"\n',
+         '_URL_PASSWORD_CHAR = r"[^\\s/?#\\[\\]\\"\'<>{}\\\\|^`,;]"\n'),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "keep the URL password's log-form class in tool output -- Go's JSON "
+        "encoder writes `&` as `\\u0026`, so a password holding one in "
+        "kubectl -o json output passes whole",
+    ),
+    Mutation(
+        "C1-broker-match-opens-on-an-escape-letter",
+        "agents/platform/scripts/credential_shapes.py",
+        ('_NOT_ON_AN_ESCAPE_LETTER = r"(?!(?<=(?<!\\\\)\\\\)[bfnrtu])"\n',
+         '_NOT_ON_AN_ESCAPE_LETTER = ""\n'),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "let the plain word boundary open a match anywhere it holds -- a URL "
+        "after a `\\n` then takes the escape's `n` as its scheme's first letter "
+        "and leaves a lone backslash, and the JSON stops parsing",
+    ),
+    Mutation(
+        "C1-broker-header-value-in-prose",
+        "agents/platform/scripts/credential_shapes.py",
+        ("    HEADER_VALUE_SHAPE_NAME: HEADER_VALUE_TOOL_FORM,\n",
+         ""),
+        "test_C1_the_broker_leaves_must_keep_tool_output_byte_identical",
+        "use the log form's header value in tool output, any twelve letters "
+        "after `basic` or `bearer` -- prose about an auth bug then reaches the "
+        "model with its words blanked",
+    ),
+    Mutation(
+        "C1-broker-jwt-shape-one-segment",
+        "agents/platform/scripts/credential_shapes.py",
+        ('re.compile(r"\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}")',
+         're.compile(r"\\beyJ[A-Za-z0-9_-]{8,}")'),
+        "test_C1_the_broker_leaves_must_keep_tool_output_byte_identical",
+        "simplify the JWT shape to its eyJ header, to catch a token cut short -- "
+        "every base64-encoded JSON value and every list continue token in a "
+        "kubectl read then reaches the model as [REDACTED]",
+    ),
+    Mutation(
         "A1-flag-refusal-invites-a-write-retry",
         "agents/platform/scripts/command_policy.py",
         ("    stripped = _strip_refused_flags(argv)\n",

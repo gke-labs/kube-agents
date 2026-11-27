@@ -36,6 +36,15 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # The Google Workspace Add-ons service agent, which Chat creates in the project and
 # which terraform/modules/chat-pubsub/main.tf grants publisher on the events topic.
 readonly WORKSPACE_ADDONS_SA_DOMAIN="gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
+readonly CHAT_API_PUSH_SA="chat-api-push@system.gserviceaccount.com"
+readonly GSUITEADDONS_API="gsuiteaddons.googleapis.com"
+readonly CHAT_API="chat.googleapis.com"
+readonly PUBSUB_API="pubsub.googleapis.com"
+readonly ROLE_TOKEN_CREATOR="roles/iam.serviceAccountTokenCreator"
+readonly ROLE_PUBSUB_PUBLISHER="roles/pubsub.publisher"
+readonly ROLE_PUBSUB_SUBSCRIBER="roles/pubsub.subscriber"
+readonly ROLE_PUBSUB_VIEWER="roles/pubsub.viewer"
+readonly CHAT_SUB_ACK_DEADLINE_SECONDS=60
 
 load_state
 
@@ -47,6 +56,18 @@ if [ -n "${GCHAT_STEPS_GOOGLE_CHAT_ENABLED+set}" ]; then
   ALLOWED_USERS="${GCHAT_STEPS_ALLOWED_USERS:-}"
   CHAT_TOPIC_NAME="${GCHAT_STEPS_TOPIC_NAME:-}"
   CHAT_SUB_NAME="${GCHAT_STEPS_SUB_NAME:-}"
+fi
+if [ -n "${GCHAT_STEPS_CHAT_PROJECT_ID+set}" ]; then
+  CHAT_PROJECT_ID="${GCHAT_STEPS_CHAT_PROJECT_ID:-}"
+fi
+if [ -n "${GCHAT_STEPS_CHAT_MANAGE_PROJECT+set}" ]; then
+  CHAT_MANAGE_PROJECT="${GCHAT_STEPS_CHAT_MANAGE_PROJECT:-}"
+fi
+if [ -n "${GCHAT_STEPS_CHAT_PROJECT_NUMBER+set}" ]; then
+  CHAT_PROJECT_NUMBER="${GCHAT_STEPS_CHAT_PROJECT_NUMBER:-}"
+fi
+if [ -n "${GCHAT_STEPS_CHAT_GSA_NAME+set}" ]; then
+  CHAT_GSA_NAME="${GCHAT_STEPS_CHAT_GSA_NAME:-}"
 fi
 # An empty subscription name is one the tfvars generator derives from the
 # topic, as an install.env that turned Google Chat on in the Day-2 menu has.
@@ -94,29 +115,62 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
     print_warning "Google Chat integration is enabled but CHAT_TOPIC_NAME or CHAT_SUB_NAME is missing. It may not work properly."
   fi
 
+  chat_project="${CHAT_PROJECT_ID:-${PROJECT_ID:-}}"
+  chat_manage="${CHAT_MANAGE_PROJECT:-$DEFAULT_CHAT_MANAGE_PROJECT}"
+  chat_gsa_name="${CHAT_GSA_NAME:-$DEFAULT_CHAT_GSA_NAME}"
+  agent_gsa_email="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID:-<PROJECT_ID>}.iam.gserviceaccount.com"
+  if [ -n "${CHAT_PROJECT_ID:-}" ] && [ "${CHAT_PROJECT_ID}" != "${PROJECT_ID:-}" ]; then
+    subscriber_sa_email="${chat_gsa_name}@${chat_project}.iam.gserviceaccount.com"
+    chat_project_number="${CHAT_PROJECT_NUMBER:-}"
+  else
+    subscriber_sa_email="$agent_gsa_email"
+    chat_project_number="${CHAT_PROJECT_NUMBER:-${PROJECT_NUMBER:-}}"
+  fi
+
   echo -e "${C_CYAN}${C_BOLD}--- [Google Chat Integration Instructions] ---${C_RESET}"
+  if ! is_truthy "$chat_manage"; then
+    echo -e "${C_YELLOW}CHAT_MANAGE_PROJECT=false: have an administrator of '${chat_project:-<CHAT_PROJECT_ID>}' run:${C_RESET}"
+    echo -e "  gcloud services enable ${CHAT_API} ${GSUITEADDONS_API} ${PUBSUB_API} --project=${chat_project:-<CHAT_PROJECT_ID>}"
+    echo -e "  gcloud beta services identity create --service=${GSUITEADDONS_API} --project=${chat_project:-<CHAT_PROJECT_ID>}"
+    echo -e "  gcloud beta services identity create --service=${CHAT_API} --project=${chat_project:-<CHAT_PROJECT_ID>}"
+    if [ "$subscriber_sa_email" != "$agent_gsa_email" ]; then
+      echo -e "  gcloud iam service-accounts create ${chat_gsa_name} --project=${chat_project:-<CHAT_PROJECT_ID>} --display-name=\"Platform Agent Google Chat Service Account\""
+      echo -e "  gcloud iam service-accounts add-iam-policy-binding ${subscriber_sa_email} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${agent_gsa_email}\" --role=\"${ROLE_TOKEN_CREATOR}\""
+    fi
+    echo -e "  gcloud pubsub topics create ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>}"
+    echo -e "  gcloud pubsub subscriptions create ${CHAT_SUB_NAME} --topic=${CHAT_TOPIC_NAME} --ack-deadline=${CHAT_SUB_ACK_DEADLINE_SECONDS} --project=${chat_project:-<CHAT_PROJECT_ID>}"
+    echo -e "  gcloud pubsub topics add-iam-policy-binding ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${CHAT_API_PUSH_SA}\" --role=\"${ROLE_PUBSUB_PUBLISHER}\""
+    echo -e "  gcloud pubsub topics add-iam-policy-binding ${CHAT_TOPIC_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:service-${chat_project_number:-<CHAT_PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}\" --role=\"${ROLE_PUBSUB_PUBLISHER}\""
+    echo -e "  gcloud pubsub subscriptions add-iam-policy-binding ${CHAT_SUB_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${subscriber_sa_email}\" --role=\"${ROLE_PUBSUB_SUBSCRIBER}\""
+    echo -e "  gcloud pubsub subscriptions add-iam-policy-binding ${CHAT_SUB_NAME} --project=${chat_project:-<CHAT_PROJECT_ID>} --member=\"serviceAccount:${subscriber_sa_email}\" --role=\"${ROLE_PUBSUB_VIEWER}\""
+    echo -e ""
+  fi
   echo -e "[ ] 1. Configure GChat bot connection in GCP Console:"
-  echo -e "       ${C_WHITE}https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${PROJECT_ID}${C_RESET}"
+  echo -e "       ${C_WHITE}https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=${chat_project}${C_RESET}"
   echo -e "       - Name: ${C_GREEN}GKE Platform Agent Bot${C_RESET}"
   echo -e "       - Avatar: ${C_GREEN}https://raw.githubusercontent.com/cncf/artwork/master/projects/kubernetes/icon/color/kubernetes-icon-color.png${C_RESET}"
   echo -e "       - Connection Settings: Select ${C_BOLD}Cloud Pub/Sub${C_RESET}"
-  echo -e "       - Pub/Sub Topic Name: ${C_GREEN}projects/${PROJECT_ID}/topics/${CHAT_TOPIC_NAME}${C_RESET}"
+  echo -e "       - Pub/Sub Topic Name: ${C_GREEN}projects/${chat_project}/topics/${CHAT_TOPIC_NAME}${C_RESET}"
   echo -e "       - Under Visibility, check: ${C_GREEN}Only specific people (add your email/emails: ${ALLOWED_USERS:-your-email})${C_RESET}"
-  sa_display_format="service-${PROJECT_NUMBER:-<PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
+  sa_display_format="service-${chat_project_number:-<CHAT_PROJECT_NUMBER>}@${WORKSPACE_ADDONS_SA_DOMAIN}"
   echo -e "       - After saving, refresh the page and verify the Workspace Add-ons ${C_BOLD}Service account email${C_RESET} appears under Connection settings"
   echo -e "         ${C_CYAN}(format: ${C_GREEN}${sa_display_format}${C_CYAN}; it is not the agent's ${C_YELLOW}${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}${C_CYAN}).${C_RESET}"
   echo -e "         ${C_CYAN}(This field only exists when \"Build this Chat app as a Workspace add-on\" is checked — the default, locked-on state for new apps).${C_RESET}"
-  echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
+  if is_truthy "$chat_manage"; then
+    echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
+  else
+    echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — have an administrator of '${chat_project:-<CHAT_PROJECT_ID>}' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above, then re-save this config.${C_RESET}"
+  fi
   echo -e ""
   next_step=2
-  if [ -n "${PROJECT_NUMBER:-}" ]; then
+  if [ -n "${chat_project_number:-}" ]; then
     next_step=3
     echo -e "[ ] 2. Direct DM Link to Bot on Google Chat:"
-    echo -e "       ${C_WHITE}https://chat.google.com/dm/${PROJECT_NUMBER}${C_RESET}"
+    echo -e "       ${C_WHITE}https://chat.google.com/dm/${chat_project_number}${C_RESET}"
     echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
     echo -e ""
   else
-    print_warning "PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."
+    print_warning "CHAT_PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."
   fi
   print_a2a_gateway_steps "$next_step"
 else

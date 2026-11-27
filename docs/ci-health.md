@@ -1604,7 +1604,7 @@ impersonate it for the cluster listing, the credentials, the control-plane
 describes and the `gcloud compute instances list`, `gcloud compute
 firewall-rules list`, `gcloud compute networks list`, `gcloud compute snapshots list`,
 `gcloud compute disks list` and `gcloud compute instances get-serial-port-output`
-reads of the project-scoped roles (`startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`,
+reads of the project-scoped roles (`startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `health-check-shadowed`,
 `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, which have no cluster slot; the account holds
 `roles/compute.viewer` for them, which includes
 `compute.instances.getSerialPortOutput`), and the `gcloud compute reservations list` read of the

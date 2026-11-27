@@ -37,7 +37,37 @@ install without the interview.
   module resolves them to at plan time.
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
-  subscription, and Chat integration wiring.
+  subscription, and Chat integration wiring. By default these live in
+  `project_id`. When the Google Workspace organization and its Chat app live in
+  a separate GCP project or organization from the GKE cluster, set
+  `chat_project_id`: the composition enables `chat.googleapis.com`,
+  `gsuiteaddons.googleapis.com`, and `pubsub.googleapis.com` in
+  `chat_project_id`, creates a dedicated service account
+  (`kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com`) there,
+  grants the Platform Agent GSA `roles/iam.serviceAccountTokenCreator` on that
+  service account as a resource, binds `roles/pubsub.subscriber` and
+  `roles/pubsub.viewer` on the subscription to the Chat service account, and
+  wires `googleChat.projectId` and `googleChat.serviceAccountEmail` into the
+  Helm chart so the credential broker impersonates the Chat service account for
+  Chat API calls and Pub/Sub pulls without hitting Domain Restricted Sharing on
+  the Pub/Sub subscription. When the applying identity cannot administer
+  `chat_project_id`, set `chat_manage_project = false` and have a project admin
+  in `chat_project_id` enable the three APIs, register the Chat and Workspace
+  Add-ons service identities, create `kubeagents-chat-gsa` with the
+  `roles/iam.serviceAccountTokenCreator` binding for the Platform Agent GSA,
+  and create the topic and subscription with their publisher and subscriber IAM
+  bindings (see [`scripts/installer/print_instructions_gchat.sh`](../../../scripts/installer/print_instructions_gchat.sh)
+  or the [ChatOps guide](../../../docs/site/src/content/docs/concepts/chatops.md)).
+  Decide `chat_manage_project = false` at the first apply: turning it off later on an
+  install whose earlier apply created the Chat project resources destroys the topic,
+  subscription, `kubeagents-chat-gsa` service account, and IAM bindings on the next
+  apply unless you remove them from state first:
+
+  ```bash
+  terraform state rm 'module.chat_pubsub[0]' \
+    'google_project_service.chat_project'
+  ```
+
 - Optionally (`enable_github_minter = true`) the GitHub token minter backend
   ([`github-minter`](../../modules/github-minter) module): minter service
   account plus a KMS key ring and signing key.
@@ -238,11 +268,11 @@ plans the whole composition as new and reads as total drift. A gitignored
 installs in one project keep separate state. State is only half of the
 second-install story: every service account the composition creates has one
 fixed default name per project, so the second install must name its own —
-`agent_service_account_id`, and `github_minter_service_account_id` or
-`litellm_service_account_id` when it enables the minter or serves from Vertex —
+`agent_service_account_id`, and `github_minter_service_account_id`,
+`litellm_service_account_id` or `chat_service_account_id` when it enables the minter, serves from Vertex or shares a cross-project Google Chat project —
 or its first apply stops on the account the first install owns. Through the
 installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
-`GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
+`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME` and `CHAT_GSA_NAME` in `install.env`, which every
 front door regenerates `terraform.tfvars` from; every front door that applies
 (`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
 names the key to set. The minter's KSA (`github_minter_ksa_name`,
@@ -902,9 +932,12 @@ not covered by master-authorized-networks.
 ### Google Chat, Slack, and GitHub integrations
 
 With `enable_google_chat = true` the composition provisions the GCP backend
-(topic, subscription, IAM) **and** enables the CR's `googleChat` integration
-with the created topic/subscription — restrict access with
-`google_chat_allowed_users` (empty = everyone).
+(topic, subscription, IAM, and, when `chat_project_id` differs from
+`project_id`, the `kubeagents-chat-gsa` service account and token-creator grant
+unless `chat_manage_project = false`) **and** enables the CR's `googleChat`
+integration with the created topic, subscription, `projectId`, and
+`serviceAccountEmail` — restrict access with `google_chat_allowed_users`
+(empty = everyone).
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 

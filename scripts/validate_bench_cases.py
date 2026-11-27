@@ -432,6 +432,13 @@ KNOWN_UNREGISTERED = {
 # of the validated-capabilities suite, restores its `suite:` line (a suite case
 # is never in a roster file).
 FIXTURE_NOT_READY = {
+    # Fixture planted in bench/tf/fleet/main.tf (#2587); parked until the
+    # postsubmit fleet reconcile applies health-check-shadowed across the pool
+    # projects, after which a follow-up moves it to nightly-cases.txt.
+    "networking-health-check-shadowed": (
+        "#2587: needs health-check-shadowed (firewall/hc-shadow-allow-*, firewall/hc-shadow-deny-*) "
+        "applied to every pool project by the postsubmit fleet reconcile"
+    ),
     # Fixture planted in bench/tf/fleet/defects-a.tf (#7097, #1982); parked
     # until the postsubmit fleet reconcile applies unaccepted-gateway-class
     # across the pool projects, after which a follow-up moves it to nightly-cases.txt.

@@ -189,6 +189,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `integration.googleChat` | `object` | no |  |  | GoogleChat configures the Google Chat integration. |
 | `integration.googleChat.enabled` | `boolean` | no | `false` |  | Enabled toggles the Google Chat integration. |
 | `integration.googleChat.projectId` | `string` | no |  |  | ProjectID is the target GCP Project ID for Pub/Sub. |
+| `integration.googleChat.serviceAccountEmail` | `string` | no |  |  | ServiceAccountEmail is an optional Google Service Account email in ProjectID that the credential broker impersonates for Google Chat API calls and Pub/Sub subscription pulls when the Chat project lives in a different GCP project or organization from the Platform Agent. |
 | `integration.googleChat.topicName` | `string` | no |  |  | TopicName is the GCP Chat Topic Name. |
 | `integration.googleChat.subscriptionName` | `string` | no |  |  | SubscriptionName is the GCP Chat Subscription Name. |
 | `integration.googleChat.allowedUsers` | `[]string` | no |  |  | AllowedUsers is a list of allowed users. If not present, all users will be allowed. |

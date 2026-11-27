@@ -28,7 +28,7 @@ const (
 	// DelegateMCPCommand is the subcommand that serves the tool
 	// (cmd/worker-adapter dispatches it).
 	DelegateMCPCommand    = "mcp"
-	DelegateMCPServer     = persona.DelegateServer
+	DelegateMCPServer     = "a2a"
 	EnvDelegateSocket     = "A2A_DELEGATE_SOCKET"
 	DefaultDelegateSocket = "/scratch/a2a-delegate.sock"
 	// EnvDelegateTargets carries the turn's delegateTargets part, as JSON, to

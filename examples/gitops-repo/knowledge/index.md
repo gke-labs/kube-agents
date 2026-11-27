@@ -1,19 +1,15 @@
----
-type: index
-title: Operational Knowledge Framework (OKF) — index
-tags: [okf, index]
----
-
 # OKF index
 
-The Operational Knowledge Framework is durable, human-reviewed knowledge shared indirectly across
-agent tiers (06 §5). It is markdown + YAML frontmatter under `knowledge/`, lives **outside** the
-paths the pipeline deploys, and is **never applied to a cluster**. Agents **read** OKF for context
-and **propose** updates via PR; humans approve (curate-as-code). OKF holds durable knowledge only —
-**not** session state.
+The [Open Knowledge Format](https://github.com/GoogleCloudPlatform/open-knowledge-format) (OKF, v0.2
+[`SPEC.md`](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md)) is
+durable, human-reviewed knowledge shared indirectly across agent tiers (06 §5). It is markdown +
+YAML frontmatter under `knowledge/`, lives **outside** the paths the pipeline deploys, and is
+**never applied to a cluster**. Agents **read** OKF for context and **propose** updates via PR;
+humans approve (curate-as-code). OKF holds durable knowledge only — **not** session state.
 
-Every entry must declare a `type` in frontmatter. The canonical starting set (open convention, not a
-hard enum — add new types by PR):
+Every entry (other than `index.md` navigation and `log.md` history files, which are reserved at every
+level) must declare a `type` in frontmatter. The canonical starting set (open convention, not a hard enum — add new
+types by PR):
 
 | `type`              | Purpose                                                                                          |
 | ------------------- | ------------------------------------------------------------------------------------------------ |

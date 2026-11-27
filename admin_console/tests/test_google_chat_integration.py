@@ -33,7 +33,11 @@ SUBSCRIPTION_PATH = (
 
 
 def platform_agents(
-    *, name: str = "platform-agent", enabled: bool = True, with_secret: bool = False
+    *,
+    name: str = "platform-agent",
+    enabled: bool = True,
+    with_secret: bool = False,
+    service_account_email: str = "",
 ) -> dict:
     payload = {
         "items": [
@@ -62,6 +66,10 @@ def platform_agents(
             }
         ]
     }
+    if service_account_email:
+        payload["items"][0]["spec"]["integration"]["googleChat"][
+            "serviceAccountEmail"
+        ] = service_account_email
     if with_secret:
         payload["items"][0]["spec"]["deployment"] = {
             "env": [{"name": "EXTERNAL_API_TOKEN", "value": "literal-secret"}]
@@ -96,11 +104,13 @@ class FakeCloud:
         omit_subscriber: bool = False,
         push_subscription: bool = False,
         stray_topic: bool = False,
+        subscriber_gsa: str = GSA,
     ) -> None:
         self.conditional_publisher = conditional_publisher
         self.omit_subscriber = omit_subscriber
         self.push_subscription = push_subscription
         self.stray_topic = stray_topic
+        self.subscriber_gsa = subscriber_gsa
         self.calls: list[list[str]] = []
 
     def run(self, arguments: list[str], *, timeout: int = 15):
@@ -170,11 +180,11 @@ class FakeCloud:
                 "bindings": [
                     {
                         "role": "roles/pubsub.subscriber",
-                        "members": [f"serviceAccount:{GSA}"],
+                        "members": [f"serviceAccount:{self.subscriber_gsa}"],
                     },
                     {
                         "role": "roles/pubsub.viewer",
-                        "members": [f"serviceAccount:{GSA}"],
+                        "members": [f"serviceAccount:{self.subscriber_gsa}"],
                     },
                 ]
             }
@@ -337,6 +347,43 @@ class GoogleChatIntegrationServiceTest(unittest.TestCase):
         self.assertEqual(check["status"], "failed")
         self.assertIn("missing", check["detail"])
         self.assertNotIn("can consume", check["detail"])
+
+    def test_cross_project_service_account_email_is_checked_on_subscription(
+        self,
+    ):
+        chat_gsa = (
+            "kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"
+        )
+        snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents(service_account_email=chat_gsa)),
+            cloud=FakeCloud(subscriber_gsa=chat_gsa),
+            runtime=FakeRuntime(),
+        ).inspect()
+
+        check = next(
+            item
+            for item in snapshot["checks"]
+            if item["id"] == "subscription_ready"
+        )
+        self.assertEqual(snapshot["status"], "Ready")
+        self.assertEqual(check["status"], "passed")
+        self.assertIn(f"{chat_gsa} can read it.", check["detail"])
+
+        failed_snapshot = GoogleChatIntegrationService(
+            TARGET,
+            kube=FakeKube(platform_agents(service_account_email=chat_gsa)),
+            cloud=FakeCloud(subscriber_gsa=GSA),
+            runtime=FakeRuntime(),
+        ).inspect()
+        failed_check = next(
+            item
+            for item in failed_snapshot["checks"]
+            if item["id"] == "subscription_ready"
+        )
+        self.assertEqual(failed_snapshot["status"], "Needs attention")
+        self.assertEqual(failed_check["status"], "failed")
+        self.assertIn(f"{chat_gsa} is missing", failed_check["detail"])
 
     def test_zero_delivery_with_stray_chat_topic_names_the_root_cause(self):
         cloud = FakeCloud(stray_topic=True)

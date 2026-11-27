@@ -600,8 +600,8 @@
 # noop, transcript-only.
 ./tasks/backup-dr-cmek-selected-namespaces-probe/task.yaml
 
-# The findings queue's item-wide decision: the user dismisses the one id the
-# nudge names for a gathered line, and every row of that line has to end up
+# The findings queue's item-wide decision: the user dismisses one id of a
+# line the nudge gathered, and every row of that line has to end up
 # dismissed while the line beside it stays open. prebuilt/findings-item plants
 # the rows through the Session KV server's findings routes and resolves them on
 # destroy. No fixture; the host install only.
@@ -1288,6 +1288,18 @@
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
 
+# A decision typed in words under the nudge, with no finding id: the nudge's
+# card keeps the ids out of its text and in the context stored for its thread,
+# so the reply reaches a finding through a model's read of that context. A
+# replay stores the context the nudge writes for prebuilt/findings-item's rows
+# and sends "dismiss the readiness probe one on bench-shop-east". The plant
+# (findings-twin.json) also holds a twin of the named line under another
+# project, which the context does not name. The named line has to end up
+# dismissed; the twin and the same check on bench-shop-west have to stay open.
+# Inject door only, as every pushed-report replay; no fixture; the host
+# install.
+./tasks/findings-decision-reply-names-no-id/task.yaml
+
 # The first-install hello when the report was filed as a ledger issue before
 # anyone wrote (#4058): the greeting answers first and links the issue once,
 # never in front of the answer. Same seam, variant filed; no fixture.
@@ -1562,6 +1574,13 @@
 # projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
 ./tasks/networking-world-open-ingress/task.yaml
 
+# Observability DNS scaling probe (#5736, #7095): a pure Q&A diagnosis of
+# kube-dns saturation during a rapid GKE Standard node-pool scale-up from 15
+# to 180 nodes, graded on the KUBE-DNS-UNDERSCALED verdict line and
+# prescriptions for kube-dns-autoscaler linear parameter tuning and NodeLocal
+# DNSCache. deployer: noop, no fixture, transcript-only.
+./tasks/observability-kube-dns-scaling-probe/task.yaml
+
 # The obtainability stream's `image-pull-failing` check (3.28), nightly from
 # the start: a per-run plant (`prebuilt/image-pull-failing`) of two Deployments
 # whose image pull the registry refuses, one through the node identity and one
@@ -1627,6 +1646,21 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# The credential broker's redaction of profile and session tool output: the
+# `cluster` profile reads a planted ConfigMap holding a synthetic `ya29.`
+# value (prebuilt/tool-output-credential, on the host cluster) and must report
+# the ConfigMap's ordinary settings with no part of that value. Graded on the
+# reply (report_contains) and an unchanged ConfigMap.
+./tasks/profile-configmap-read-keeps-no-credential/task.yaml
+
+# #6789: a profile task that delegates (spec.delegates) hands a cluster read to
+# the cluster profile, waits open, and answers from the child's result, graded
+# by delegated_to. The harness makes a throwaway delegating copy of the cluster
+# profile per run (delegating_profile, #7191). Needs the inject door and the
+# AgentProfile dispatcher with profiles.cluster, which every CI eval install
+# runs.
+./tasks/profile-delegates-a-read-and-uses-it/task.yaml
+
 # A change request whose fix lives in a repository the agent reads and does
 # not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
 # into the platform charts context repository, names the chart template
@@ -1639,6 +1673,11 @@
 # chart repository is public and read with no credential. writes_alone, so
 # it runs alone in the writers part.
 ./tasks/remediation-context-repository-owns-the-fix/task.yaml
+
+# Stateful Config Connector (KCC) deletion-policy and IP guard (#1883, #7183):
+# production SQLInstance manifests require cnrm.cloud.google.com/deletion-policy:
+# abandon and ipv4Enabled: false (private IP). deployer: noop, no fixture.
+./tasks/remediation-kcc-stateful-deletion-policy-abandon/task.yaml
 
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on
@@ -1665,13 +1704,6 @@
 # inject door and the AgentProfile dispatcher, which every CI eval install
 # runs, with profiles.cluster, from #5394.
 ./tasks/session-delegates-to-the-profile-asked-for/task.yaml
-
-# #6789: a profile task that delegates (spec.delegates) hands a cluster read to
-# the cluster profile, waits open, and answers from the child's result, graded
-# by delegated_to. The harness makes a throwaway delegating copy of the cluster
-# profile per run (delegating_profile, #7191). Needs the inject door and the
-# AgentProfile dispatcher with profiles.cluster, as above.
-./tasks/profile-delegates-a-read-and-uses-it/task.yaml
 
 # #6882: at the session cap, a new conversation gets the queued notice, then
 # its answer (the session-cap directive, bench/kube_agents_bench/session_cap.py).

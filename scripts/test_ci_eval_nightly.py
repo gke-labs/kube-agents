@@ -741,6 +741,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "gce-startup-script-failure",
             "gce-rotated-console-notes",
             "networking-world-open-ingress",
+            "networking-health-check-shadowed",
             "obtainability-pdb-kustomize-overlay",
             "gce-chat-request-runs-collector",
             "fleet-audit-manifest-fix-names-stalled-config-connector",

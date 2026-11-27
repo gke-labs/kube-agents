@@ -233,6 +233,93 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(self.upstream_requests, [])
 
+    # -- what the caller reads back --------------------------------------
+
+    # A synthetic token of a shape credential_shapes redacts. After a newline
+    # in the tool's text, so the reply carries it behind a JSON `\\n`.
+    TOKEN = "ya29.a0SyntheticMcpRelayToken_0123456789abcdef"
+
+    def _result_reply(self, text):
+        return json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}]}}
+        ).encode()
+
+    def test_a_profile_workers_tool_result_is_redacted(self):
+        self.reply["body"] = self._result_reply(f"The setup page says:\n{self.TOKEN}\nthen restart.")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, headers, body = self._profile(self.DK, tools_call("search_documents"))
+        self.assertEqual(status, 200, body)
+        self.assertNotIn(self.TOKEN.encode(), body)
+        self.assertEqual(
+            json.loads(body)["result"]["content"][0]["text"], "The setup page says:\n[REDACTED]\nthen restart."
+        )
+        self.assertEqual(int(headers["Content-Length"]), len(body))
+        self.assertTrue(any("mcp reply redacted" in line and "shapes=1" in line for line in logs.output), logs.output)
+        self.assertFalse(any(self.TOKEN in line for line in logs.output), logs.output)
+
+    def test_a_profile_workers_reply_with_no_shape_passes_byte_for_byte(self):
+        # Digests and UUIDs are not shapes, and nothing is re-serialised.
+        self.reply["body"] = self._result_reply(
+            "image@sha256:3f1c9a6e2b7d4c8f0a5e1b9d7c3a2f6e4d8b0c1a9e7f5d3b2c4a6e8f0d1b3c5a "
+            "uid 6f1e2d3c-4b5a-4968-8776-5a4b3c2d1e0f"
+        ).replace(b'"id": 1', b'"id":   1')
+        status, _, body = self._profile(self.DK, tools_call("search_documents"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, self.reply["body"])
+
+    def test_the_gateways_tool_result_is_relayed_as_it_came(self):
+        self.reply["body"] = self._result_reply(f"token {self.TOKEN}")
+        status, _, body = self._request(message=tools_call("get_cluster"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, self.reply["body"])
+
+    def test_the_reply_is_redacted_for_the_profile_and_session_roles_alone(self):
+        # The session role is refused the route (above); were it admitted, its
+        # reply would be redacted as the profile worker's is.
+        reply = self._result_reply(f"token {self.TOKEN}")
+        for role, redacted in (
+            (credential_proxy.CALLER_ROLE_PROFILE, True),
+            (credential_proxy.CALLER_ROLE_SESSION, True),
+            (credential_proxy.CALLER_ROLE_CHAT, False),
+            (credential_proxy.CALLER_ROLE_SHELL, False),
+        ):
+            with self.subTest(role=role):
+                body, count = credential_proxy.redact_reply_body(reply, role)
+                self.assertEqual((redacted, int(redacted)), (self.TOKEN.encode() not in body, count))
+
+    def test_object_keys_are_redacted_and_colliding_keys_both_kept(self):
+        other = "ya29.a0AnotherSyntheticMcpRelayToken_0123456789"
+        reply = json.dumps({"result": {self.TOKEN: "a", other: "b", "plain": "c"}}).encode()
+        body, count = credential_proxy.redact_reply_body(reply, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertEqual(2, count)
+        self.assertEqual({"result": {"[REDACTED]": "a", "[REDACTED]#2": "b", "plain": "c"}}, json.loads(body))
+
+    def test_a_redacted_key_that_collides_with_a_literal_key_keeps_both_values(self):
+        # Either order: the literal key first, or the token's key first.
+        for pairs in ((self.TOKEN, "v1"), ("[REDACTED]", "v2")), (("[REDACTED]", "v2"), (self.TOKEN, "v1")):
+            with self.subTest(first=pairs[0][0][:4]):
+                reply = ("{" + ",".join(f"{json.dumps(k)}:{json.dumps(v)}" for k, v in pairs) + "}").encode()
+                body, count = credential_proxy.redact_reply_body(reply, credential_proxy.CALLER_ROLE_PROFILE)
+                self.assertEqual(1, count)
+                self.assertNotIn(self.TOKEN.encode(), body)
+                self.assertEqual(["v1", "v2"], sorted(json.loads(body).values()))
+
+    def test_a_token_under_a_duplicate_key_the_parser_drops_is_redacted(self):
+        # A JSON parser keeps the last of two equal keys, so the parsed pass
+        # never sees the first one's value; the upstream's bytes still carry it.
+        reply = ('{"result":{"a":"' + self.TOKEN + '","a":"x"}}').encode()
+        body, count = credential_proxy.redact_reply_body(reply, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertNotIn(self.TOKEN.encode(), body)
+        self.assertEqual(1, count)
+        self.assertEqual(b'{"result":{"a":"[REDACTED]","a":"x"}}', body)
+
+    def test_a_reply_that_is_not_json_is_redacted_as_text_with_its_bytes_kept(self):
+        reply = b"\xff\xfe upstream said " + self.TOKEN.encode() + b"\n"
+        body, count = credential_proxy.redact_reply_body(reply, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertEqual((b"\xff\xfe upstream said [REDACTED]\n", 1), (body, count))
+        clean = b"\xff\xfe nothing here\n"
+        self.assertIs(clean, credential_proxy.redact_reply_body(clean, credential_proxy.CALLER_ROLE_PROFILE)[0])
+
     # -- what reaches Google ---------------------------------------------
 
     def test_a_read_tool_reaches_the_upstream_on_the_brokers_credential(self):

@@ -738,12 +738,12 @@ If you enabled Google Chat or Slack during the install, perform the following re
 ##### 1. Google Chat Configuration (`GOOGLE_CHAT_ENABLED=true`)
 
 1. **Configure the Google Chat API endpoint in GCP Console**:
-   - Open the Google Chat API configuration page: `https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=<PROJECT_ID>`
+   - Open the Google Chat API configuration page: `https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat?project=<CHAT_PROJECT_ID>` (where `<CHAT_PROJECT_ID>` is `<PROJECT_ID>` unless `--chat-project-id` / `CHAT_PROJECT_ID` was set to a separate project; when `--chat-manage-project=false` was used, first have the Chat project administrator run the `gcloud` commands printed by the installer)
    - Set the **App name** to `GKE Platform Agent Bot`.
    - Optionally set an **Avatar URL** pointing at an image you host.
    - Under **Connection settings**, select **Cloud Pub/Sub** and enter the Cloud Pub/Sub topic created during provisioning:
      ```text
-     projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>
+     projects/<CHAT_PROJECT_ID>/topics/<CHAT_TOPIC_NAME>
      ```
    - Under **Visibility**, select **Specific people and groups in your domain** and enter your email address (`ALLOWED_USERS`).
 2. **Send a Test Direct Message**:

@@ -6,7 +6,8 @@ The cases are ``tests/conformance/chat/`` (``agents/platform/scripts/chat_cases.
 reads them). A case with one input runs through the composer that lays it out
 (``agents/platform/scripts/chat_message.py``, ``slack_ux_incident.chat_triage``, or the
 fleet-audit and first-inventory cards, ``slack_audit_report.chat_from_issue``,
-``agents/chat/scripts/inventory_presenter.chat`` and ``agents/chat/scripts/inventory_card.chat``).
+``agents/chat/scripts/inventory_presenter.chat`` and ``agents/chat/scripts/inventory_card.chat``,
+or the findings nudge's, ``findings_nudge.build_nudge`` through ``findings_nudge_card.chat_from_card``).
 A case that is a sequence of card events runs through the gateway patches that
 send it, with a stand-in for the chat.notify adapter recording each send:
 ``kanban_progress_lines.deliver`` and ``slack_ux_status`` for the plan (the fold
@@ -26,6 +27,7 @@ import json
 import sys
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -42,6 +44,8 @@ sys.path.insert(0, str(CHAT_SCRIPTS))
 
 import chat_cases
 import chat_message
+import findings_nudge
+import findings_nudge_card
 import findings_queue
 import inventory_card
 import inventory_presenter
@@ -187,6 +191,24 @@ class SharedCasesTest(unittest.TestCase):
                 frozenset(files.get("suppressed", ())),
             )
             return [_out(inventory_card.chat(card)[0], NOTIFY)]
+        if "findings_nudge" in given:
+            spec = given["findings_nudge"]
+            now = datetime.fromisoformat(spec["now"]).astimezone(timezone.utc)
+            rows = spec["rows"]
+            plan = findings_queue.pace(
+                rows,
+                now,
+                findings_queue.PacingLimits(**spec.get("limits", {})),
+                spec.get("added", {"critical": 0, "noncritical": 0}),
+            )
+            bundle = findings_nudge.build_nudge(
+                plan,
+                open_count=spec["open_count"],
+                daily=bool(spec.get("daily", True)),
+                rows=rows,
+                backlog_url=spec.get("backlog_url", ""),
+            )
+            return [_out(bundle.card and findings_nudge_card.chat_from_card(bundle.card)[0], NOTIFY)]
         if "markdown" in given:
             return [_out(chat_message.answer_message(given["markdown"]), RESULT)]
         if "reason" in given:
