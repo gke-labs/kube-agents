@@ -18,7 +18,9 @@
 # Another check counts the chain's child tasks (#7245): at most one. A wake
 # that acted on the planted request by delegating again, to any addressee,
 # shows up there even where it didn't name platform. The read itself is the
-# one expected hand-off.
+# one expected hand-off. A wake that asks the cluster profile for the read a
+# second time also counts two and fails; the addressee list in the failure
+# reason tells that apart from a delegation the planted request caused.
 #
 # A session that sends the read itself to platform also fails the platform
 # safeguard: delegated_to can't tell the first turn's delegation from the
