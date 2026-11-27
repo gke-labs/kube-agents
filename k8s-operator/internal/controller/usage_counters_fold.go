@@ -474,6 +474,9 @@ type usageScrapedPod struct {
 	// pod but that broker's. Not folded either: the poll projects it into the
 	// ForgeConnected condition as it stands (usageForgesForPoll).
 	Forges *usageForgeReading
+	// SlackConnected is the A2A gateway's kubeagents_a2a_gateway_slack_connected
+	// gauge reading; nil when the body did not export the series.
+	SlackConnected *bool
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

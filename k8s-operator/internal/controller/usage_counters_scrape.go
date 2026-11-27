@@ -150,6 +150,11 @@ const (
 	a2aPeopleWindowLabel = "window"
 	a2aPeopleWindowShort = "7d"
 	a2aPeopleWindowLong  = "30d"
+	// a2aSlackConnectedSeries is the A2A gateway's gauge of the Slack Socket
+	// Mode connection: 1 while connected, 0 while disconnected or failing
+	// auth.test, and absent on standby replicas or when Slack is not running.
+	a2aSlackConnectedSeries = "kubeagents_a2a_gateway_slack_connected"
+	a2aSlackConnectedUp     = 1
 	// proposalsOpenedSeries is the chat plugin's count of the pull requests
 	// the agent opened, by the origin of the work and, for chat, its platform:
 	// a gauge it reads from the pod's proposals ledger at scrape time, served
@@ -706,6 +711,10 @@ type usageReading struct {
 	// (no managed repository, no sweep yet, or a broker that predates the
 	// series).
 	Forges *usageForgeReading
+	// SlackConnected is the A2A gateway's kubeagents_a2a_gateway_slack_connected
+	// gauge reading (true when >= a2aSlackConnectedUp, false when 0); nil when
+	// the body is not an A2A gateway's or does not export the series.
+	SlackConnected *bool
 }
 
 // usageForgeReading is the providers one broker body reports, in provider order.
@@ -962,6 +971,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	// forges collects the forge connection series by provider, for the
 	// stateful broker's body alone.
 	var forges map[string]*usageForge
+	// slackConnected is the A2A gateway's Slack Socket Mode gauge when exported.
+	var slackConnected *bool
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -997,6 +1008,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			forges = map[string]*usageForge{}
 			wanted = append(wanted, vcsForgeConnectedSeries, vcsForgeRepositoriesSeries, vcsForgeCheckedAgeSeries)
 		}
+		if family == a2aAnswerFeedbackSeries && !slices.Contains(wanted, a2aSlackConnectedSeries) {
+			wanted = append(wanted, a2aSlackConnectedSeries)
+		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
 	// of the kinds asked for, whether a sample resolved it, and the readings
@@ -1018,6 +1032,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				wanted = append(wanted, family)
 			}
 		}
+	}
+	if slices.Contains(kinds, usageReadingPeople) && !slices.Contains(wanted, a2aSlackConnectedSeries) {
+		wanted = append(wanted, a2aSlackConnectedSeries)
 	}
 	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
 	for {
@@ -1074,6 +1091,13 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 					if name == processStartTimeSeries {
 						captured := value
 						start = &captured
+						continue
+					}
+					if name == a2aSlackConnectedSeries {
+						up := value >= a2aSlackConnectedUp
+						if slackConnected == nil || up {
+							slackConnected = &up
+						}
 						continue
 					}
 					if name == dataVolumeSeries {
@@ -1208,7 +1232,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		clusters = nil
 		volume = nil
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher, SlackConnected: slackConnected}
 	if forges != nil {
 		out.Forges = &usageForgeReading{}
 		for _, provider := range slices.Sorted(maps.Keys(forges)) {

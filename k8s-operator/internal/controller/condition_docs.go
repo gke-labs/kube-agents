@@ -27,10 +27,10 @@ type conditionDoc struct {
 
 // degradedConditionReasons are the reasons the Degraded condition carries,
 // for its row, in the order updateStatusReady ranks them. A parked pass reads
-// the ones ahead of A2ABusStreamsMissing as ranked above it
-// (degradedRanksAboveBusStreams), so a new reason goes where the chain puts
-// it. Listed by constant, so a renamed reason fails to compile; a
-// new reason has to be added here by hand (the writer passes it as a value,
+// this order (degradedRanksAbove) when following poller-owned Degraded reasons
+// (A2ABusStreamsMissing and SlackConnectionFailed), so a new reason goes where
+// the chain puts it. Listed by constant, so a renamed reason fails to compile;
+// a new reason has to be added here by hand (the writer passes it as a value,
 // which the completeness test cannot follow).
 var degradedConditionReasons = []string{
 	conditionReasonInvalidGitRepoURL,
@@ -38,6 +38,7 @@ var degradedConditionReasons = []string{
 	conditionReasonMinterPruningHeld,
 	conditionReasonA2ABusStreamsMissing,
 	conditionReasonA2AGatewayWaitingForTasks,
+	conditionReasonSlackConnectionFailed,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
@@ -103,6 +104,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Type:    a2aGatewayConditionType,
 		Written: "Only on an install upgraded from an operator that ran the A2A gateway at zero replicas for want of a chat backend: from the pass that scales it back to one replica until that replica is ready. Written and cleared by every pass that renders the stack, whichever phase it ends on (`Ready`, `Provisioning`, or `Degraded` for `A2AProvisionFailed` and `ShellSandboxKeysMissing`), so only a pass that stops before rendering leaves it as it was",
 		Meaning: "`status: False`, `Reason: WaitingForReplica`. Every install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.",
+	},
+	{
+		Type:    slackConnectedConditionType,
+		Written: "While Slack is enabled on the A2A gateway and any scraped gateway pod exports `kubeagents_a2a_gateway_slack_connected` (first poll 30 seconds after operator leader election, then every five minutes); removed when Slack is disabled or after two consecutive polls with no pod exporting the gauge",
+		Meaning: "`True`, `SocketModeConnected`: the A2A gateway's Slack Socket Mode connection is up (maximum reading across reporting replicas is `1`; set on the first poll reading `1`). `False`, `ConnectionFailed`: two consecutive polls read `0` across reporting replicas (Slack `auth.test` or Socket Mode is failing); projects onto `Degraded=True` (`Reason: SlackConnectionFailed`) without changing `Ready` or `phase` so an external Slack outage does not take down the console, A2A doors, or gateway PodDisruptionBudget.",
 	},
 	{
 		Type:    busProvisionedConditionType,

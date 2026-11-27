@@ -220,6 +220,12 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowLongLabel"), "30d")
         self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowLongLabel"), _go_const(_SCRAPE_GO, "a2aPeopleWindowLong"))
 
+    def test_the_a2a_gateways_slack_connected_gauge_keeps_its_name(self):
+        """The gateway's Slack Socket Mode gauge and the operator's scrape constant agree."""
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "slackConnectedName"))
+        self.assertEqual(name, "kubeagents_a2a_gateway_slack_connected")
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aSlackConnectedSeries"))
+
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()
         self.assertEqual(_py_const("CHAT_INBOUND_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatInboundSeries"))

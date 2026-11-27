@@ -104,6 +104,7 @@ VCS_PROPOSALS_CLOSED_BY_METRIC = "kubeagents_vcs_proposals_closed_by"
 VCS_PROPOSAL_TOUCHES_METRIC = "kubeagents_vcs_proposal_touches"
 VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC = "kubeagents_vcs_proposal_touches_per_proposal"
 VCS_PROPOSALS_IGNORED_METRIC = "kubeagents_vcs_proposals_ignored"
+VCS_STOCKOUT_PROPOSALS_METRIC = "kubeagents_vcs_stockout_proposals"
 VCS_READINGS_AGE_METRIC = "kubeagents_vcs_readings_age_seconds"
 VCS_READINGS_FAILURES_METRIC = "kubeagents_vcs_readings_failures_total"
 # The forge health the same sweep reports: whether each forge the managed
@@ -157,6 +158,11 @@ EVENT_COMMENT = "comment"
 EVENT_COMMIT = "commit"
 # The form the `pr_comments` sweep accepts as a person steering the agent.
 AGENT_ADDRESS_PREFIX = "/agent"
+# Fixed source-branch prefix cut by the stockout investigator skill.
+STOCKOUT_BRANCH_PREFIX = "platform-agent/remediate-stockout-"
+# Neutral proposal dict fields read from `proposal_view` for branch classification.
+PROPOSAL_VIEW_PROPOSAL_FIELD = "proposal"
+PROPOSAL_SOURCE_FIELD = "source"
 
 # The install's git author addresses, none of which a forge links to an
 # account, so its commits are told by email (design section 4).
@@ -230,6 +236,7 @@ class ProposalRecord:
     created: str
     touches: Counter = field(default_factory=Counter)
     closer: str = ""  # "install" | "human" | "bot" | ""
+    stockout: bool = False
 
 
 @dataclass
@@ -248,6 +255,12 @@ class DetailsReading:
     buckets: dict[str, dict[float, int]]
     ignored: int
     taken_at: float
+    stockout_proposals: dict[str, int] = field(default_factory=lambda: dict.fromkeys(STATES, 0))
+
+
+def is_stockout_branch(branch: str) -> bool:
+    """Whether a proposal's source branch was cut by the stockout investigator."""
+    return isinstance(branch, str) and branch.startswith(STOCKOUT_BRANCH_PREFIX)
 
 
 def install_commit_emails(host: str, app_login: str, app_id: str | None) -> frozenset[str]:
@@ -1028,6 +1041,12 @@ class ReadingsSweep:
         closer = self._closer(bound, number, login) if state == STATE_CLOSED else ""
         if truncated or capped:
             self._metrics.record_reading_failure(REASON_DETAIL_TRUNCATED)
+        proposal_detail = view.get(PROPOSAL_VIEW_PROPOSAL_FIELD)
+        source_branch = (
+            proposal_detail.get(PROPOSAL_SOURCE_FIELD)
+            if isinstance(proposal_detail, dict)
+            else None
+        ) or ""
         return ProposalRecord(
             number=number,
             state=state,
@@ -1035,6 +1054,7 @@ class ReadingsSweep:
             created=str(proposal.get("created") or ""),
             touches=touches,
             closer=closer,
+            stockout=is_stockout_branch(str(source_branch)),
         )
 
     @staticmethod
@@ -1105,6 +1125,7 @@ class ReadingsSweep:
 
     def _details_reading(self, scopes: set[tuple[str, str]], now: float) -> DetailsReading:
         closed_by = dict.fromkeys(CLOSERS, 0)
+        stockout_proposals = dict.fromkeys(STATES, 0)
         touches: Counter = Counter()
         totals: dict[str, list[int]] = {outcome: [] for outcome in OUTCOMES}
         ignored = 0
@@ -1117,6 +1138,8 @@ class ReadingsSweep:
                 totals[record.state].append(human)
             if record.state == STATE_CLOSED and record.closer in closed_by:
                 closed_by[record.closer] += 1
+            if record.stockout and record.state in stockout_proposals:
+                stockout_proposals[record.state] += 1
             created = _epoch(record.created)
             if (
                 record.state == STATE_OPEN
@@ -1131,4 +1154,5 @@ class ReadingsSweep:
             buckets={outcome: bucket_counts(totals[outcome]) for outcome in OUTCOMES},
             ignored=ignored,
             taken_at=now,
+            stockout_proposals=stockout_proposals,
         )
