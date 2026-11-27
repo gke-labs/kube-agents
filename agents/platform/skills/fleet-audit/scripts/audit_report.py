@@ -1917,8 +1917,8 @@ NOTES_SECTION_CAP = 6_000
 MORE_NOTES_ROW = "…and {more} more; the stored report carries every full note"
 # A collected target's manifest entry may list the objects its `notes` names
 # as `{check, object}` (and `namespace` where the check has one, and an
-# optional `command`, the object's own read): each one an object a check read
-# but could not see. `finish` refuses a `resolved_because`
+# optional `command`, the read that says so): each one an object whose result
+# a check could not see. `finish` refuses a `resolved_because`
 # entry for one of them (`refuse_resolved_over_notes`), because the run did
 # not see the finding go away.
 NOTED_OBJECTS_KEY = "noted_objects"

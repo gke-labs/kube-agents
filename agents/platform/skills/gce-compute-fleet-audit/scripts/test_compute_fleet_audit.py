@@ -2949,6 +2949,43 @@ class ConntrackUnitsTest(unittest.TestCase):
         units = units_of(gke_node("gke-odd-node1"))
         self.assertEqual(list(units), ["gke-odd-node1"])
         self.assertTrue(units["gke-odd-node1"]["exact"])
+        # Its finding is on its node pool, as its noted object is.
+        self.assertEqual(units["gke-odd-node1"]["object"], POOL_A)
+        self.assertEqual(units["gke-odd-node1"]["node"]["pool"], "default-pool")
+
+    def test_a_units_object_is_the_one_a_noted_object_carries(self):
+        """A finding one day and a noted object the next must be one identity,
+        or the earlier finding is not held."""
+        items = [gke_node(NODE_A), gke_node("gke-odd-node1"), gke_node("gke-bare-0a1b2c3d-abcd", pool="")]
+        nodes = cf.gke_nodes(items)
+        for key in nodes:
+            (unit,) = cf.conntrack_units(nodes, [key]).values()
+            self.assertEqual([unit["object"]], cf.node_objects(nodes, [key]))
+
+    def test_a_name_with_the_word_that_ends_the_time_bound_is_spelled_another_way(self):
+        """`gcloud logging read` and the relay add the 24-hour bound only to a
+        filter without the word `timestamp`; a pool can be named with it."""
+        node = "gke-prod-timestamp-authority-1a2b3c4d-abcd"
+        units = units_of(gke_node(node, cluster="prod", pool="timestamp-authority"), gke_node("timestamp-odd-node1"))
+        clause = cf.names_clause(units, sorted(units))
+        self.assertNotIn(cf.logging_reads.FRESHNESS_SKIP_WORD, cf.CONNTRACK_LOG_FILTER + clause)
+        self.assertNotIn(cf.logging_reads.FRESHNESS_SKIP_WORD, cf.SERIAL_CONTROL_FILTER + clause)
+        pattern = re.compile(clause.split('=~"', 1)[1][:-1])
+        for name in (node, "gke-prod-timestamp-authority-1a2b3c4d-zzzz", "timestamp-odd-node1"):
+            self.assertTrue(pattern.match(name), name)
+        self.assertFalse(pattern.match("gke-prod-timestam-authority-1a2b3c4d-abcd"))
+        self.assertEqual(cf.conntrack_unit(units, node), "gke-prod-timestamp-authority-1a2b3c4d")
+
+    def test_a_project_with_many_groups_gets_larger_reads(self):
+        self.assertEqual(cf.groups_per_read(1), cf.CONNTRACK_GROUPS_PER_READ)
+        self.assertEqual(cf.groups_per_read(cf.CONNTRACK_GROUPS_PER_READ * cf.CONNTRACK_FIRST_READS), cf.CONNTRACK_GROUPS_PER_READ)
+        self.assertEqual(cf.groups_per_read(501), 51)
+        self.assertEqual(cf.groups_per_read(100000), cf.CONNTRACK_GROUPS_PER_READ_MAX)
+
+    def test_a_read_with_the_most_groups_is_under_the_length_that_a_log_query_may_have(self):
+        longest = "g" * 58
+        units = {f"{longest[:-3]}{i:03d}": {"object": "x", "node": None, "exact": False} for i in range(cf.CONNTRACK_GROUPS_PER_READ_MAX)}
+        self.assertLess(len(cf.CONNTRACK_LOG_FILTER + cf.names_clause(units, sorted(units))), 20000)
 
     def test_an_instance_belongs_to_the_unit_of_its_group(self):
         units = units_of(gke_node(NODE_A), gke_node("gke-odd-node1"))
@@ -3317,9 +3354,9 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertNotIn(cf.CONNTRACK_SLUG, unevaluated(entry))
         self.assertNotIn("limitations", entry)
         self.assertEqual(self.conntrack(entry), [])
-        (noted,) = self.noted(entry)
-        self.assertEqual(noted["object"], POOL_A)
-        self.assertIn(cf.SERIAL_CONTROL_FRESHNESS, noted["command"])
+        # The control read names that day's groups, so it is in the target's
+        # record once and on no noted object.
+        self.assertEqual(self.noted(entry), [{"check": cf.CONNTRACK_SLUG, "object": POOL_A}])
         (record,) = [c for c in entry["commands"] if c["check"] == cf.CONNTRACK_SLUG]
         self.assertIn(cf.SERIAL_CONTROL_FRESHNESS, record["command"])
 
@@ -3586,7 +3623,7 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
             [n["object"] for n in self.noted(entry)],
             [f"NodePool/us-central1-a/fleet/pool-{i:03d}" for i in (cf.CONNTRACK_READ_ROUNDS, cf.CONNTRACK_READ_ROUNDS + 1)],
         )
-        self.assertTrue(all(n["command"].startswith("gcloud logging read ") for n in self.noted(entry)))
+        self.assertTrue(all("command" not in n for n in self.noted(entry)))
         self.assertEqual(self.control_reads(issued), [])
 
     def test_a_full_page_that_names_no_group_asked_for_ends_the_rounds(self):
@@ -3617,6 +3654,66 @@ class ConntrackInCollectProjectTest(unittest.TestCase):
         self.assertIn("logging read", logged_text)
 
     # --- many node pools: the reads ------------------------------------------------------------
+
+    def test_a_pool_named_with_the_time_word_keeps_the_days_window(self):
+        node = "gke-prod-timestamp-authority-1a2b3c4d-abcd"
+        nodes = [gke_node(node, cluster="prod", pool="timestamp-authority")]
+        _, issued = self.collect(self.responses(nodes=nodes, entries=[conntrack_entry(node)]))
+        (read,) = self.day_reads(issued)
+        self.assertNotIn("timestamp", read)
+        answers = self.responses(nodes=nodes)
+        del answers[self.DAY_READ]
+        del answers[self.CONTROL_READ]
+        with mock.patch.object(cf.logging_reads, "read_json", return_value=json.dumps([conntrack_entry(node)])) as relay:
+            entry, _ = self.collect(answers)
+        self.assertEqual([c["object"] for c in self.conntrack(entry)], ["NodePool/us-central1-a/prod/timestamp-authority"])
+        _, filter_text, _ = relay.call_args.args
+        self.assertAlmostEqual(self.window_hours(filter_text), cf.CONNTRACK_FRESHNESS_HOURS, delta=0.1)
+
+    def test_a_project_with_many_groups_is_read_whole_in_the_first_reads(self):
+        nodes = [pool_node(i) for i in range(501)]
+        entry, issued = self.collect(self.responses(nodes=nodes))
+        reads = self.day_reads(issued)
+        self.assertEqual(len(reads), cf.CONNTRACK_FIRST_READS)
+        self.assertEqual(sum(read.count("|") + 1 for read in reads), 501)
+        self.assertNotIn("limitations", entry)
+        self.assertEqual(self.noted(entry), [])
+
+    def test_a_day_with_no_line_asks_the_control_though_some_pools_were_not_reached(self):
+        """The first read returned nothing and the second failed. Nothing shows
+        yet that the project stores the log, so the control still asks."""
+        nodes = [pool_node(i) for i in range(cf.CONNTRACK_GROUPS_PER_READ + 5)]
+        failed = run_of(1, "", "ERROR: DEADLINE_EXCEEDED")
+        entry, issued = self.collect(self.responses(nodes=nodes, entries=[], later_pages=[failed], control=[]))
+        self.assertEqual(len(self.control_reads(issued)), 1)
+        self.assertIn(cf.NO_SERIAL_ENTRIES_NOTE.format(days=30), entry["notes"])
+        self.assertIn(cf.CONNTRACK_UNREAD_FAILED_LIMITATION.format(count=5, reads=1), entry["limitations"])
+        self.assertEqual(len(self.noted(entry)), len(nodes))
+
+    def test_a_read_that_fails_leaves_every_group_after_it_unread(self):
+        nodes = [pool_node(i) for i in range(cf.CONNTRACK_GROUPS_PER_READ * 2 + 10)]
+        failed = run_of(1, "", "ERROR: DEADLINE_EXCEEDED")
+        entry, issued = self.collect(self.responses(nodes=nodes, entries=[conntrack_entry(nodes[0]["name"])], later_pages=[failed]))
+        self.assertEqual(len(self.day_reads(issued)), 2)
+        self.assertEqual(len(self.conntrack(entry)), 1)
+        unread = cf.CONNTRACK_GROUPS_PER_READ + 10
+        self.assertIn(cf.CONNTRACK_UNREAD_FAILED_LIMITATION.format(count=unread, reads=1), entry["limitations"])
+        self.assertEqual(len(self.noted(entry)), unread)
+
+    def test_the_limit_of_reads_leaves_every_group_after_it_unread(self):
+        nodes = [pool_node(i) for i in range(cf.CONNTRACK_GROUPS_PER_READ * 2 + 10)]
+        with mock.patch.object(cf, "CONNTRACK_READS_MAX", 1):
+            entry, issued = self.collect(self.responses(nodes=nodes, entries=[conntrack_entry(nodes[0]["name"])]))
+        self.assertEqual(len(self.day_reads(issued)), 1)
+        unread = cf.CONNTRACK_GROUPS_PER_READ + 10
+        self.assertIn(cf.CONNTRACK_UNREAD_FULL_LIMITATION.format(count=unread, reads=1), entry["limitations"])
+        self.assertEqual(len(self.noted(entry)), unread)
+
+    def test_a_finding_on_a_node_with_no_group_form_is_on_its_pool(self):
+        entry, _ = self.collect(self.responses(nodes=[gke_node("gke-odd-node1")], entries=[conntrack_entry("gke-odd-node1")]))
+        self.assertEqual([c["object"] for c in self.conntrack(entry)], [POOL_A])
+        held, _ = self.collect(self.responses(nodes=[gke_node("gke-odd-node1")], control=[]))
+        self.assertEqual([n["object"] for n in self.noted(held)], [POOL_A])
 
     def test_more_groups_than_one_read_names_are_read_in_turn(self):
         nodes = [pool_node(i) for i in range(cf.CONNTRACK_GROUPS_PER_READ + 5)]

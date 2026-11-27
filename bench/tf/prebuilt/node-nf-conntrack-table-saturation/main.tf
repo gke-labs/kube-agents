@@ -41,9 +41,11 @@
 # node is healthy again seconds later. The lines of a run stay in the
 # project's log after the cluster is gone. A later compute audit of the same
 # project does not read them: the check asks the log only for the node pools
-# that it lists as running. So a later run of this case cannot pass on an
-# earlier run's lines, and no finding of this case stays behind for another
-# case's audit.
+# that it lists as running, by the base name of each pool's instance group.
+# A cluster made again under the same name got a group with another base
+# name each time (four runs, 2026-11-26). So a later run of this case cannot
+# pass on an earlier run's lines, and no finding of this case stays behind
+# for another case's audit.
 #
 # The default network, as prebuilt/networking-pod-cidr-slash24-exhaustion:
 # the lane's runner holds no Compute network role.
