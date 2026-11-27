@@ -931,6 +931,15 @@
 # namespace; the incumbent's delivery checks and safeguards.
 ./tasks/autoops-warning-event-triage-state-stamp/task.yaml
 
+# gke-cluster-autoscaler skill probe (#2635): CapacityBuffer placeholder pods
+# exist only inside Cluster Autoscaler memory, so reactive triage lists
+# capacitybuffers.autoscaling.x-k8s.io across namespaces and checks the v1beta1
+# failure triad (ReadyForProvisioning=False, LimitedByQuotas=True,
+# Provisioning=False) plus NotTriggerScaleUp events on the CapacityBuffer
+# object (healthy buffers stay Provisioning=True with no Ready condition).
+# deployer: noop, transcript-only.
+./tasks/autoscaler-capacity-buffer-triage-probe/task.yaml
+
 # gke-cluster-autoscaler skill probe (#2528): Pods with generated names stay
 # Pending with an empty NotTriggerScaleUp reason on a pool below its maximum.
 # Graded on the fix that goes through Git: the answer names the namespace
