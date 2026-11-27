@@ -6045,8 +6045,10 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	if platformFrontDoorEnabled(agent) {
 		frontDoorProfile = platformProfileName
 	}
-	// On the gateway container only: it owns the shared-state setup, which is where the
-	// entrypoint merges the Platform Agent's cron roster and applies this.
+	// On the gateway container, which owns the shared-state setup: that is where the
+	// entrypoint merges the Platform Agent's cron roster and applies this. The hermes-bridge
+	// sidecar copies this container's env and so carries it too, unread; the dashboard
+	// sidecar, which runs the entrypoint without the setup, does not.
 	gatewayEnvVars = append(gatewayEnvVars, builtinSchedulesEnv(agent))
 	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
 		Name:  gatewayProfileEnvVar,

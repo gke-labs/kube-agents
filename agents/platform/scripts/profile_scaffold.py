@@ -619,11 +619,14 @@ def parse_cron_suspend(text: str) -> dict | None:
     overrides = setting.get(CRON_SUSPEND_OVERRIDES_KEY, {}) if isinstance(setting, dict) else None
     if (
         not isinstance(overrides, dict)
+        # A key this does not know is a misspelled one: read as absent, it would be
+        # the "nothing suspended" guess.
+        or not set(setting).issubset({CRON_SUSPEND_ALL_KEY, CRON_SUSPEND_OVERRIDES_KEY})
         or not isinstance(setting.get(CRON_SUSPEND_ALL_KEY, False), bool)
         or not all(isinstance(v, bool) for v in overrides.values())
     ):
         raise SystemExit(
-            f"ERROR: --cron-suspend must be an object with a boolean {CRON_SUSPEND_ALL_KEY} "
+            f"ERROR: --cron-suspend must be an object with only a boolean {CRON_SUSPEND_ALL_KEY} "
             f"and a {CRON_SUSPEND_OVERRIDES_KEY} object of booleans"
         )
     return {

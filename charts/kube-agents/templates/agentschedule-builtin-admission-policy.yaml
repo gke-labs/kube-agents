@@ -30,7 +30,8 @@
 #   3. A built-in schedule's spec doesn't change, except spec.suspend: what it runs, on which
 #      profile, when and where its report goes are the operator's. Suspending it stays open. The
 #      supported way to pause a built-in is PlatformAgent.spec.schedules.overrides, which the
-#      operator writes into spec.suspend; with no override for it, a suspend set here stands.
+#      operator writes into spec.suspend; with no override for it, a suspend set here stands
+#      unless PlatformAgent.spec.schedules.suspendAll is set, which the operator writes over it.
 #
 # Anything else passes, so a person may still annotate a built-in schedule (`run-now`) or
 # edit a user schedule. A built-in schedule written before this policy existed isn't refused for

@@ -598,7 +598,17 @@ class CronSuspendTest(unittest.TestCase):
         self.assertIn("could not suspend jobs in cron/jobs.json", stderr.getvalue())
 
     def test_an_unreadable_setting_stops_before_the_roster_is_touched(self):
-        for text in ("{not json", "[]", '{"suspendAll": "yes"}', '{"overrides": {"audit": "no"}}', '{"overrides": []}'):
+        # A misspelled key is unreadable too: read as absent, it would mean
+        # "nothing suspended" and start every job an operator turned off.
+        for text in (
+            "{not json",
+            "[]",
+            '{"suspendAll": "yes"}',
+            '{"overrides": {"audit": "no"}}',
+            '{"overrides": []}',
+            '{"suspend_all": true}',
+            '{"suspendAll": true, "override": {"audit": false}}',
+        ):
             with self.subTest(text=text), self.assertRaises(SystemExit):
                 ps.parse_cron_suspend(text)
 

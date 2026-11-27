@@ -69,8 +69,10 @@ func TestBuiltinSchedulesEnvCarriesTheSetting(t *testing.T) {
 	}
 }
 
-// The setting reaches the gateway container, which runs the roster merge, and no other.
-func TestBuiltinSchedulesEnvIsOnTheGatewayOnly(t *testing.T) {
+// The setting reaches the gateway container, which runs the roster merge, and not the dashboard
+// sidecar, which runs the same entrypoint without it. (The hermes-bridge sidecar copies the
+// gateway's env and never reads this.)
+func TestBuiltinSchedulesEnvIsOnTheGatewayNotTheDashboard(t *testing.T) {
 	agent := frontDoorAgent("schedules-env", 1, false)
 	agent.Spec.Schedules = &agentv1alpha1.PlatformAgentSchedulesSpec{SuspendAll: true}
 	deployment := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
