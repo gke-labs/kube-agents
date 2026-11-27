@@ -1740,12 +1740,25 @@ func (d *Dispatcher) terminalGivenUp(log *slog.Logger, r *terminalRefusal, err e
 }
 
 // giveUpTerminal records a task settled without its terminal: counted and
-// logged at Error under ReasonTerminalUnpublished.
+// logged at Error under ReasonTerminalUnpublished, on an alert line
+// (terminalUnpublishedAlert) that names the profile, tier and task (the
+// caller's logger carries them). The give-up has no other carrier: the
+// refused six-token publish is the channel that would have told the gateway,
+// so the requester sees no end until a stop (#6884).
 func (d *Dispatcher) giveUpTerminal(log *slog.Logger, state lib.TaskState, reason string, after time.Duration, err error) {
 	d.supervisorGiveUps.Add(1)
-	log.Error("gave up on a profile task's terminal on the six-token supervisor subject; settling it without one, and the requester sees no end until a stop",
+	log.Error(terminalUnpublishedAlert+": gave up on a profile task's terminal on the six-token supervisor subject; settling it without one, and the requester sees no end until a stop",
 		"settle", ReasonTerminalUnpublished, "state", state, "reason", reason, "after", after, "err", err)
 }
+
+// terminalUnpublishedAlert starts the give-up's log line, the fixed prefix a
+// log-based alert matches (the repo's ALERT-line convention, as
+// chat_delivery_watch's): on GKE, resource.type="k8s_container"
+// resource.labels.container_name="dispatcher"
+// jsonPayload.msg:"ALERT dispatcher_terminal_unpublished". It means a
+// profile's six-token supervisor grant never reached the dispatcher's
+// connection for DroppedTerminalGiveUp: an install fault.
+const terminalUnpublishedAlert = "ALERT dispatcher_terminal_unpublished"
 
 // settle ends a task whose outcome is decided (its final renewal came, or
 // its failure terminal is written): it turns the lease record into a

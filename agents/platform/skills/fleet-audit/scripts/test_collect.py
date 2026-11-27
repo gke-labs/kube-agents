@@ -10338,7 +10338,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         }
         return pod
 
-    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, endpointslice_run=None, serviceentry_items=None, configsync_pod_items=()):
+    def run_with(self, workload_items=None, rbac_items=(), netpol_items=(), sa_items=(), describe=None, node_pools=(), ccnp_run=None, cluster=None, allowlist_items=None, kcc_items=None, svc_items=(), configsync_items=None, webhook_items=(), endpointslice_items=(), webhook_run=None, endpointslice_run=None, serviceentry_items=None, configsync_pod_items=(), project_describe_runs=None):
         # §2.17's reconciler pods are pods of the workload dump like any other.
         workload_items = ([self.benign_pod()] if workload_items is None else list(workload_items)) + list(configsync_pod_items)
         describe = describe if describe is not None else {}
@@ -10421,6 +10421,12 @@ class TestComplianceCollectCluster(unittest.TestCase):
                 if target.get("autopilot"):
                     return Run(argv, 1, "", self.AUTOPILOT_NODE_POOLS_ERROR, 0.1)
                 return Run(argv, 0, json.dumps(list(node_pools)), "", 0.1)
+            if argv[:3] == ["gcloud", "projects", "describe"] and project_describe_runs is not None:
+                if callable(project_describe_runs):
+                    return project_describe_runs(argv, **kwargs)
+                described = project_describe_runs.get(argv[3])
+                if described is not None:
+                    return described
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
@@ -10436,7 +10442,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         )
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
-        self.assertEqual(len(result["commands"]), 17)
+        self.assertEqual(len(result["commands"]), 18)
 
     def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
         """The real paging, not the module's adapter: the workload, RBAC,
@@ -10663,7 +10669,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertLessEqual(
             {"privileged-container", "host-namespace", "hostpath-mount"}, command_slugs
         )
-        self.assertEqual(len(command_slugs), 17)
+        self.assertEqual(len(command_slugs), 18)
 
     def test_an_absent_allowlist_crd_reads_as_no_allowlists(self):
         """The read is best-effort for the reason the `ccnp` one is: the CRDs
@@ -10982,14 +10988,14 @@ class TestComplianceCollectCluster(unittest.TestCase):
 
     def test_autopilot_records_every_check_it_could_run(self):
         """The point of not gate-failing: the other checks reach the manifest.
-        Twenty checks minus the three Autopilot rules out and the three no
-        cluster without Config Connector, Config Sync or Istio can run is fourteen,
+        Twenty-one checks minus the three Autopilot rules out and the three no
+        cluster without Config Connector, Config Sync or Istio can run is fifteen,
         each with a command behind it, and the six dispositioned rather than silently
         absent -- absent is what §6 reads as a coverage gap."""
         result = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
         command_slugs = {c["check"] for c in result["commands"]}
         na_slugs = {e["check"] for e in result["checks_not_applicable"]}
-        self.assertEqual(len(command_slugs), 14)
+        self.assertEqual(len(command_slugs), 15)
         self.assertEqual(len(na_slugs), 6)
         self.assertFalse(command_slugs & na_slugs)
         self.assertTrue(all(c["rc"] == 0 for c in result["commands"]))
@@ -14928,7 +14934,7 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertNotIn("webhook-backend-unreachable", command_slugs)
         self.assertIn("webhook-ca-bundle-expired", command_slugs)
-        self.assertEqual(len(command_slugs), 16)
+        self.assertEqual(len(command_slugs), 17)
         self.assertNotIn("webhook-backend-unreachable", {c["check"] for c in result["candidates"]})
 
     def test_a_planted_expired_ca_bundle_webhook_runs_when_endpointslices_fail(self):
@@ -14961,7 +14967,7 @@ class TestAdversarialReviewFixes(unittest.TestCase):
         self.assertNotIn("webhook-ca-bundle-expired", unevaluated)
         command_slugs = {c["check"] for c in result["commands"]}
         self.assertNotIn("webhook-backend-unreachable", command_slugs)
-        self.assertEqual(len(command_slugs), 16)
+        self.assertEqual(len(command_slugs), 17)
         candidates = [c for c in result["candidates"] if c["check"] == "webhook-ca-bundle-expired"]
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["object"], "ValidatingWebhookConfiguration/bench-expiring-webhook-ca")
@@ -16597,6 +16603,431 @@ class TestWebhookCaBundleExpired(unittest.TestCase):
         self.assertEqual(spec.kind, "cluster")
         self.assertEqual(spec.severity, "critical")
         self.assertEqual(collect._COMPLIANCE_CHECK_SOURCES["webhook-ca-bundle-expired"], ("webhooks",))
+
+WI_TEST_WORKLOAD_POOL = "acme.svc.id.goog"
+WI_PLANTED_NS = "seeded-identity"
+WI_PLANTED_SA = "kms-signer-sa"
+WI_PLANTED_PROJECT = "kube-agents-bench-no-such-fixture-project"
+WI_PLANTED_GSA = f"kms-signer@{WI_PLANTED_PROJECT}.iam.gserviceaccount.com"
+WI_READABLE_PROJECT = "acme"
+WI_READABLE_GSA = f"app-reader@{WI_READABLE_PROJECT}.iam.gserviceaccount.com"
+WI_CENTRAL_PROJECT = "central-iam-prod"
+WI_COMPUTE_DEFAULT_PROJECT = "123456789012"
+WI_COMPUTE_DEFAULT_GSA = f"{WI_COMPUTE_DEFAULT_PROJECT}-compute@developer.gserviceaccount.com"
+WI_APPSPOT_PROJECT = "acme-appengine"
+WI_APPSPOT_GSA = f"{WI_APPSPOT_PROJECT}@appspot.gserviceaccount.com"
+
+
+def wi_serviceaccount(
+    name: str = WI_PLANTED_SA,
+    *,
+    ns: str = WI_PLANTED_NS,
+    gsa: str | None = WI_PLANTED_GSA,
+    labels: dict | None = None,
+    annotations: dict | None = None,
+) -> dict:
+    merged_annotations = dict(annotations or {})
+    if gsa is not None:
+        merged_annotations[collect.WI_GSA_ANNOTATION] = gsa
+    return {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": dict(labels or {}),
+            "annotations": merged_annotations,
+        },
+    }
+
+
+class TestWiGsaIamBindingMissing(unittest.TestCase):
+    """§2.21 `wi-gsa-iam-binding-unverifiable` (arm A: unreadable target project)."""
+
+    def compliance(self, **kw) -> dict:
+        helper = TestComplianceCollectCluster()
+        result = helper.run_with(**kw)
+        self.issued = helper.issued
+        return result
+
+    def test_planted_unreadable_overlong_project_emits_minor_serviceaccount_candidate(self):
+        planted = wi_serviceaccount(
+            labels={"managed-by": "kube-agents-bench", "app.kubernetes.io/managed-by": "Helm", "meta.helm.sh/release-name": "signer"},
+            annotations={"meta.helm.sh/release-name": "signer", "meta.helm.sh/release-namespace": WI_PLANTED_NS},
+        )
+        result = self.compliance(
+            sa_items=[planted],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_PLANTED_PROJECT: Run(
+                    ["gcloud", "projects", "describe", WI_PLANTED_PROJECT],
+                    1,
+                    "",
+                    "ERROR: (gcloud.projects.describe) Bad Request: Request contains an invalid argument.",
+                    0.05,
+                ),
+            },
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(len(candidates), 1)
+        hit = candidates[0]
+        self.assertEqual(hit["namespace"], WI_PLANTED_NS)
+        self.assertEqual(hit["object"], f"ServiceAccount/{WI_PLANTED_SA}")
+        self.assertEqual(hit["severity"], "minor")
+        self.assertTrue(hit.get("impact_authoritative"))
+        self.assertIn("cannot vouch", hit["impact"])
+        self.assertNotIn("broken", hit["impact"].lower())
+        self.assertNotIn("missing", hit["impact"].lower())
+        self.assertNotIn("broken", hit["excerpt"].lower())
+        self.assertNotIn("no such", hit["excerpt"].lower())
+        self.assertIn(WI_PLANTED_GSA, hit["excerpt"])
+        self.assertIn(f"serviceAccount:{WI_TEST_WORKLOAD_POOL}[{WI_PLANTED_NS}/{WI_PLANTED_SA}]", hit["excerpt"])
+        self.assertIn(collect.WI_IAM_ROLE, hit["excerpt"])
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertIn("/api/v1/serviceaccounts", command)
+        self.assertIn(f"gcloud projects describe {WI_PLANTED_PROJECT}", command)
+        self.assertIn("/api/v1/serviceaccounts", hit["command"])
+        self.assertIn(f"gcloud projects describe {WI_PLANTED_PROJECT}", hit["command"])
+        self.assertNotIn("checks_unevaluated", result)
+
+    def test_readable_project_is_not_flagged(self):
+        result = self.compliance(
+            sa_items=[wi_serviceaccount(gsa=WI_READABLE_GSA)],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_READABLE_PROJECT: Run(["gcloud", "projects", "describe", WI_READABLE_PROJECT], 0, "111222333\n", "", 0.03),
+            },
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(candidates, [])
+
+    def test_workload_identity_off_skips_project_describes_and_emits_nothing(self):
+        result = self.compliance(
+            sa_items=[wi_serviceaccount()],
+            describe={"workloadIdentityConfig": {}},
+            project_describe_runs=lambda argv, **kw: (_ for _ in ()).throw(AssertionError(f"unexpected project describe: {argv}")),
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(candidates, [])
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertIn("gcloud container clusters describe", command)
+        self.assertNotIn("/api/v1/serviceaccounts", command)
+
+    def test_compute_and_appspot_default_gsas_resolve_target_projects(self):
+        result = self.compliance(
+            sa_items=[
+                wi_serviceaccount("compute-sa", gsa=WI_COMPUTE_DEFAULT_GSA),
+                wi_serviceaccount("appspot-sa", gsa=WI_APPSPOT_GSA),
+            ],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_COMPUTE_DEFAULT_PROJECT: Run(["x"], 1, "", "PERMISSION_DENIED", 0.02),
+                WI_APPSPOT_PROJECT: Run(["x"], 1, "", "PERMISSION_DENIED", 0.02),
+            },
+        )
+        objects = [c["object"] for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(objects, ["ServiceAccount/appspot-sa", "ServiceAccount/compute-sa"])
+
+    def test_suppressions_and_google_service_agents_issue_no_project_describe(self):
+        result = self.compliance(
+            sa_items=[
+                wi_serviceaccount("sys-sa", ns="kube-system", gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("gke-sa", ns="gke-managed-cim", gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("addon-sa", labels={"addonmanager.kubernetes.io/mode": "Reconcile"}, gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("comp-sa", annotations={"components.gke.io/component-name": "gke-mcs"}, gsa=WI_PLANTED_GSA),
+                wi_serviceaccount("plain-sa", gsa=None),
+                wi_serviceaccount("bad-sa", gsa="not-an-email"),
+                wi_serviceaccount("agent-sa", gsa="service-123@gcp-sa-gkehub.iam.gserviceaccount.com"),
+                wi_serviceaccount("robot-sa", gsa="service-123@container-engine-robot.iam.gserviceaccount.com"),
+                wi_serviceaccount("cloudsvc-sa", gsa="123@cloudservices.gserviceaccount.com"),
+            ],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs=lambda argv, **kw: (_ for _ in ()).throw(AssertionError(f"unexpected project describe: {argv}")),
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(candidates, [])
+
+    def test_project_describe_is_deduplicated_within_and_across_clusters(self):
+        describes: list[str] = []
+        cache = collect._WiProjectDescribeCache()
+        for cluster_name in ("cluster-a", "cluster-b"):
+            helper = TestComplianceCollectCluster()
+            target = {**helper.CLUSTER, "name": cluster_name, "target": f"acme/us-central1/{cluster_name}"}
+
+            def make_run(target_cluster):
+                def run(argv, **kw):
+                    if argv[:3] == ["gcloud", "projects", "describe"]:
+                        describes.append(argv[3])
+                        return Run(argv, 1, "", "PERMISSION_DENIED", 0.02)
+                    if "get-credentials" in argv:
+                        return Run(argv, 0, "", "", 0.01)
+                    if argv[:2] == ["kubectl", "api-resources"]:
+                        return serve_kcc(argv, None)
+                    if argv[:2] == ["kubectl", "get"]:
+                        kinds = argv[2]
+                        if kinds == "sa":
+                            return Run(
+                                argv,
+                                0,
+                                json.dumps(
+                                    dump_of(
+                                        wi_serviceaccount("sa-one", gsa=f"one@{WI_CENTRAL_PROJECT}.iam.gserviceaccount.com"),
+                                        wi_serviceaccount("sa-two", gsa=f"two@{WI_CENTRAL_PROJECT}.iam.gserviceaccount.com"),
+                                    )
+                                ),
+                                "",
+                                0.02,
+                            )
+                        if kinds in ("ccnp", *collect.CONFIGSYNC_SYNC_KINDS, *collect.AUTOPILOT_ALLOWLIST_KINDS):
+                            return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{kinds}"', 0.01)
+                        return Run(argv, 0, json.dumps(dump_of()), "", 0.02)
+                    if argv[:3] == ["gcloud", "container", "clusters"]:
+                        return Run(
+                            argv,
+                            0,
+                            json.dumps(
+                                {
+                                    "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                                    "privateClusterConfig": {"enablePrivateEndpoint": True},
+                                }
+                            ),
+                            "",
+                            0.02,
+                        )
+                    if argv[:3] == ["gcloud", "container", "node-pools"]:
+                        return Run(argv, 0, "[]", "", 0.02)
+                    return Run(argv, 0, "", "", 0.01)
+
+                return run
+
+            with TemporaryDirectory() as tmp:
+                with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+                    entry = collect.collect_cluster(
+                        target,
+                        "compliance-audit",
+                        collect.COMPLIANCE_CHECKS,
+                        run=make_run(target),
+                        wi_project_cache=cache,
+                    )
+            hits = [c["object"] for c in entry["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+            self.assertEqual(hits, ["ServiceAccount/sa-one", "ServiceAccount/sa-two"])
+        self.assertEqual(describes, [WI_CENTRAL_PROJECT])
+
+    def test_timed_out_project_describe_marks_check_unevaluated_not_clean_or_flagged(self):
+        result = self.compliance(
+            sa_items=[wi_serviceaccount()],
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs={
+                WI_PLANTED_PROJECT: Run(["gcloud", "projects", "describe", WI_PLANTED_PROJECT], collect.TIMEOUT_RC, "", "", 60.0),
+            },
+        )
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        unevaluated = {e["check"]: e["reason"] for e in result["checks_unevaluated"]}
+        self.assertIn("Undetermined", unevaluated[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG])
+        self.assertIn(WI_PLANTED_PROJECT, unevaluated[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG])
+        command_slugs = {c["check"] for c in result["commands"]}
+        self.assertNotIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, command_slugs)
+        self.assertEqual(len(command_slugs), 17)
+        self.assertNotIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, {c["check"] for c in result["candidates"]})
+
+    def test_broker_transient_and_consumer_disabled_failures_mark_unevaluated_without_caching(self):
+        cases = (
+            ("broker-busy", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "credential proxy throttled: gave up after 1 attempt (HTTP 503): CREDENTIAL_PROXY_BUSY", 0.1)),
+            ("policy-cap", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 77, "", "BROKER_SESSION_BUDGET_EXCEEDED", 0.05)),
+            ("spawn-error", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], -1, "", "FileNotFoundError: gcloud", 0.01)),
+            ("empty-stderr", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "", 0.05)),
+            ("rate-limited", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "ERROR: RESOURCE_EXHAUSTED: Quota exceeded (HTTP 429)", 0.1)),
+            ("upstream-503", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "ERROR: UNAVAILABLE: backend unavailable (HTTP 503)", 0.1)),
+            ("auth-refresh", Run(["gcloud", "projects", "describe", WI_CENTRAL_PROJECT], 1, "", "ERROR: problem refreshing your current auth tokens: invalid_grant", 0.1)),
+            (
+                "consumer-disabled",
+                Run(
+                    ["gcloud", "projects", "describe", WI_CENTRAL_PROJECT],
+                    1,
+                    "",
+                    "ERROR: PERMISSION_DENIED: Cloud Resource Manager API has not been used in project 123456 before or it is disabled (SERVICE_DISABLED)",
+                    0.1,
+                ),
+            ),
+            (
+                "quota-project-denied",
+                Run(
+                    ["gcloud", "projects", "describe", WI_CENTRAL_PROJECT],
+                    1,
+                    "",
+                    f"ERROR: (gcloud.projects.describe) [caller] does not have permission to access projects instance [{WI_CENTRAL_PROJECT}] (or it may not exist): Caller does not have required permission to use project quota-proj. Grant the caller the roles/serviceusage.serviceUsageConsumer role (USER_PROJECT_DENIED)",
+                    0.1,
+                ),
+            ),
+            (
+                "insufficient-scopes",
+                Run(
+                    ["gcloud", "projects", "describe", WI_CENTRAL_PROJECT],
+                    1,
+                    "",
+                    f"ERROR: (gcloud.projects.describe) [caller] does not have permission to access projects instance [{WI_CENTRAL_PROJECT}] (or it may not exist): Request had insufficient authentication scopes. (ACCESS_TOKEN_SCOPE_INSUFFICIENT)",
+                    0.1,
+                ),
+            ),
+        )
+        for label, failed_run in cases:
+            with self.subTest(case=label):
+                cache = collect._WiProjectDescribeCache()
+                calls = 0
+
+                def flaky_then_readable(argv, _failed=failed_run):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        return _failed
+                    return Run(argv, 0, "99887766\n", "", 0.02)
+
+                _, first_run = cache.describe(WI_CENTRAL_PROJECT, run=flaky_then_readable)
+                self.assertEqual(collect._classify_wi_project_describe(first_run), collect.WI_PROJECT_UNREAD)
+                self.assertEqual(cache._results, {})
+
+                result = self.compliance(
+                    sa_items=[wi_serviceaccount(gsa=f"reader@{WI_CENTRAL_PROJECT}.iam.gserviceaccount.com")],
+                    describe={
+                        "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                        "privateClusterConfig": {"enablePrivateEndpoint": True},
+                    },
+                    project_describe_runs={WI_CENTRAL_PROJECT: failed_run},
+                )
+                unevaluated = {e["check"]: e["reason"] for e in result.get("checks_unevaluated") or []}
+                self.assertIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, unevaluated)
+                self.assertIn("Undetermined:", unevaluated[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG])
+                self.assertNotIn(collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG, {c["check"] for c in result["commands"]})
+                self.assertEqual([c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG], [])
+
+                _, recovered_run = cache.describe(WI_CENTRAL_PROJECT, run=flaky_then_readable)
+                self.assertEqual(recovered_run.rc, 0)
+                self.assertEqual(calls, 2)
+                self.assertIn(WI_CENTRAL_PROJECT, cache._results)
+
+    def test_many_projects_stay_under_max_command_chars_and_keep_per_candidate_commands(self):
+        projects = [f"acme-external-tenant-{idx:02d}" for idx in range(35)]
+        overlong_project = "a" * (collect.WI_MAX_PROJECT_ID_CHARS + 1)
+        sa_items = [
+            wi_serviceaccount(f"sa-{idx:02d}", gsa=f"svc@{proj}.iam.gserviceaccount.com")
+            for idx, proj in enumerate(projects)
+        ] + [
+            wi_serviceaccount("overlong-sa", gsa=f"svc@{overlong_project}.iam.gserviceaccount.com"),
+        ]
+        project_runs = {
+            proj: Run(
+                ["gcloud", "projects", "describe", proj],
+                1,
+                "",
+                f"ERROR: (gcloud.projects.describe) caller does not have permission to access [{proj}] (or it may not exist): PERMISSION_DENIED",
+                0.02,
+            )
+            for proj in projects
+        }
+        result = self.compliance(
+            sa_items=sa_items,
+            describe={
+                "workloadIdentityConfig": {"workloadPool": WI_TEST_WORKLOAD_POOL},
+                "privateClusterConfig": {"enablePrivateEndpoint": True},
+            },
+            project_describe_runs=project_runs,
+        )
+        command = {c["check"]: c["command"] for c in result["commands"]}[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertLessEqual(len(command), audit_report.MAX_COMMAND_CHARS)
+        self.assertEqual(
+            command,
+            audit_report.validate_check_command(command, "clusters[0]", collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG),
+        )
+        candidates = [c for c in result["candidates"] if c["check"] == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG]
+        self.assertEqual(len(candidates), 35)
+        last = candidates[-1]
+        self.assertEqual(last["object"], "ServiceAccount/sa-34")
+        self.assertIn(f"gcloud projects describe {projects[-1]}", last["command"])
+        self.assertLessEqual(len(last["command"]), audit_report.MAX_COMMAND_CHARS)
+
+        drafted = audit_report.draft_findings({"audit": "compliance-audit", "clusters": [result]}, "compliance-audit")
+        adopted_finding = next(f for f in drafted["findings"] if f["object"] == "ServiceAccount/sa-34")
+        self.assertEqual(adopted_finding["evidence"]["command"], last["command"])
+
+    def test_concurrent_cache_waiter_recovers_when_owner_raises(self):
+        cache = collect._WiProjectDescribeCache()
+        entered = collect.threading.Event()
+        release = collect.threading.Event()
+        calls = 0
+
+        def owner_raises_then_waiter_succeeds(argv):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                release.wait(timeout=5.0)
+                raise RuntimeError("injected owner crash")
+            return Run(argv, 0, "12345\n", "", 0.01)
+
+        errors: list[BaseException] = []
+        waiter_results: list[Run] = []
+
+        def run_owner():
+            try:
+                cache.describe(WI_CENTRAL_PROJECT, run=owner_raises_then_waiter_succeeds)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def run_waiter():
+            _, res = cache.describe(WI_CENTRAL_PROJECT, run=owner_raises_then_waiter_succeeds)
+            waiter_results.append(res)
+
+        t1 = collect.threading.Thread(target=run_owner)
+        t2 = collect.threading.Thread(target=run_waiter)
+        t1.start()
+        self.assertTrue(entered.wait(timeout=5.0))
+        t2.start()
+        deadline = collect.time.monotonic() + 5.0
+        while collect.time.monotonic() < deadline:
+            frame = sys._current_frames().get(t2.ident)
+            in_wait = False
+            while frame is not None:
+                if frame.f_code.co_name == "wait":
+                    in_wait = True
+                    break
+                frame = frame.f_back
+            if in_wait:
+                break
+            collect.time.sleep(0.001)
+        self.assertTrue(in_wait)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertEqual(len(waiter_results), 1)
+        self.assertEqual(waiter_results[0].rc, 0)
+        self.assertEqual(calls, 2)
+
+    def test_check_is_on_the_compliance_roster_as_a_minor_cluster_check(self):
+        spec = next(c for c in collect.COMPLIANCE_CHECKS if c.slug == collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG)
+        self.assertEqual(spec.kind, "cluster")
+        self.assertEqual(spec.severity, "minor")
+        self.assertEqual(
+            collect._COMPLIANCE_CHECK_SOURCES[collect.WI_GSA_BINDING_UNVERIFIABLE_SLUG],
+            ("serviceaccounts", "describe", "projects"),
+        )
 
 
 

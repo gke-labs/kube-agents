@@ -23,6 +23,7 @@ import io
 import json
 import types
 import re
+import tempfile
 import textwrap
 import unittest
 from unittest import mock
@@ -578,6 +579,72 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             "/v1/exec", credential="a-credential", gate=types.SimpleNamespace(admit=lambda caller, token: bound)
         )
         self.assertIs(bound, admitted, replies)
+
+    def test_A3_only_the_chat_role_reports_the_dial(self) -> None:
+        # The handler row holds that the role table refuses a profile caller on
+        # the dial route. This row names the dial. The table gives the route to
+        # the chat role alone. The route's own handler refuses each other
+        # caller, also one with no role, which the table admits on every route.
+        # A refused report stores no level: a dial that a profile task or the
+        # shell could move is no dial.
+        cp = h.credential_proxy
+        broker = cp.vcs_broker
+        chat = cp.CALLER_ROLE_CHAT
+        self.assertIn((cp.DIAL_PATH, (chat,)), cp.ROUTE_ROLES)
+
+        def principal_of(role: str) -> object:
+            return cp.Principal(workload="w", uid="u", role=role, pod="p", pod_uid="u")
+
+        def authenticated(role: str) -> tuple[object, list]:
+            principal = principal_of(role)
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.authenticator = types.SimpleNamespace(authenticate=lambda headers: principal)
+            handler.headers = email.message.Message()
+            handler.command, handler.path, handler.profile_gate = "POST", cp.DIAL_PATH, None
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            return handler._authenticated(), replies
+
+        def reported(principal: object, level: str) -> tuple[int, dict]:
+            body = json.dumps({"level": level}).encode()
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = {"Content-Length": str(len(body))}
+            handler.rfile, handler.path = io.BytesIO(body), cp.DIAL_PATH
+            replies: list = []
+            handler._json = lambda status, payload: replies.append((int(status), payload))
+            handler._handle_dial_post(principal)
+            return replies[0]
+
+        for role in cp.CALLER_ROLES:
+            with self.subTest(table=role):
+                admitted, replies = authenticated(role)
+                if role == chat:
+                    self.assertIsNotNone(admitted, replies)
+                    continue
+                self.assertIsNone(admitted)
+                self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (replies[0][0], replies[0][1]["code"]), replies)
+
+        # The handler's own check, with the dial on and its stored level in a
+        # folder of this test. The chat role's report is the control.
+        with contextlib.ExitStack() as stack:
+            stored = f"{stack.enter_context(tempfile.TemporaryDirectory())}/dial-level"
+            stack.enter_context(mock.patch.dict("os.environ", {broker.DIAL_ENV: "on", broker.WRITE_MODE_ENV: ""}))
+            stack.enter_context(mock.patch.object(broker, "DIAL_STATE_FILE", stored))
+            stack.enter_context(mock.patch.object(broker, "_dial_level", None))
+            stack.enter_context(mock.patch.object(broker, "_dial_reported", False))
+            status, answer = reported(principal_of(chat), broker.DIAL_PROPOSE)
+            self.assertEqual((200, broker.DIAL_PROPOSE), (status, answer.get("level")), answer)
+            others = [role for role in cp.CALLER_ROLES if role != chat]
+            self.assertIn(cp.CALLER_ROLE_PROFILE, others)
+            callers = [(role, principal_of(role)) for role in others]
+            callers += [("a caller with no role", principal_of("")), ("no principal", None)]
+            for case, principal in callers:
+                with self.subTest(handler=case), self.assertLogs(cp.LOGGER, level="WARNING"):
+                    status, answer = reported(principal, broker.DIAL_AUTOMERGE)
+                    self.assertEqual((403, "CALLER_ROLE_FORBIDDEN"), (status, answer.get("code")), answer)
+                    self.assertEqual(broker.DIAL_PROPOSE, broker.dial_level())
+                    with open(stored, encoding="utf-8") as level:
+                        self.assertEqual(broker.DIAL_PROPOSE, level.read().strip())
 
     def test_A3_the_vcs_dispatch_refuses_a_profile_caller_ahead_of_the_body(self) -> None:
         # The permit row calls profile_vcs_refusal. This one drives the
