@@ -3,6 +3,7 @@ package proxyserver
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,6 +55,11 @@ const (
 
 	// certificateSources is how a usage text and an error name the three certificate fields.
 	certificateSources = "uri, dns or cn"
+	// pemCertificateBlock is the type of a PEM block that holds a certificate.
+	pemCertificateBlock = "CERTIFICATE"
+	// sharedCAMeaning is what one CA certificate under both certificate modes means, in the
+	// warnings that report it.
+	sharedCAMeaning = ": every certificate under that CA whose name is in --" + headerAllowedNamesFlag + " is a front proxy and can name any caller; give front proxies a CA of their own"
 	// libraryErrorPrefix starts every error of pkg/mtlsauth's constructors.
 	libraryErrorPrefix = "mtlsauth: "
 	// flagListSeparator joins flag names in an error that names several.
@@ -257,15 +264,18 @@ func validateClientCertFlags(cfg proxyConfig, modes []string) error {
 	// workload. Read from different fields, a workload's certificate could carry an allowed
 	// name in the front proxies' field next to its own identity in the workloads'.
 	if sharesClientCA(c, modes) && c.mtlsIdentitySource != c.headerNameSource {
-		return fmt.Errorf("--%s and --%s name the same file, so --%s (%s) and --%s (%s) must name the same certificate field: a workload's certificate could otherwise carry an allowed front proxy's name in the other field",
+		return fmt.Errorf("--%s and --%s share a CA certificate (one file, or a certificate in both bundles), so --%s (%s) and --%s (%s) must name the same certificate field: a workload's certificate could otherwise carry an allowed front proxy's name in the other field",
 			mtlsClientCAFileFlag, headerClientCAFileFlag, mtlsIdentitySourceFlag, c.mtlsIdentitySource, headerNameSourceFlag, c.headerNameSource)
 	}
 	return nil
 }
 
-// sharesClientCA reports whether both certificate modes are listed and their CA flags name
-// one file: the same path once cleaned and made absolute, or two paths to one existing
-// file. Two files holding the same CA are not detected.
+// sharesClientCA reports whether both certificate modes are listed and one CA certificate
+// vouches for both: their CA flags name one file (the same path once cleaned and made
+// absolute, or two paths to one existing file), or the two bundles hold a certificate with
+// the same bytes, as one Secret mounted twice does. Two different certificates of one CA
+// key, and a CA reached from both bundles through cross-signed intermediates, are not
+// detected.
 func sharesClientCA(c clientCertConfig, modes []string) bool {
 	if !slices.Contains(modes, authModeMTLS) || !slices.Contains(modes, authModeRequestHeader) {
 		return false
@@ -280,7 +290,71 @@ func sharesClientCA(c clientCertConfig, modes []string) bool {
 	}
 	workloadInfo, errWorkloads := os.Stat(c.mtlsClientCAFile)
 	proxyInfo, errProxies := os.Stat(c.headerClientCAFile)
-	return errWorkloads == nil && errProxies == nil && os.SameFile(workloadInfo, proxyInfo)
+	if errWorkloads == nil && errProxies == nil && os.SameFile(workloadInfo, proxyInfo) {
+		return true
+	}
+	return bundlesShareCertificate(c.mtlsClientCAFile, c.headerClientCAFile)
+}
+
+// bundleCertificates returns the certificates of the PEM bundle at path, each as its DER
+// bytes; none when the file cannot be read, which the bundle's own loader reports.
+func bundleCertificates(path string) map[string]struct{} {
+	data, err := os.ReadFile(path) // #nosec G304 -- a CA bundle the operator named in a flag
+	if err != nil {
+		return nil
+	}
+	certs := map[string]struct{}{}
+	for {
+		var block *pem.Block
+		if block, data = pem.Decode(data); block == nil {
+			return certs
+		}
+		if block.Type == pemCertificateBlock {
+			certs[string(block.Bytes)] = struct{}{}
+		}
+	}
+}
+
+// bundlesShareCertificate reports whether the two PEM bundles hold a certificate with the
+// same bytes.
+func bundlesShareCertificate(a, b string) bool {
+	other := bundleCertificates(b)
+	for cert := range bundleCertificates(a) {
+		if _, shared := other[cert]; shared {
+			return true
+		}
+	}
+	return false
+}
+
+// newSharedCAWatch returns what the listener calls when its client CAs were reloaded: a
+// func that warns when the two modes' bundles have come to share a CA certificate since
+// the last look, once for each time they do; nil unless both certificate modes are listed.
+// The proxy refuses that at startup when the modes read different certificate fields, and
+// cannot refuse it once it serves.
+func newSharedCAWatch(cfg proxyConfig, logger *slog.Logger) func() {
+	trimAuthFlags(&cfg)
+	modes, err := parseAuthModes(cfg.authMode)
+	if err != nil || !slices.Contains(modes, authModeMTLS) || !slices.Contains(modes, authModeRequestHeader) {
+		return nil
+	}
+	c := cfg.clientCert
+	var mu sync.Mutex
+	shared := sharesClientCA(c, modes)
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		was := shared
+		shared = sharesClientCA(c, modes)
+		if !shared || was {
+			return
+		}
+		message := "the reloaded --" + mtlsClientCAFileFlag + " and --" + headerClientCAFileFlag + " now share a CA certificate" + sharedCAMeaning
+		if c.mtlsIdentitySource != c.headerNameSource {
+			message += "; the two modes read different certificate fields, which the proxy refuses at startup, so a workload's certificate carrying an allowed front proxy's name is a front proxy until the bundles are separated"
+		}
+		logger.Warn(message, logKeyClientCAFile, c.headerClientCAFile, logKeyAllowedNames, splitList(c.headerAllowedNames))
+	}
 }
 
 // warnSharedClientCA says, once at startup, what one CA file for both certificate modes
@@ -289,7 +363,7 @@ func warnSharedClientCA(c clientCertConfig, modes []string, logger *slog.Logger)
 	if !sharesClientCA(c, modes) {
 		return
 	}
-	logger.Warn("--"+mtlsClientCAFileFlag+" and --"+headerClientCAFileFlag+" name the same file: every certificate under that CA whose name is in --"+headerAllowedNamesFlag+" is a front proxy and can name any caller; give front proxies a CA of their own",
+	logger.Warn("--"+mtlsClientCAFileFlag+" and --"+headerClientCAFileFlag+" share a CA certificate"+sharedCAMeaning,
 		logKeyClientCAFile, c.headerClientCAFile,
 		logKeyAllowedNames, splitList(c.headerAllowedNames),
 	)
@@ -604,15 +678,21 @@ type handshakeConfig struct {
 // that is given against the current clientCAs, so a rotated bundle applies to the next
 // handshake; a peer that presents none still connects, which is what a health probe and a
 // bearer-token caller do. The configuration is built once per version of the pool.
-func verifyClientCertificates(base *tls.Config, clientCAs *certreload.CAPool) func(*tls.ClientHelloInfo) (*tls.Config, error) {
+//
+// onReload, when not nil, is called each time a handshake finds the client CAs reloaded.
+func verifyClientCertificates(base *tls.Config, clientCAs *certreload.CAPool, onReload func()) func(*tls.ClientHelloInfo) (*tls.Config, error) {
 	// Cloned now, before the server starts and before base gets this func: net/http adds
 	// protocols to base once it serves, and every other field of base carries over.
 	template := base.Clone()
 	var current atomic.Pointer[handshakeConfig]
 	return func(*tls.ClientHelloInfo) (*tls.Config, error) {
 		pool := clientCAs.Pool()
-		if cached := current.Load(); cached != nil && cached.pool == pool {
+		cached := current.Load()
+		if cached != nil && cached.pool == pool {
 			return cached.config, nil
+		}
+		if cached != nil && onReload != nil {
+			onReload()
 		}
 		config := template.Clone()
 		config.NextProtos = []string{nextProtoHTTP2, nextProtoHTTP1}

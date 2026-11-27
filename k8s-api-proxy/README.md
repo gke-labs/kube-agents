@@ -574,11 +574,16 @@ chains to `--requestheader-client-ca-file` and carries a name in `--requestheade
 can act as any caller in any partition, and the audit record names the caller it sent and not the
 proxy. So the CA signs front proxies and nothing else, the list holds only proxies that
 authenticate their callers, and the headers are ones the proxy overwrites on every request. When
-both modes are listed and the two CA flags name one file, the proxy stops at startup if
+both modes are listed and one CA certificate vouches for both (the two CA flags name one file, or
+the two bundles hold a certificate with the same bytes, as one Secret mounted twice does), the
+proxy stops at startup if
 `--mtls-identity-source` and `--requestheader-name-source` differ, since a workload's certificate
 could then carry an allowed front proxy's name in the other field, and otherwise starts with a
-warning that every certificate under that CA with an allowed name is a front proxy. Two files
-holding the same CA are not detected: keeping them apart is the operator's to do. A
+warning that every certificate under that CA with an allowed name is a front proxy. Bundles that
+come to share a certificate through a reload cannot be refused: the proxy logs that warning once,
+at the next handshake, each time they do. Two different certificates of one CA key, and a CA both
+bundles reach through cross-signed intermediates, are not detected: keeping the two CAs apart
+stays the operator's to do. A
 peer that is not an allowed front proxy gains nothing by sending them: they are ignored, and
 stripped before the request is forwarded.
 
@@ -635,7 +640,8 @@ connection with a certificate is admitted or answered `401`.
 The proxy stops at startup, naming the flag, when:
 
 - `mtls` or `requestheader` is listed and `--tls-cert-file` or `--tls-key-file` is empty;
-- both are listed, their CA flags name one file, and their two source flags differ;
+- both are listed, their CA files are one file or hold a common certificate, and their two source
+  flags differ;
 - `mtls` is listed without `--mtls-client-ca-file` or `--mtls-identity-source`, or
   `requestheader` without `--requestheader-client-ca-file`, `--requestheader-name-source`,
   `--requestheader-allowed-names` or `--requestheader-username-headers`;

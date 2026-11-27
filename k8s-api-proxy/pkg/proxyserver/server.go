@@ -895,7 +895,7 @@ func newServer(ctx context.Context, cfg proxyConfig, mode k8sapiproxy.Mode, logg
 		return nil, false, err
 	}
 	if clientCAs != nil {
-		srv.TLSConfig.GetConfigForClient = verifyClientCertificates(srv.TLSConfig, clientCAs)
+		srv.TLSConfig.GetConfigForClient = verifyClientCertificates(srv.TLSConfig, clientCAs, newSharedCAWatch(cfg, logger))
 	}
 	return srv, true, nil
 }

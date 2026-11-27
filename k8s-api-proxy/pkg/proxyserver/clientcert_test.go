@@ -1380,6 +1380,24 @@ func TestOneClientCAFileForBothCertificateModes(t *testing.T) {
 		t.Fatal(err)
 	}
 	unclean := filepath.Dir(p.workloadCAFile) + string(filepath.Separator) + "." + string(filepath.Separator) + filepath.Base(p.workloadCAFile)
+	dir := t.TempDir()
+	hardLink, copied, superset := filepath.Join(dir, "hard-link-ca.crt"), filepath.Join(dir, "copied-ca.crt"), filepath.Join(dir, "superset-ca.crt")
+	absent := filepath.Join(dir, "absent-ca.crt")
+	if err := os.Link(p.workloadCAFile, hardLink); err != nil {
+		t.Fatal(err)
+	}
+	// Another file with the same CA, as one Secret mounted as two volumes is, and a
+	// bundle that holds the workloads' CA after the front proxies' own.
+	writeBundle(t, copied, p.workloads.pem)
+	writeBundle(t, superset, append(slices.Clone(p.gateways.pem), p.workloads.pem...))
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, p.workloadCAFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	both := append(append(p.mtlsArgs(), p.headerArgs()...), "--auth-mode=requestheader,mtls")
 	build := func(t *testing.T, args ...string) (string, error) {
 		t.Helper()
@@ -1388,9 +1406,12 @@ func TestOneClientCAFileForBothCertificateModes(t *testing.T) {
 		_, _, err := newServer(context.Background(), cfg, mode, slog.New(slog.NewJSONHandler(&logs, nil)), nil, nil)
 		return logs.String(), err
 	}
-	const sameFile, dnsNames = "name the same file", "--requestheader-name-source=dns"
+	const sameFile, dnsNames = "share a CA certificate", "--requestheader-name-source=dns"
 
-	for name, path := range map[string]string{"the same path": p.workloadCAFile, "an unclean path": unclean, "a symlink": link} {
+	for name, path := range map[string]string{
+		"the same path": p.workloadCAFile, "an unclean path": unclean, "a symlink": link, "a relative path": relative, "a hard link": hardLink,
+		"another file holding the same CA": copied, "a bundle that also holds the other mode's CA": superset,
+	} {
 		t.Run("refuses "+name+" read from different fields", func(t *testing.T) {
 			_, err := build(t, "--requestheader-client-ca-file="+path, dnsNames, "--requestheader-allowed-names="+testWorkloadDNS)
 			if err == nil || !strings.Contains(err.Error(), sameFile) || !strings.Contains(err.Error(), "--"+headerNameSourceFlag) {
@@ -1409,6 +1430,13 @@ func TestOneClientCAFileForBothCertificateModes(t *testing.T) {
 			}
 		})
 	}
+	// A file that does not load is reported as that, not as a shared CA.
+	t.Run("a CA file that does not exist", func(t *testing.T) {
+		_, err := build(t, "--requestheader-client-ca-file="+absent, dnsNames, "--requestheader-allowed-names="+testWorkloadDNS)
+		if err == nil || !strings.Contains(err.Error(), "--"+headerClientCAFileFlag+": ") || strings.Contains(err.Error(), sameFile) {
+			t.Fatalf("err = %v, want --%s reported as not loading", err, headerClientCAFileFlag)
+		}
+	})
 	for name, args := range map[string][]string{"the same field": nil, "different fields": {dnsNames, "--requestheader-allowed-names=" + testWorkloadDNS}} {
 		t.Run("two files read from "+name, func(t *testing.T) {
 			logs, err := build(t, args...)
@@ -1454,7 +1482,7 @@ func TestVerifyClientCertificatesKeepsTheBaseConfiguration(t *testing.T) {
 	suites := []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}
 	getCertificate := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return nil, nil }
 	base := &tls.Config{MinVersion: tls.VersionTLS13, CurvePreferences: curves, CipherSuites: suites, GetCertificate: getCertificate}
-	forClient := verifyClientCertificates(base, pool)
+	forClient := verifyClientCertificates(base, pool, nil)
 	// What the server does next: the base gets the func, and net/http its protocols.
 	base.GetConfigForClient = forClient
 	base.NextProtos = []string{nextProtoHTTP1}
@@ -1507,5 +1535,37 @@ func TestStartupErrorKeepsAValueThatHoldsAFieldName(t *testing.T) {
 				t.Errorf("err = %q names %s", err, library)
 			}
 		}
+	}
+}
+
+// Two bundles that come to share a CA certificate through a reload are reported once, at
+// the handshake that finds the client CAs reloaded: the proxy cannot refuse to start by then.
+func TestReloadedClientCAFilesThatShareACertificateAreReportedOnce(t *testing.T) {
+	const nowShare = "now share a CA certificate"
+	p := newCertProxy(t)
+	p.start(t, Options{}, append(append(p.mtlsArgs(), p.headerArgs()...), "--auth-mode=mtls,requestheader")...)
+	workload := certCase{cert: p.workloads.workload(t, testWorkloadURI), status: http.StatusOK, username: testWorkloadURI, authenticator: authModeMTLS}
+	p.check(t, workload, nil)
+	if logs := p.logs.String(); strings.Contains(logs, "share a CA certificate") {
+		t.Fatalf("logs = %s, want no shared CA reported for two CAs", logs)
+	}
+
+	writeBundle(t, p.gatewayCAFile, append(slices.Clone(p.gateways.pem), p.workloads.pem...))
+	p.clock.passCheckInterval()
+	p.check(t, workload, nil)
+	p.check(t, workload, nil)
+	if got := strings.Count(p.logs.String(), nowShare); got != 1 {
+		t.Fatalf("the shared CA was reported %d times after the reload, want once; logs = %s", got, p.logs.String())
+	}
+
+	// Apart again, then shared again: a second transition is a second report.
+	writeBundle(t, p.gatewayCAFile, p.gateways.pem)
+	p.clock.passCheckInterval()
+	p.check(t, workload, nil)
+	writeBundle(t, p.gatewayCAFile, append(slices.Clone(p.gateways.pem), p.workloads.pem...))
+	p.clock.passCheckInterval()
+	p.check(t, workload, nil)
+	if got := strings.Count(p.logs.String(), nowShare); got != 2 {
+		t.Errorf("the shared CA was reported %d times after two transitions, want 2", got)
 	}
 }
