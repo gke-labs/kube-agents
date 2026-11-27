@@ -424,7 +424,16 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 
 	harness, driver, builder, err := selectHarness(os.Getenv)
 	if err != nil {
-		log.Error("the worker's harness is not one it can run",
+		// A refused tool grant is not a harness problem: the harness and
+		// its selection are fine, the grant is what stops the worker. It
+		// gets its own message so a reader, or an alert on the message,
+		// sees the real cause rather than finding it only in err (#7376).
+		msg := "the worker's harness is not one it can run"
+		var grantErr *toolGrantError
+		if errors.As(err, &grantErr) {
+			msg = "the worker's tool grant is refused"
+		}
+		log.Error(msg,
 			lib.EnvHarness, os.Getenv(lib.EnvHarness), lib.EnvProfileHarness, os.Getenv(lib.EnvProfileHarness), "err", err)
 		return workeradapter.Config{}, false
 	}
@@ -943,7 +952,7 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 		if getenv(lib.EnvProfileWorker) != "true" {
 			var err error
 			if p, err = coreAgentSessionGrant(getenv, envOrDefaultFrom(getenv, "A2A_WORKDIR", defaultWorkdir)); err != nil {
-				return "", nil, nil, fmt.Errorf("the tool grant for harness %q: %w", driver.Harness(), err)
+				return "", nil, nil, &toolGrantError{harness: driver.Harness(), err: err}
 			}
 		}
 		driver = workeradapter.NewCoreAgentDriver(p, nil)
@@ -956,6 +965,20 @@ func selectHarness(getenv func(string) string) (persona.Harness, workeradapter.D
 	}
 	return driver.Harness(), driver, builder, nil
 }
+
+// toolGrantError is selectHarness refusing a harness's tool grant, as
+// distinct from refusing the harness: configFromEnv logs it under its own
+// message.
+type toolGrantError struct {
+	harness persona.Harness
+	err     error
+}
+
+func (e *toolGrantError) Error() string {
+	return fmt.Sprintf("the tool grant for harness %q: %v", e.harness, e.err)
+}
+
+func (e *toolGrantError) Unwrap() error { return e.err }
 
 // builderFor is the argv and env builder for a harness that has a driver. A
 // harness with a driver but no builder is an error, never Claude Code's
