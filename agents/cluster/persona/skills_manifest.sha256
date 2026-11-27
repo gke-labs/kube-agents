@@ -19,7 +19,7 @@ ee3a9a02dc9773a7aa27998ed55e5b464b5e0dc6731ea17e3a253bfed46bdbfb  ./skills/gke-w
 d0eece93c3c04b24fabfb686c1852876a377a91f85a77fe9516b0cf0f3ca946d  ./skills/pod-container-creating/SKILL.md
 0dcf951f424bd7306e5ceaace3ecccba4888fd64bcdd03e96f1471cf0912cf46  ./skills/pod-crashloop-oom/SKILL.md
 1306133bd7a0b90a97b9f64ec1a212a0a115a2b966a533363f32f4869830f2e4  ./skills/pod-pending-scheduling/SKILL.md
-2bbbd82f9aaec872518d9f189893e5f4828dba04da4737ab93614e8951c75691  ./skills/service-connectivity/SKILL.md
+1f144896a53c5fdcdd2c4642e5d174c6eae7fc194751f3cf8455d93832a9ce6c  ./skills/service-connectivity/SKILL.md
 88f2151c4a221f4c6b06d69a31dba2de82bd6a9cdb7a5544cc16c93de602beb4  ./skills/version-control/SKILL.md
 98a9fff845b5885d3f600c9a7252695ac70600bdaee47b439a71fe1cf4bf47cb  ./skills/version-control/scripts/vcs.py
 1faabb3f15df92115dc636a7c67aee3708b9ae00825f3f0e509afa72822890ae  ./skills/workload-triage-scan/SKILL.md

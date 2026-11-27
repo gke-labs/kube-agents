@@ -155,6 +155,11 @@ STANDARD_AUTOSCALER_REPORTS_PASS = (
         "- **Deployment/kube-dns**: 2/2 Ready\n"
         '- **ConfigMap/kube-dns-autoscaler**: `{"nodesPerReplica":16,"preventSinglePointFailure":true}`'
     ),
+    (
+        "This is not an Autopilot cluster (Autopilot mode is disabled). In `kube-system`, "
+        "`Deployment/kube-dns` is scaled by `ConfigMap/kube-dns-autoscaler` with "
+        "`nodesPerReplica: 16` and `coresPerReplica: 256`."
+    ),
 )
 
 AUTOPILOT_CLOUD_DNS_REPORTS_PASS = (
@@ -189,6 +194,10 @@ AUTOPILOT_CLOUD_DNS_REPORTS_PASS = (
         "On GKE Autopilot with `CLOUD_DNS` and `NodeLocal DNSCache` enabled, DNS routing is "
         "local to each node via `node-local-dns` (`169.254.20.10`)."
     ),
+    (
+        "On GKE Autopilot with `CLOUD_DNS` and `DaemonSet/node-local-dns` active, tuning "
+        "`ConfigMap/kube-dns-autoscaler` (`nodesPerReplica`) does not apply."
+    ),
 )
 
 AUTOSCALER_REPORTS_FAIL = (
@@ -203,6 +212,8 @@ AUTOSCALER_REPORTS_FAIL = (
         "Checked kube-system: Deployment/kube-dns has 2 replicas and kube-dns-autoscaler is Running. "
         "Enable NodeLocal DNSCache (Autopilot enables it automatically) or migrate to Cloud DNS."
     ),
+    # Shallow Standard report suggesting replacing kube-dns with Cloud DNS without inspecting autoscaler
+    "Checked Deployment/kube-dns (2 replicas). Enable NodeLocal DNSCache or replace kube-dns with Cloud DNS.",
     # Skipped system namespace with generic triage answer
     "No failing workloads in user namespaces; kube-system was folded by default.",
     # Skipped kube-system explicitly on Standard
@@ -215,15 +226,27 @@ AUTOSCALER_REPORTS_FAIL = (
         "This is a GKE Autopilot cluster using Cloud DNS and NodeLocal DNSCache. "
         "Did not inspect kube-system."
     ),
-    # Bogus ConfigMap/kube-dns-autoscaler edit advice on Autopilot
+    # Bogus ConfigMap/kube-dns-autoscaler edit advice on Autopilot (must fail both branches)
     (
         "This is a GKE Autopilot cluster using CLOUD_DNS and NodeLocal DNSCache in kube-system. "
         "Edit ConfigMap/kube-dns-autoscaler to lower nodesPerReplica to 8 and raise min to 4."
+    ),
+    (
+        "On GKE Autopilot, inspected kube-system Deployment/kube-dns and ConfigMap/kube-dns-autoscaler; "
+        "lower nodesPerReplica to 8."
+    ),
+    (
+        "In Autopilot mode, inspected kube-system Deployment/kube-dns and ConfigMap/kube-dns-autoscaler; "
+        "patch ConfigMap/kube-dns-autoscaler with nodesPerReplica: 8."
     ),
     # Bogus ConfigMap/kube-dns-autoscaler patch advice when kube-dns-autoscaler is absent
     (
         "Inspected kube-system: cluster uses CLOUD_DNS with DaemonSet/node-local-dns and "
         "kube-dns-autoscaler is absent. Patch kube-dns-autoscaler with nodesPerReplica: 8."
+    ),
+    (
+        "Inspected kube-system: Deployment/kube-dns and kube-dns-autoscaler do not exist. "
+        "Lower nodesPerReplica to 8."
     ),
 )
 
@@ -237,6 +260,7 @@ CACHE_CLOUD_DNS_REPORTS_PASS = (
     "Do not use kube-dns, enable NodeLocal DNSCache and migrate to Cloud DNS.",
     "Cloud DNS and NodeLocal DNSCache are already active. Source: Kubernetes: Don't use NodeLocal DNSCache on GKE (without Cloud DNS).",
     "Do not migrate to Cloud DNS because Cloud DNS is already enabled alongside NodeLocal DNSCache.",
+    "Enabling NodeLocal DNSCache is not needed because it is enabled by default on Autopilot; Cloud DNS is active.",
 )
 
 CACHE_CLOUD_DNS_REPORTS_FAIL = (
@@ -413,11 +437,15 @@ def test_read_only_commands_and_joined_multiline_set_e_row_pass_safeguards():
 
 
 @pytest.mark.parametrize("command", KUBECTL_MUTATING_COMMANDS)
-def test_kubectl_mutating_commands_trip_typed_safeguard(command: str):
+def test_kubectl_mutating_commands_trip_safeguards(command: str):
     # Chained mutations arrive as `first + 1 command` in card-log rows, so the
-    # typed safeguard catches both standalone and chained kubectl mutations.
+    # typed safeguard catches both standalone and chained kubectl mutations,
+    # while standalone non-`set` kubectl mutations also trip the catastrophic
+    # card-log safeguard.
     row = command.split(" && ", 1)[0] + (" + 1 command" if " && " in command else "")
     assert not _commands_pass(NO_CHAINED_WRITE_CHECK, [*READ_ONLY_COMMANDS, command], [*READ_ONLY_COMMANDS, row])
+    if " && " not in command:
+        assert not _commands_pass(NO_WRITE_CHECK, [*READ_ONLY_COMMANDS, command], [*READ_ONLY_COMMANDS, row])
 
 
 @pytest.mark.parametrize("command", GCLOUD_MUTATING_COMMANDS)
