@@ -15,8 +15,9 @@ crashed run left.
              burst window (the first-run flow and every audit) and the soak window,
              and write the verdict; exit 1 when it is red
   install    upgrade the host cluster's install to the newest `main` commit whose
-             images are published, at the size's tier (the release's other values
-             are kept, so no secret is needed)
+             images are published, at the size's tier, from the registry
+             REGISTRY_PREFIX names (unset, GHCR); the release's secrets and other
+             values are kept
   usage      tokens by capability for any period (--since, --until), from the live install or a
              kept archive (--stores), checked against Vertex AI's own count
   sweep      delete any sized fleet older than --max-age-hours, whatever its size:
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -69,7 +71,16 @@ DEFAULT_NAMESPACE = "kubeagents-system"
 RELEASE = "kube-agents"
 CHART_DIR = REPO / "charts" / "kube-agents"
 CRD_DIR = CHART_DIR / "crds"
-REGISTRY = "ghcr.io"
+# Where a commit's published images are looked up and installed from: REGISTRY_PREFIX, the
+# variable the release scripts and hack/ci-deploy.sh read, else the public default.
+REGISTRY_PREFIX_ENV = "REGISTRY_PREFIX"
+DEFAULT_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
+GHCR_HOST = "ghcr.io"
+# An Artifact Registry Docker host answers the caller's Google access token, not an anonymous one.
+ARTIFACT_REGISTRY_HOST = re.compile(r"^[a-z0-9-]+-docker\.pkg\.dev$")
+ACCESS_TOKEN_COMMAND = (kube.GCLOUD, "auth", "print-access-token")
+# The chart value that puts every first-party image on one registry prefix; empty is the default.
+IMAGE_REGISTRY_KEY = "global.imageRegistry"
 IMAGES_FILE = REPO / "images.json"
 FIRST_PARTY = "first-party"
 RELEASE_TAG_POLICY = "release"
@@ -664,15 +675,22 @@ def summary(name: str, body: dict) -> str:
                      for w, v in windows.items())
 
 
+def registry_prefix() -> str:
+    """The registry prefix a commit's published images are under, without a trailing slash."""
+    return (os.environ.get(REGISTRY_PREFIX_ENV) or DEFAULT_REGISTRY_PREFIX).rstrip("/")
+
+
 def image_repositories() -> list[str]:
     """The registry path of every first-party image an install pulls at the release's tag.
 
     images.json is the inventory of what an install pulls. The chart's tag keys name only
     five; the operator renders the agent bus's images (a2a-*, hermes-bridge, web-console)
-    at its own tag, and the release pushes them last.
+    at its own tag, and the release pushes them last. Each keeps its trailing name under
+    the registry prefix, the layout the chart's global.imageRegistry assumes.
     """
+    path = registry_prefix().partition("/")[2]
     images = json.loads(IMAGES_FILE.read_text())["images"]
-    return sorted(i["repository"].removeprefix(f"{REGISTRY}/") for i in images
+    return sorted(f"{path}/{i['repository'].rsplit('/', 1)[-1]}" for i in images
                   if i.get("origin") == FIRST_PARTY and i.get("tagPolicy") == RELEASE_TAG_POLICY)
 
 
@@ -685,12 +703,33 @@ def image_published(sha: str) -> bool:
     return all(manifest_exists(repo, sha) for repo in image_repositories())
 
 
+@functools.cache
+def google_access_token() -> str:
+    """The caller's Google access token, asked for once a run."""
+    return subprocess.run(ACCESS_TOKEN_COMMAND, capture_output=True, text=True, check=True,
+                          timeout=REGISTRY_TIMEOUT_SECONDS).stdout.strip()
+
+
+def registry_token(host: str, repo: str) -> str:
+    """A token ``host`` accepts for reading ``repo``: the caller's Google one for Artifact Registry, GHCR's anonymous one.
+
+    The Google token goes to an Artifact Registry host and no other; a host that is neither is refused.
+    """
+    if ARTIFACT_REGISTRY_HOST.match(host):
+        return google_access_token()
+    if host != GHCR_HOST:
+        raise SystemExit(f"{REGISTRY_PREFIX_ENV} names {host}, which this lookup cannot ask: "
+                         f"it reads {GHCR_HOST} and Artifact Registry (<location>-docker.pkg.dev)")
+    token_url = f"https://{GHCR_HOST}/token?scope=repository:{repo}:pull&service={GHCR_HOST}"
+    with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed host
+        return json.loads(response.read())["token"]
+
+
 def manifest_exists(repo: str, sha: str) -> bool:
-    """Whether ``repo`` has a manifest tagged ``sha``, read anonymously."""
-    token_url = f"https://{REGISTRY}/token?scope=repository:{repo}:pull&service={REGISTRY}"
-    with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed URL
-        token = json.loads(response.read())["token"]
-    request = urllib.request.Request(f"https://{REGISTRY}/v2/{repo}/manifests/{sha}",
+    """Whether ``repo`` has a manifest tagged ``sha`` in the registry the prefix names."""
+    host = registry_prefix().partition("/")[0]
+    token = registry_token(host, repo)
+    request = urllib.request.Request(f"https://{host}/v2/{repo}/manifests/{sha}",
                                      headers={"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT})
     try:
         with urllib.request.urlopen(request, timeout=REGISTRY_TIMEOUT_SECONDS):  # noqa: S310
@@ -748,6 +787,11 @@ def cmd_install(args: argparse.Namespace) -> int:
         kube.run(["kubectl", "--context", host_context, "apply", "--server-side", "--force-conflicts", "-f",
                   str(chart / CRD_DIR.name)], timeout=HELM_TIMEOUT_SECONDS)
         sets = [f"--set={key}={sha}" for key in IMAGE_TAG_KEYS] + [f"--set={SIZING_KEY}={tier}"]
+        # The images built from this repository are pulled from the registry the commit was
+        # looked up in. Said on every run, the default as the chart's own empty value, so a
+        # release that kept another run's registry does not pull from one this run never asked.
+        prefix = registry_prefix()
+        sets.append(f"--set-string={IMAGE_REGISTRY_KEY}={'' if prefix == DEFAULT_REGISTRY_PREFIX else prefix}")
         overrides = Path(tree) / "test-bed-values.json"
         overrides.write_text(json.dumps({"platformAgent": {"deployment": {"env": env}}}))
         sets += ["-f", str(overrides)]
