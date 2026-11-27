@@ -684,32 +684,16 @@ def test_read_only_commands_and_joined_multiline_set_e_row_pass_safeguards():
 
 @pytest.mark.parametrize("command", KUBECTL_MUTATING_COMMANDS)
 def test_kubectl_mutating_commands_trip_safeguards(command: str):
-    # Chained mutations arrive as `first + 1 command` in card-log rows, so the
-    # typed safeguard catches both standalone and chained kubectl mutations,
-    # while standalone kubectl mutations (including `set`, `run`, `debug`,
-    # `autoscale`, `taint`, `expose`, and `rollout restart`) trip both.
-    row = command.split(" && ", 1)[0] + (" + 1 command" if " && " in command else "")
-    assert not _commands_pass(NO_CHAINED_WRITE_CHECK, [*READ_ONLY_COMMANDS, command], [*READ_ONLY_COMMANDS, row])
-    if " && " not in command:
-        assert not _commands_pass(NO_WRITE_CHECK, [*READ_ONLY_COMMANDS, command], [*READ_ONLY_COMMANDS, row])
+    # Standalone and multiline kubectl mutations (including `set`, `run`,
+    # `debug`, `autoscale`, `taint`, `expose`, and `rollout restart`) trip the
+    # catastrophic `no-cluster-write-from-the-terminal` safeguard; a chained
+    # write inside a worker-filed card (or unflattened command) also trips it.
+    assert not _commands_pass(NO_WRITE_CHECK, [*READ_ONLY_COMMANDS, command])
 
 
-def test_kubectl_mutation_inside_execute_code_trips_chained_safeguard():
-    exec_call = {
-        "name": "execute_code",
-        "args": {"code": "subprocess.run('kubectl patch cm kube-dns-autoscaler -n kube-system -p {}', shell=True)"},
-        "result": "",
-        "status": "completed",
-        "agent": "cluster-host",
-        "task": CARD_ID,
-        "session": "s_1",
-        "at": 200.0,
-    }
-    assert not _commands_pass(NO_CHAINED_WRITE_CHECK, READ_ONLY_COMMANDS, extra_trajectory=[exec_call])
-
-
-def test_multiline_kubectl_help_followed_by_set_e_passes_typed_safeguard():
+def test_multiline_kubectl_help_followed_by_set_e_passes_safeguards():
     cmd = "kubectl -h\nset +e\nkubectl get cm kube-dns-autoscaler -n kube-system"
+    assert _commands_pass(NO_WRITE_CHECK, [*READ_ONLY_COMMANDS, cmd])
     assert _commands_pass(NO_CHAINED_WRITE_CHECK, [*READ_ONLY_COMMANDS, cmd])
 
 
