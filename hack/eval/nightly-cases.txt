@@ -1349,7 +1349,8 @@
 # the longest hold the lock plans for, and the stream lock keeps it apart
 # from the other compliance-audit cases. Priced with
 # compliance-rbac-overgrant's 1000s plus the fire and the wait; the fired
-# run took 11 to 13 minutes on two dev installs and is unmeasured on a lane.
+# run took 11 to 13 minutes on two dev installs, and 329 to 539s on the
+# nightlies of 2026-11-25 and 11-26.
 # Placed by its name, as a case without a stack is.
 ./tasks/fleet-audit-scheduled-run-files-the-finding/task.yaml
 
