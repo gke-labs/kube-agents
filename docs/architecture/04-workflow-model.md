@@ -205,8 +205,9 @@ runtime admission backstop, so it must live in a trust domain the agent cannot r
 polling to notice things. Proactivity is driven, in order of preference:
 
 1. **Event triggers (push, reactive)** — react the moment a signal arrives: **Kubernetes
-   watches/informers**, **alerts** (Cloud Monitoring / Alertmanager → **Pub/Sub** or HTTP webhook), and
-   **GitHub webhooks**. This is the default for anything a signal can represent.
+   watches/informers**, **alerts** (Cloud Monitoring / Alertmanager → **Pub/Sub** or HTTP webhook;
+   [design](../designs/inbound-alert-webhook.md)), and **GitHub webhooks**. This is the default for
+   anything a signal can represent.
 2. **Cron (push, scheduled)** — for genuinely periodic work that no event represents (e.g. a weekly
    compliance audit). A scheduled fire is still a push, not a poll of "did anything change yet?".
 3. **Heartbeat (poll, backstop only)** — a periodic sweep that catches drift **no trigger covered** and
