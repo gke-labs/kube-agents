@@ -47,6 +47,12 @@ type teamsPress struct {
 	Choice *int   `json:"choice"`
 	Label  string `json:"label"`
 	Next   bool   `json:"next"`
+	// Verb, Row and Tasks are a board row press's: the action, the row's
+	// index among its message's rows, and the row's card ids
+	// (teams_board.go).
+	Verb  string `json:"verb"`
+	Row   *int   `json:"row"`
+	Tasks string `json:"tasks"`
 }
 
 // teamsCardPress reads a message activity's value as a press of one of the
@@ -82,6 +88,11 @@ func (a *TeamsAdapter) classifyPress(act *teamsActivity, press teamsPress, conve
 	}
 	if press.Action == teamsPressActionChoice {
 		return a.choicePress(act, press, conversation, kind)
+	}
+	if press.Action == teamsPressActionBoard {
+		// A board row's Retry or Drop is never a turn either: it acts
+		// over the board route, off the pull loop.
+		return InboundMessage{}, a.boardPress(act, press, conversation)
 	}
 	if press.Action != teamsPressActionStop {
 		return InboundMessage{}, "press of a button this adapter does not draw (" + press.Action + ")"

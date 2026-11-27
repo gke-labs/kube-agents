@@ -260,6 +260,15 @@ type TeamsAdapter struct {
 	editing map[string]*teamsEditLock
 	// rating counts the ratings in flight, for a test to wait on.
 	rating sync.WaitGroup
+	// boardActor and boardAdmits are the board route and the admission
+	// rule a press of a board row's Retry or Drop takes (SetBoardActor,
+	// SetBoardAdmits); boardTaps is the rows being pressed, by message and
+	// row, and boarding counts the presses in flight, for a test to wait
+	// on (teams_board.go).
+	boardActor  BoardActor
+	boardAdmits BoardAdmits
+	boardTaps   map[string]bool
+	boarding    sync.WaitGroup
 	// ux is the adapter's record of its laid-out messages: the questions
 	// open, the answers waiting on the gateway's verdict, and what each
 	// card shows (teams_clicks.go). rewrites counts the answered
@@ -1051,6 +1060,8 @@ func teamsCardActivity(text string) map[string]any {
 // the card's own actions key; none leaves the card as it was.
 func teamsCardActivityWith(text string, actions []map[string]any) map[string]any {
 	card := teamsMarkdownToCard(text)
+	// A board row's buttons go in the body, under their row (teams_board.go).
+	actions = teamsPlaceBoardRows(card, actions)
 	if len(actions) > 0 {
 		card[teamsCardActionsKey] = actions
 	}
