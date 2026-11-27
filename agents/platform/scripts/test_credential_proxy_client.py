@@ -4577,6 +4577,71 @@ class LoopbackKubeProxyKubeconfigTest(unittest.TestCase):
         )
         self.assertEqual({}, doc["users"][0]["user"])
 
+    # The host context the worker adapter gives a task that has no cluster
+    # (kubeProxyNoTargetContext in a2a/worker-adapter/kubeproxy.go): not a GKE context name.
+    NO_TARGET_CTX = "no-cluster-for-this-task"
+
+    def ensure_for_a_bare_kubectl(self, environ):
+        """What `--ensure-kubectl-context` leaves as the default kubeconfig for a `kubectl get pods`
+        under `environ`, or None when it writes none."""
+        import yaml
+
+        home_config = self.root / "home" / ".kube" / "config"
+        home_config.parent.parent.mkdir()
+        with patch.dict(os.environ, environ), \
+                patch.object(credential_proxy_client, "_caller_default_kubeconfig_path", return_value=home_config), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.root / "absent" / "config"):
+            for name in ("KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT", "KUBECONFIG"):
+                if name not in environ:
+                    os.environ.pop(name, None)
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(["get", "pods"])
+        if not home_config.exists():
+            return None
+        return yaml.safe_load(home_config.read_text(encoding="utf-8"))
+
+    def test_a_bare_kubectl_in_a_task_with_no_cluster_asks_the_loopback(self):
+        """A task with no cluster gets a placeholder host context, so the kubeconfig a bare kubectl
+        reads points at the loopback, which says why there is nothing to read. Without one, kubectl
+        had no kubeconfig and reported a refused connection to localhost:8080."""
+        self.assertIsNone(credential_proxy_client.parse_gke_context(self.NO_TARGET_CTX))
+        doc = self.ensure_for_a_bare_kubectl(
+            {"KUBE_PROXY_URL": self.LOOPBACK_URL, "KUBE_PROXY_HOST_CONTEXT": self.NO_TARGET_CTX}
+        )
+        self.assertEqual(self.NO_TARGET_CTX, doc["current-context"])
+        self.assertEqual(
+            [{"name": self.NO_TARGET_CTX, "cluster": {"server": f"{self.LOOPBACK_URL}/clusters/{self.NO_TARGET_CTX}"}}],
+            doc["clusters"],
+        )
+        self.assertEqual([{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {}}], doc["users"])
+        self.assertEqual(
+            [{"name": self.NO_TARGET_CTX, "context": {"cluster": self.NO_TARGET_CTX, "user": credential_proxy_client.KUBE_PROXY_USER_NAME}}],
+            doc["contexts"],
+        )
+
+    def test_without_a_host_context_no_default_kubeconfig_is_written_as_before(self):
+        """The client itself invents no context, for the loopback or any other proxy: the placeholder
+        is the adapter's to give."""
+        for proxy_url in (self.LOOPBACK_URL, self.HTTPS_URL):
+            with self.subTest(proxy_url=proxy_url):
+                self.assertIsNone(self.ensure_for_a_bare_kubectl({"KUBE_PROXY_URL": proxy_url}))
+                shutil.rmtree(self.root / "home")
+
+    def test_a_host_context_behind_any_other_proxy_is_written_as_before(self):
+        doc = self.ensure_for_a_bare_kubectl(
+            {
+                "KUBE_PROXY_URL": self.HTTPS_URL,
+                "KUBE_PROXY_HOST_CONTEXT": self.HOST_CTX,
+                "KUBE_PROXY_CA_FILE": self.CA_FILE,
+                "CREDENTIAL_PROXY_TOKEN_FILE": self.TOKEN_FILE,
+            }
+        )
+        self.assertEqual(self.HOST_CTX, doc["current-context"])
+        self.assertEqual(
+            {"server": f"{self.HTTPS_URL}/clusters/{self.HOST_CTX}", "certificate-authority": self.CA_FILE},
+            doc["clusters"][0]["cluster"],
+        )
+        self.assertEqual({"tokenFile": self.TOKEN_FILE}, doc["users"][0]["user"])
+
 
 class KubeconfigLockOwnerTest(unittest.TestCase):
     """Only the kubeconfig's owner makes the lock beside it. A caller that does

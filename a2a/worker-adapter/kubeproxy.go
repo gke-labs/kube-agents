@@ -145,6 +145,17 @@ const (
 	// modification time, its size and the error.
 	caFailureFormat = "%d/%d: %v"
 
+	// kubeProxyNoTargetContext is the host context a task's harness gets
+	// when the loopback holds the task to no cluster. Without a host context
+	// the kubectl wrapper's client writes no kubeconfig, and a kubectl that
+	// names no context asks localhost:8080 and reports a refused connection.
+	// With this one it asks the loopback, which answers every path of such a
+	// task with why there is no cluster to read. It is not a GKE context
+	// name (no gke_ prefix), so it names no real cluster, the client never
+	// takes it for one, and a task that has a target is refused it like any
+	// cluster but its own.
+	kubeProxyNoTargetContext = "no-cluster-for-this-task"
+
 	// gkeContextFormat is a GKE cluster's kubeconfig context name, from its
 	// project, location and cluster (credential_proxy_client.ClusterTarget).
 	gkeContextFormat = "gke_%s_%s_%s"
@@ -373,7 +384,9 @@ func StartKubeProxyLoopback(cfg KubeProxyLoopbackConfig, log *slog.Logger) (*Kub
 	if err != nil {
 		return nil, fmt.Errorf("%s does not parse as a URL: want https://host[:port][/path]", EnvKubeProxyURL)
 	}
-	if upstream.Scheme != kubeProxyUpstreamScheme || upstream.Host == "" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" {
+	// Hostname, not Host: "https://:8443" has a Host and names no one to
+	// dial or to verify a certificate for.
+	if upstream.Scheme != kubeProxyUpstreamScheme || upstream.Hostname() == "" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" {
 		return nil, fmt.Errorf("%s (scheme %q, host %q): want https://host[:port][/path], with no credentials, query or fragment", EnvKubeProxyURL, upstream.Scheme, upstream.Host)
 	}
 	caPath := strings.TrimSpace(cfg.CAFile)
@@ -447,20 +460,29 @@ func (p *KubeProxyLoopback) serve(w http.ResponseWriter, r *http.Request) {
 		writeKubeProxyStatus(w, http.StatusForbidden, kubeProxyNotProxyMessage)
 		return
 	}
-	// 404, as for any path this listener doesn't serve: a path that climbs,
-	// or spells its cluster in an encoding, is not one kubectl sends, and
-	// not one whose cluster can be read here.
-	cluster, ok := kubeProxyPathCluster(r.URL.EscapedPath())
-	if !ok {
+	escaped := r.URL.EscapedPath()
+	if !strings.HasPrefix(escaped, kubeProxyPathPrefix) {
 		writeKubeProxyStatus(w, http.StatusNotFound, kubeProxyNotFoundMessage)
 		return
 	}
+	// Before the path is read any further: with no task, or a task with no
+	// cluster to hold it to, every path under the prefix gets that answer,
+	// whichever cluster it names (a bare kubectl names
+	// kubeProxyNoTargetContext) and however it is spelt.
 	task, refusal := p.admit()
 	if task == nil {
 		writeKubeProxyStatus(w, http.StatusForbidden, refusal)
 		return
 	}
 	defer task.inflight.Done()
+	// 404, as for any path this listener doesn't serve: a path that climbs,
+	// or spells its cluster in an encoding, is not one kubectl sends, and
+	// not one whose cluster can be read here.
+	cluster, ok := kubeProxyPathCluster(escaped)
+	if !ok {
+		writeKubeProxyStatus(w, http.StatusNotFound, kubeProxyNotFoundMessage)
+		return
+	}
 	// The task's own cluster, byte for byte, or nothing is sent. The path
 	// may be enabled only against a kube-proxy that checks the same against
 	// the credential; this check is in front of that one.
@@ -806,7 +828,8 @@ func taskTargetContext(credential string) (context string, targeted bool) {
 // kubeProxyTaskEnv is a task's harness environment with the pod's kube-proxy
 // replaced by the loopback: EnvKubeProxyURL names the loopback, the CA file
 // goes (the loopback is plain http, and holds the CA itself), and the host
-// context is the task's target, or absent when it has none.
+// context is the task's target, or kubeProxyNoTargetContext when it has
+// none.
 func kubeProxyTaskEnv(env []string, loopbackURL, targetContext string) []string {
 	out := make([]string, 0, len(env)+2)
 	for _, kv := range env {
@@ -816,9 +839,8 @@ func kubeProxyTaskEnv(env []string, loopbackURL, targetContext string) []string 
 		}
 		out = append(out, kv)
 	}
-	out = append(out, EnvKubeProxyURL+"="+loopbackURL)
-	if targetContext != "" {
-		out = append(out, envKubeProxyHostContext+"="+targetContext)
+	if targetContext == "" {
+		targetContext = kubeProxyNoTargetContext
 	}
-	return out
+	return append(out, EnvKubeProxyURL+"="+loopbackURL, envKubeProxyHostContext+"="+targetContext)
 }

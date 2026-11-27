@@ -711,14 +711,16 @@ func TestAnUnusableKubeProxyStopsTheWorker(t *testing.T) {
 		cfg  KubeProxyLoopbackConfig
 		want string
 	}{
-		"plain http":        {KubeProxyLoopbackConfig{Upstream: "http://kube-proxy:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
-		"no scheme":         {KubeProxyLoopbackConfig{Upstream: "kube-proxy:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
-		"credentials":       {KubeProxyLoopbackConfig{Upstream: "https://u:p@kube-proxy:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
-		"a query":           {KubeProxyLoopbackConfig{Upstream: "https://kube-proxy:8443/?x=1", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
-		"no CA file named":  {KubeProxyLoopbackConfig{Upstream: up.srv.URL, PodTokenFile: token}, EnvKubeProxyCAFile},
-		"a missing CA file": {KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: filepath.Join(dir, "absent.crt"), PodTokenFile: token}, EnvKubeProxyCAFile},
-		"a CA file of junk": {KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: garbage, PodTokenFile: token}, EnvKubeProxyCAFile},
-		"no token file":     {KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: ca}, EnvCredentialProxyTokenFile},
+		"plain http":         {KubeProxyLoopbackConfig{Upstream: "http://kube-proxy:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
+		"no scheme":          {KubeProxyLoopbackConfig{Upstream: "kube-proxy:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
+		"credentials":        {KubeProxyLoopbackConfig{Upstream: "https://u:p@kube-proxy:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
+		"a query":            {KubeProxyLoopbackConfig{Upstream: "https://kube-proxy:8443/?x=1", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
+		"a port and no host": {KubeProxyLoopbackConfig{Upstream: "https://:8443", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
+		"no host at all":     {KubeProxyLoopbackConfig{Upstream: "https://", CAFile: ca, PodTokenFile: token}, EnvKubeProxyURL},
+		"no CA file named":   {KubeProxyLoopbackConfig{Upstream: up.srv.URL, PodTokenFile: token}, EnvKubeProxyCAFile},
+		"a missing CA file":  {KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: filepath.Join(dir, "absent.crt"), PodTokenFile: token}, EnvKubeProxyCAFile},
+		"a CA file of junk":  {KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: garbage, PodTokenFile: token}, EnvKubeProxyCAFile},
+		"no token file":      {KubeProxyLoopbackConfig{Upstream: up.srv.URL, CAFile: ca}, EnvCredentialProxyTokenFile},
 	} {
 		p, err := startKubeProxyLoopback(tc.cfg, discardLogger())
 		if p != nil {
@@ -801,8 +803,70 @@ func TestATasksHarnessIsPointedAtTheLoopback(t *testing.T) {
 	cfg = Config{TaskID: "task-b", HarnessEnv: slices.Clone(w.cfg.HarnessEnv)}
 	end = w.beginKubeProxyTask(&cfg, &held{})
 	defer end()
-	if want := []string{"PATH=/bin", EnvKubeProxyURL + "=" + f.p.URL}; !slices.Equal(cfg.HarnessEnv, want) {
+	if want := []string{"PATH=/bin", EnvKubeProxyURL + "=" + f.p.URL, envKubeProxyHostContext + "=" + kubeProxyNoTargetContext}; !slices.Equal(cfg.HarnessEnv, want) {
 		t.Errorf("a targetless task's environment = %q, want %q", cfg.HarnessEnv, want)
+	}
+}
+
+// kubeTestBarePath is what a kubectl that names no context asks for in a
+// task with no cluster: the placeholder context the harness was given.
+const kubeTestBarePath = "/clusters/" + kubeProxyNoTargetContext + "/api?timeout=32s"
+
+// TestABareKubectlInATaskWithNoClusterIsToldWhy: a task with no target, and
+// one whose target can't be addressed, each get their own message on the
+// placeholder context's path, on any other cluster's path and on a bent
+// one, with nothing sent upstream. So does a pod running no task. A task
+// that has a target is refused the placeholder like any cluster but its own,
+// and a bent path under it is still a 404.
+func TestABareKubectlInATaskWithNoClusterIsToldWhy(t *testing.T) {
+	f := startKubeLoopback(t)
+	// Every target context is gke_<project>_<location>_<cluster>.
+	if strings.HasPrefix(kubeProxyNoTargetContext, "gke_") {
+		t.Fatalf("the placeholder context %q could be a cluster's", kubeProxyNoTargetContext)
+	}
+	if cluster, ok := kubeProxyPathCluster("/clusters/" + kubeProxyNoTargetContext + "/api"); !ok || cluster != kubeProxyNoTargetContext {
+		t.Fatalf("the placeholder's path reads as %q, %v", cluster, ok)
+	}
+	paths := []string{kubeTestBarePath, kubeTestEchoPath, "/clusters/../healthz", "/clusters/%2e%2e/x", "/clusters//x"}
+	expect := func(when string, wantStatus int, wantMessage, path string) {
+		t.Helper()
+		status, body := rawRequest(t, f.addr, fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, f.addr))
+		if status != wantStatus || !strings.Contains(body, wantMessage) {
+			t.Errorf("%s, %s: status %d, body %q; want %d carrying %q", when, path, status, body, wantStatus, wantMessage)
+		}
+	}
+	for _, path := range paths {
+		expect("no task", http.StatusForbidden, kubeProxyNoTaskMessage, path)
+	}
+	for _, tc := range []struct{ when, credential, message string }{
+		{"a task given no cluster", "", kubeProxyNoClusterMessage},
+		{"a report task", reportCredential(), kubeProxyNoClusterMessage},
+		{"a task whose cluster can't be addressed", claimsCredential(`{"nats":{"target":{"project":"example.com:proj","location":"us-central1","cluster":"alpha"}}}`), kubeProxyUnaddressedMessage},
+		{"a task with a misshapen credential", "not a credential", kubeProxyUnaddressedMessage},
+	} {
+		target, end := f.p.BeginTask("task-none", tc.credential)
+		if target != "" {
+			t.Errorf("%s: held to %q, want no context", tc.when, target)
+		}
+		for _, path := range paths {
+			expect(tc.when, http.StatusForbidden, tc.message, path)
+		}
+		end()
+	}
+	if calls := f.up.seen(); len(calls) != 0 {
+		t.Fatalf("the upstream saw %d requests, want none: %+v", len(calls), calls)
+	}
+
+	// A task with a target: the placeholder is another cluster, a bent path
+	// is no path, and its own cluster goes through.
+	_, end := f.p.BeginTask("task-a", clusterCredential("alpha"))
+	defer end()
+	expect("a task with a target", http.StatusForbidden, kubeProxyOtherClusterMessage, kubeTestBarePath)
+	expect("a task with a target", http.StatusNotFound, kubeProxyNotFoundMessage, "/clusters/../healthz")
+	expect("a task with a target", http.StatusNotFound, kubeProxyNotFoundMessage, "/clusters/%2e%2e/x")
+	expect("a task with a target", http.StatusOK, "ok", kubeTestEchoPath)
+	if calls := f.up.seen(); len(calls) != 1 {
+		t.Errorf("the upstream saw %d requests, want the one for the task's own cluster", len(calls))
 	}
 }
 
@@ -916,8 +980,8 @@ func TestTheHarnessGetsTheContextTheLoopbackSettledOn(t *testing.T) {
 	cfg := Config{TaskID: "task-oversize", HarnessEnv: slices.Clone(w.cfg.HarnessEnv)}
 	end := w.beginKubeProxyTask(&cfg, &held{proxyToken: oversize})
 	defer end()
-	if want := []string{"PATH=/bin", EnvKubeProxyURL + "=" + f.p.URL}; !slices.Equal(cfg.HarnessEnv, want) {
-		t.Errorf("the task's environment = %q, want no host context: %q", cfg.HarnessEnv, want)
+	if want := []string{"PATH=/bin", EnvKubeProxyURL + "=" + f.p.URL, envKubeProxyHostContext + "=" + kubeProxyNoTargetContext}; !slices.Equal(cfg.HarnessEnv, want) {
+		t.Errorf("the task's environment = %q, want the placeholder for the host context: %q", cfg.HarnessEnv, want)
 	}
 	if status, body, _ := f.get(t, kubeTestEchoPath); status != http.StatusForbidden || !strings.Contains(body, kubeProxyUnaddressedMessage) {
 		t.Errorf("status %d, body %q; want the task refused here", status, body)
