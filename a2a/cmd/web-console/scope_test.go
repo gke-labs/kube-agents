@@ -248,6 +248,14 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				Clusters: &zeroCount,
 			},
 			{
+				ID:          "proj-carried",
+				Via:         []string{"folders/123"},
+				Outcome:     "unreachable",
+				State:       "in-scope",
+				AbsentSince: "2026-11-26T04:00:00Z",
+				Clusters:    &oneCount,
+			},
+			{
 				ID:          "proj-retiring",
 				Via:         []string{"explicit"},
 				Outcome:     "ok",
@@ -260,10 +268,16 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 			"cluster-proj-host-c1-us-central1":      "proj-host",
 			"cluster-proj-host-c2-us-east1":         "proj-host",
 			"cluster-proj-host-c3-no-ident":         "proj-host",
+			"cluster-proj-carried-c1-europe-west1":  "proj-carried",
 			"cluster-proj-retiring-old-us-central1": "proj-retiring",
 			"cluster-proj-unmanaged-u1-us-central1": "proj-unmanaged",
 		},
 		Unmanaged: []upstreamUnmanagedEntry{
+			{
+				Profile: "cluster-proj-carried-c1-europe-west1",
+				Project: "proj-carried",
+				Reason:  "not under any declared container in the asset index this run; carried forward",
+			},
 			{
 				Profile: "cluster-proj-unmanaged-u1-us-central1",
 				Project: "proj-unmanaged",
@@ -284,6 +298,13 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 				Cluster:  "c2",
 				Location: "us-east1",
 				Ready:    false,
+			},
+			{
+				Profile:  "cluster-proj-carried-c1-europe-west1",
+				Project:  "proj-carried",
+				Cluster:  "carried-c1",
+				Location: "europe-west1",
+				Ready:    true,
 			},
 			{
 				Profile:  "cluster-proj-retiring-old-us-central1",
@@ -340,12 +361,12 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	}
 	got := decode[scopeResponse](t, rec)
 
-	if got.Summary.TotalProjects != 5 || got.Summary.OKProjects != 1 || got.Summary.ErrorProjects != 4 {
-		t.Errorf("project summary = %+v, want total=5 ok=1 error=4 (retiring project excluded)", got.Summary)
+	if got.Summary.TotalProjects != 6 || got.Summary.OKProjects != 1 || got.Summary.ErrorProjects != 5 {
+		t.Errorf("project summary = %+v, want total=6 ok=1 error=5 (carried project kept; retiring and unmanaged excluded)", got.Summary)
 	}
-	// Only real cluster profiles (c1 ready=ok, c2 unready=error, c3 missing identity=error) are counted in cluster summary.
-	if got.Summary.TotalClusters != 3 || got.Summary.OKClusters != 1 || got.Summary.ErrorClusters != 2 {
-		t.Errorf("cluster summary = %+v, want total=3 ok=1 error=2 (no synthetic placeholder rows or retiring profiles)", got.Summary)
+	// Only real cluster profiles (c1 ready=ok, c2 unready=error, c3 missing identity=error, carried-c1 unreachable=error) are counted in cluster summary.
+	if got.Summary.TotalClusters != 4 || got.Summary.OKClusters != 1 || got.Summary.ErrorClusters != 3 {
+		t.Errorf("cluster summary = %+v, want total=4 ok=1 error=3 (carried cluster kept; no synthetic placeholder rows or retiring/unmanaged profiles)", got.Summary)
 	}
 	if !got.EventWatcher.Enabled || !got.EventWatcher.Healthy || got.EventWatcher.Status != watcherStatusWatching || got.EventWatcher.ClustersUp != 1 {
 		t.Errorf("EventWatcher = %+v", got.EventWatcher)
@@ -392,6 +413,18 @@ func TestHandleScopeEnrichesGatewaySnapshotAndWatcherMetrics(t *testing.T) {
 	}
 	if !strings.Contains(byProject["proj-overcap"].Remediation, "spec.scope.maxProjects") {
 		t.Errorf("proj-overcap remediation = %q", byProject["proj-overcap"].Remediation)
+	}
+	// Carried-in-scope projects list surviving profiles in raw.Unmanaged during carry-forward ticks,
+	// and must still keep their cluster rows and summary counts.
+	carried, ok := byProject["proj-carried"]
+	if !ok {
+		t.Fatalf("proj-carried missing from active scope projects")
+	}
+	if len(carried.ClusterRows) != 1 {
+		t.Fatalf("proj-carried cluster rows = %+v, want 1 surviving carried cluster row", carried.ClusterRows)
+	}
+	if carried.ClusterRows[0].Name != "carried-c1" || carried.ClusterRows[0].Outcome != outcomeUnreachable || !strings.Contains(carried.ClusterRows[0].Remediation, "VPC egress") {
+		t.Errorf("proj-carried cluster row = %+v, want carried-c1 unreachable with remediation", carried.ClusterRows[0])
 	}
 }
 
@@ -477,8 +510,17 @@ func TestBuildWatcherStatusReportsUnreachableWhenMetricsListenerRefuses(t *testi
 	if got.Healthy || got.Status != watcherStatusUnreachable {
 		t.Errorf("buildWatcherStatus with unreachable metrics = %+v, want Healthy=false Status=unreachable", got)
 	}
-	if !strings.Contains(got.Detail, "ConnectionRefusedError") {
-		t.Errorf("Detail = %q, want ConnectionRefusedError", got.Detail)
+	if got.Detail != "k8s-event-watcher metrics unreachable: ConnectionRefusedError" {
+		t.Errorf("Detail = %q, want unprefixed single-copy error string", got.Detail)
+	}
+
+	unconfigured := buildWatcherStatus(&upstreamEventWatcher{
+		Enabled:   true,
+		Reachable: false,
+		Error:     "EVENT_WATCHER_METRICS_PORT is not configured",
+	}, true, true, "")
+	if unconfigured.Detail != "k8s-event-watcher metrics unreachable (EVENT_WATCHER_METRICS_PORT is not configured)" {
+		t.Errorf("unconfigured Detail = %q", unconfigured.Detail)
 	}
 
 	degraded := buildWatcherStatus(&upstreamEventWatcher{

@@ -309,6 +309,7 @@ own key:
 | Operation        | console | eval | ops |
 | ---------------- | :-----: | :--: | :-: |
 | `health`         |    ✓    |  ✓   |  ✓  |
+| `scope`          |    ✓    |      |     |
 | `models`         |         |      |  ✓  |
 | `turn.respond`   |         |  ✓   |  ✓  |
 | `session.create` |    ✓    |      |     |

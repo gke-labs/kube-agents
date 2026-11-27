@@ -77,6 +77,7 @@ const (
 	watcherDiscoveryErrorsFmt        = " (%d profile discovery %s)"
 	watcherStartingDetail            = "Assembling initial cluster watch set"
 	watcherMetricsUnreachableDetail  = "k8s-event-watcher metrics listener on loopback is unreachable"
+	watcherMetricsPrefix             = "k8s-event-watcher metrics"
 	watcherMetricsErrorFmt           = "k8s-event-watcher metrics unreachable (%s)"
 	watcherFallbackHealthyDetail     = "Agent gateway reachable; k8s-event-watcher opens an #alerts thread when a Warning event arrives"
 	watcherFallbackUnreachableDetail = "Agent gateway unreachable"
@@ -94,12 +95,12 @@ const (
 // dailyAuditSlot is one daily fleet audit from agents/platform/cron/jobs.json,
 // ordered by UTC time of day.
 type dailyAuditSlot struct {
-	ID         string
-	Name       string
-	HourUTC    int
-	MinuteUTC  int
-	CronExpr   string
-	TimeLabel  string
+	ID        string
+	Name      string
+	HourUTC   int
+	MinuteUTC int
+	CronExpr  string
+	TimeLabel string
 }
 
 // dailyAuditRoster lists the daily fleet audits shipped in
@@ -222,15 +223,15 @@ type upstreamEventWatcherTarget struct {
 // scopeProjectRow is one project row in GET /api/scope, enriched with profile
 // names, discovered cluster identities, and remediation guidance.
 type scopeProjectRow struct {
-	ID          string                `json:"id"`
-	Via         []string              `json:"via"`
-	Outcome     string                `json:"outcome"`
-	State       string                `json:"state"`
-	Clusters    *int                  `json:"clusters"`
-	Profiles    []string              `json:"profiles"`
-	ClusterRows []scopeClusterRow     `json:"cluster_rows,omitempty"`
-	Remediation string                `json:"remediation,omitempty"`
-	AbsentSince string                `json:"absent_since,omitempty"`
+	ID          string            `json:"id"`
+	Via         []string          `json:"via"`
+	Outcome     string            `json:"outcome"`
+	State       string            `json:"state"`
+	Clusters    *int              `json:"clusters"`
+	Profiles    []string          `json:"profiles"`
+	ClusterRows []scopeClusterRow `json:"cluster_rows,omitempty"`
+	Remediation string            `json:"remediation,omitempty"`
+	AbsentSince string            `json:"absent_since,omitempty"`
 }
 
 // scopeClusterRow is one discovered or configured cluster entry with its
@@ -431,7 +432,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 	identByProfile := map[string]upstreamProfileIdentity{}
 	identByProject := map[string][]upstreamProfileIdentity{}
 	for _, id := range raw.ProfileIdentities {
-		if id.Profile == "" || id.Project == "" || id.Cluster == "" || unmanagedProfiles[id.Profile] {
+		if id.Profile == "" || id.Project == "" || id.Cluster == "" {
 			continue
 		}
 		identByProfile[id.Profile] = id
@@ -440,7 +441,7 @@ func buildScopeResponse(cfg config, raw upstreamScopePayload, scopeFetched, gate
 
 	profilesByProject := map[string][]string{}
 	for prof, proj := range raw.Profiles {
-		if prof == "" || proj == "" || unmanagedProfiles[prof] {
+		if prof == "" || proj == "" {
 			continue
 		}
 		profilesByProject[proj] = append(profilesByProject[proj], prof)
@@ -737,7 +738,11 @@ func buildWatcherStatus(ew *upstreamEventWatcher, scopeFetched, gatewayHealthy b
 		if scopeFetched {
 			detail := watcherMetricsUnreachableDetail
 			if ew.Error != "" {
-				detail = fmt.Sprintf(watcherMetricsErrorFmt, ew.Error)
+				if strings.HasPrefix(ew.Error, watcherMetricsPrefix) {
+					detail = ew.Error
+				} else {
+					detail = fmt.Sprintf(watcherMetricsErrorFmt, ew.Error)
+				}
 			}
 			return scopeWatcherStatus{
 				Enabled: true,

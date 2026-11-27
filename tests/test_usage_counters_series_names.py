@@ -243,6 +243,16 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
         self.assertEqual(_watcher_gauge_family("clusterUp"), _py_const("AGENT_API_CLUSTER_UP_METRIC", _BROKER_PY))
         self.assertEqual(_watcher_family("clusterDiscoveryErrors"), _py_const("AGENT_API_DISCOVERY_ERRORS_METRIC", _BROKER_PY))
+        match = re.search(
+            r'clusterDiscoveryErrors:\s*prometheus\.NewCounterVec\(prometheus\.CounterOpts\{.*?\},\s*\[\]string\{([^}]*)\}\)',
+            _WATCHER_METRICS_GO.read_text(),
+            re.S,
+        )
+        assert match, f"clusterDiscoveryErrors has no label slice in {_WATCHER_METRICS_GO}"
+        self.assertEqual(
+            {_py_const("AGENT_API_METRIC_PROFILE_LABEL", _BROKER_PY)},
+            set(_go_words(_WATCHER_METRICS_GO, match.group(1))),
+        )
 
     def test_the_watchers_watch_set_ready_gauge_is_the_one_the_poller_reads(self):
         self.assertEqual(_go_const(_WATCHER_METRICS_GO, "watchSetReadyMetric"), _go_const(_SCRAPE_GO, "watchSetReadySeries"))

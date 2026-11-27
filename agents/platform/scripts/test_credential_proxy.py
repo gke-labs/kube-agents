@@ -1133,7 +1133,9 @@ class AgentAPIProxyTest(unittest.TestCase):
             for i in range(18000)
         )
         metrics_body = (
-            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 2\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 5\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c3-broken"} 3\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c1-us-central1"} 0\n'
             'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
             'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
             + filler_series
@@ -1205,6 +1207,27 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertEqual(1, watcher["clusters_up"])
         self.assertEqual(2, watcher["clusters_total"])
         self.assertEqual(2, watcher["discovery_errors"])
+
+    def test_parse_event_watcher_metrics_counts_distinct_error_profiles_across_ticks(self):
+        # Cumulative rescan counter increments for one broken profile must count as 1 affected profile, not 7.
+        single_profile_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 7\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 0\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        single = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(single_profile_text)
+        self.assertEqual(1, single["discovery_errors"])
+
+        # Multiple distinct profiles with multi-tick counts plus a duplicate sample line count distinct profiles only.
+        multi_profile_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 4\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 5\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-b-c2-us-west1"} 9\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-c-c3-europe-west1"} 0\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        multi = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(multi_profile_text)
+        self.assertEqual(2, multi["discovery_errors"])
 
 
 class PolicyTest(unittest.TestCase):

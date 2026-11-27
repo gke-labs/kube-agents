@@ -5854,9 +5854,8 @@
         return projects
           .map((p) => {
             const projID = p.id || "unknown";
-            const projVia = Array.isArray(p.via)
-              ? p.via.join(", ")
-              : p.via || "scope";
+            const projVia =
+              (Array.isArray(p.via) ? p.via.join(", ") : p.via) || "scope";
             const pClusters = Array.isArray(p.cluster_rows)
               ? p.cluster_rows
               : [];
@@ -5950,9 +5949,21 @@
                   ? "Degraded"
                   : "Unreachable"
               : "Disabled";
-        const ewDetail =
-          ew.detail ||
-          "Kubernetes Event Watcher streams Warning events into # alerts as they occur.";
+        const ewDetail = !hasWatcher
+          ? "Loading Kubernetes Event Watcher status…"
+          : ew.detail ||
+            "Kubernetes Event Watcher streams Warning events into # alerts as they occur.";
+        const alertsLeadText = !hasWatcher
+          ? "Checking Kubernetes Event Watcher status. Scheduled daily fleet audits post anomaly reports here automatically."
+          : isWatching
+            ? "Proactive fleet monitoring is active. New Kubernetes warning incidents and anomaly reports appear here automatically."
+            : !ew.enabled
+              ? "Kubernetes Event Watcher is disabled for this install, so live warning events are not streamed here. Scheduled daily fleet audits still post anomaly reports automatically."
+              : isStarting
+                ? "Kubernetes Event Watcher is starting up and assembling its cluster watch set. Scheduled daily fleet audits still post anomaly reports automatically."
+                : isDegraded
+                  ? "Kubernetes Event Watcher is degraded and watching no clusters right now. Scheduled daily fleet audits still post anomaly reports automatically."
+                  : "Kubernetes Event Watcher is unreachable, so live warning incidents may not appear until it recovers. Scheduled daily fleet audits still post anomaly reports automatically.";
         const nextName = sch.next_audit_name || "Daily fleet audit";
         const nextAt = sch.next_audit_at || "";
         const windowUtc = sch.window_utc || "";
@@ -5979,7 +5990,7 @@
           "@platform Run an on-demand cluster health and security posture check now";
         return `<div class="feed-empty" style="max-width:560px;margin:24px auto;text-align:left;padding:18px 20px;border:1px solid var(--border-subtle, rgba(128,128,128,0.22));border-radius:10px;">
           <div style="font-weight:600;font-size:14px;margin-bottom:6px;">${escapeHtml(CHANNELS.alerts.empty)}</div>
-          <div style="font-size:12.5px;opacity:0.85;margin-bottom:12px;">Proactive fleet monitoring is active. New Kubernetes warning incidents and anomaly reports appear here automatically.</div>
+          <div style="font-size:12.5px;opacity:0.85;margin-bottom:12px;">${escapeHtml(alertsLeadText)}</div>
           <div style="display:flex;flex-direction:column;gap:8px;font-size:12.5px;margin-bottom:14px;">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
               <span><strong>Kubernetes Event Watcher:</strong> ${escapeHtml(ewDetail)}</span>

@@ -2296,6 +2296,20 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 		"",
 		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
 	)
+	unreachableResp := buildScopeResponse(
+		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
+		upstreamScopePayload{
+			EventWatcher: &upstreamEventWatcher{
+				Enabled:   true,
+				Reachable: false,
+				Error:     "k8s-event-watcher metrics unreachable: ConnectionRefusedError",
+			},
+		},
+		true,
+		true,
+		"",
+		time.Date(2099, 3, 15, 5, 20, 0, 0, time.UTC),
+	)
 	disabledResp := buildScopeResponse(
 		config{ProjectID: "proj-a", Location: "us-central1", ClusterName: "prod-a"},
 		upstreamScopePayload{
@@ -2320,6 +2334,10 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal degradedResp: %v", err)
 	}
+	unreachableJSON, err := json.Marshal(unreachableResp)
+	if err != nil {
+		t.Fatalf("marshal unreachableResp: %v", err)
+	}
 	disabledJSON, err := json.Marshal(disabledResp)
 	if err != nil {
 		t.Fatalf("marshal disabledResp: %v", err)
@@ -2329,20 +2347,28 @@ func TestPageAlertsEmptyStateRendersWatcherAndScheduleBanner(t *testing.T) {
 		"escapeHtml",
 		"CHANNELS",
 		"renderAlertsEmptyStateHtml",
-	) + "\nconst htmlWatching = renderAlertsEmptyStateHtml(" + string(watchingJSON) + ");\nconst htmlStarting = renderAlertsEmptyStateHtml(" + string(startingJSON) + ");\nconst htmlDegraded = renderAlertsEmptyStateHtml(" + string(degradedJSON) + ");\nconst htmlDisabled = renderAlertsEmptyStateHtml(" + string(disabledJSON) + ");\nconst htmlNull = renderAlertsEmptyStateHtml(null);\n" + `
+	) + "\nconst htmlWatching = renderAlertsEmptyStateHtml(" + string(watchingJSON) + ");\nconst htmlStarting = renderAlertsEmptyStateHtml(" + string(startingJSON) + ");\nconst htmlDegraded = renderAlertsEmptyStateHtml(" + string(degradedJSON) + ");\nconst htmlUnreachable = renderAlertsEmptyStateHtml(" + string(unreachableJSON) + ");\nconst htmlDisabled = renderAlertsEmptyStateHtml(" + string(disabledJSON) + ");\nconst htmlNull = renderAlertsEmptyStateHtml(null);\n" + `
+const activeClaim = "Proactive fleet monitoring is active.";
 console.log(JSON.stringify({
   hasEmptyHeadline: htmlWatching.includes(CHANNELS.alerts.empty),
   hasWatcherDetail: htmlWatching.includes("Watching 2 of 2 clusters for Kubernetes Warning events"),
   hasWatchingBadge: htmlWatching.includes("Watching") && htmlWatching.includes("badge-green"),
+  hasWatchingLead: htmlWatching.includes(activeClaim),
   hasStartingBadge: htmlStarting.includes("Starting") && htmlStarting.includes("badge-amber"),
+  hasStartingLead: !htmlStarting.includes(activeClaim) && htmlStarting.includes("starting up") && htmlStarting.includes("Scheduled daily fleet audits"),
   hasDegradedBadge: htmlDegraded.includes("Degraded") && htmlDegraded.includes("badge-amber") && !htmlDegraded.includes("badge-green"),
+  hasDegradedLead: !htmlDegraded.includes(activeClaim) && htmlDegraded.includes("degraded") && htmlDegraded.includes("Scheduled daily fleet audits"),
+  hasUnreachableBadge: htmlUnreachable.includes("Unreachable") && htmlUnreachable.includes("badge-amber"),
+  hasUnreachableLead: !htmlUnreachable.includes(activeClaim) && htmlUnreachable.includes("unreachable") && htmlUnreachable.includes("Scheduled daily fleet audits"),
   hasDisabledBadge: htmlDisabled.includes("Disabled") && htmlDisabled.includes("badge-grey"),
+  hasDisabledLead: !htmlDisabled.includes(activeClaim) && htmlDisabled.includes("disabled") && htmlDisabled.includes("Scheduled daily fleet audits"),
   hasLoadingBadge: htmlNull.includes("Loading") && htmlNull.includes("badge-grey") && !htmlNull.includes("Disabled"),
+  hasLoadingLead: !htmlNull.includes(activeClaim) && htmlNull.includes("Checking Kubernetes Event Watcher status") && htmlNull.includes("Scheduled daily fleet audits"),
   hasNextAudit: htmlWatching.includes("Security &amp; RBAC Posture Audit at 2099-03-15T06:20:00Z"),
   hasStarterPrompt: htmlWatching.includes("data-starter-prompt="),
 }));
 `
-	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasStartingBadge":true,"hasDegradedBadge":true,"hasDisabledBadge":true,"hasLoadingBadge":true,"hasNextAudit":true,"hasStarterPrompt":true}`
+	want := `{"hasEmptyHeadline":true,"hasWatcherDetail":true,"hasWatchingBadge":true,"hasWatchingLead":true,"hasStartingBadge":true,"hasStartingLead":true,"hasDegradedBadge":true,"hasDegradedLead":true,"hasUnreachableBadge":true,"hasUnreachableLead":true,"hasDisabledBadge":true,"hasDisabledLead":true,"hasLoadingBadge":true,"hasLoadingLead":true,"hasNextAudit":true,"hasStarterPrompt":true}`
 	if got := runPageJS(t, script); got != want {
 		t.Errorf("renderAlertsEmptyStateHtml output checks = %s, want %s", got, want)
 	}
