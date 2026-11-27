@@ -656,13 +656,39 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(out, odd)
 
     def test_json_inside_a_decoded_tool_output_is_decoded_too(self) -> None:
-        stdout = json.dumps({"kind": "Secret", "data": {"k": "c2VjcmV0"}}, indent=2)
+        # The nested value only a key-name rule masks: the text rules leave it,
+        # so only the nested decoding catches it, and the changed inner
+        # document keeps its indent.
+        stdout = json.dumps({"auth": "opaque-value-xyz", "name": "web"}, indent=2)
         output = json.dumps({"exit_code": 0, "stdout": stdout, "stderr": ""})
         req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "bash", "response": {"output": output}}}]}]}
         out = json.loads(self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]["output"])
         self.assertEqual(out["exit_code"], 0)
-        self.assertEqual(json.loads(out["stdout"])["data"]["k"], "[REDACTED_SECRET]")
-        self.assertTrue(out["stdout"].startswith('{\n  "kind"'), "the inner document keeps its indent")
+        self.assertEqual(json.loads(out["stdout"])["auth"], "[REDACTED_SECRET]")
+        self.assertTrue(out["stdout"].startswith('{\n  "auth"'), "the inner document keeps its indent")
+
+    def test_a_gemini_response_secret_with_a_json_data_string_is_masked_whole(self) -> None:
+        response = {"kind": "Secret", "data": json.dumps({"cfg": json.dumps({"v": "opaque-zz"})})}
+        req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": response}}]}]}
+        out = self._run(req, "agenerate_content")
+        self.assertNotIn("opaque-zz", json.dumps(out))
+
+    def test_a_bare_pseudonym_marker_still_lets_the_output_decode(self) -> None:
+        config = dict(_RULES_CONFIG, rules=_RULES_CONFIG["rules"] + [{"name": "acct", "pattern": "4[0-9]{8}", "action": "pseudonym"}])
+        hook = _load_callback_module(config).proxy_handler_instance
+        text = '{"account": 412345678, "auth": "opaque-value-xyz"}'
+        out = asyncio.run(hook.async_pre_call_hook({}, None, {"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]}, "completion"))
+        content = out["messages"][0]["content"]
+        self.assertNotIn("opaque-value-xyz", content)
+        self.assertNotIn("412345678", content)
+        json.loads(content)
+
+    def test_a_number_a_second_text_pass_masks_stays_valid_json(self) -> None:
+        text = '{"token":\n  123456789,\n  "auth": "opaque-value-xyz"}'
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+        self.assertNotIn("123456789", out)
+        self.assertNotIn("opaque-value-xyz", out)
+        json.loads(out)
 
     def test_tool_output_past_the_bounds_or_not_whole_json_is_matched_as_text(self) -> None:
         big = json.dumps({"auth": "opaque-value-xyz", "pad": "x" * (256 * 1024)})

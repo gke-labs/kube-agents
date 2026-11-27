@@ -190,8 +190,9 @@ TOOL_OUTPUT_MAX_FIELDS = 64
 # Stands in for a string while asking whether the structure rules would mask
 # it whole where it sits (a credential key, a Secret's data, an env value).
 MASK_PROBE = "kube-agents-redaction-probe"
-# A text rule's marker standing as a bare JSON value, where a number was.
-BARE_MARKER = re.compile(r"\[REDACTED_[A-Z0-9_]+\](?=\s*[,}\]])")
+# A text rule's marker (a mask or a pseudonym) standing as a bare JSON value,
+# where a number was.
+BARE_MARKER = re.compile(r"\[(?:REDACTED_[A-Z0-9_]+|[A-Za-z0-9_.\-]+:[0-9a-f]{12})\](?=\s*[,}\]])")
 # A string that is one marker and nothing else.
 WHOLE_MARKER = re.compile(r"\[(?:REDACTED_[A-Z0-9_]+|[A-Za-z0-9_.\-]+:[0-9a-f]{12})\]\Z")
 TOOL_ROLE = "tool"
@@ -552,6 +553,10 @@ class KubeAgentsRedactionCallback(CustomLogger):
             # Only adds: the text it starts from is already masked.
             if not keep and style is not None:
                 text, made = AuditRedactor.redact_counted(text, self._rules)
+                # A marker written in place of a bare value is quoted, as
+                # before decoding. Text a rule matched across JSON syntax
+                # stays masked even if it no longer parses: masked wins.
+                text = self._quote_bare_markers(text)
                 for name, count in made.items():
                     counts[name] = counts.get(name, 0) + count
             self._put(redacted, path, text)
@@ -645,7 +650,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
         string (after a colon, a comma or an opening bracket), so the text
         rules' result over JSON is JSON again. A marker inside a string,
         escaped JSON included, is left alone."""
-        if "[REDACTED_" not in text:
+        if "[" not in text:
             return text
         out: List[str] = []
         in_string = escaped = False
@@ -854,7 +859,7 @@ class KubeAgentsRedactionCallback(CustomLogger):
                         # sits stays a string.
                         if self._masked_whole(body, (name,)):
                             continue
-                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found, counts)
+                        self._decode_output((CONTENTS_KEY, i, PARTS_KEY, j, key, GEMINI_RESPONSE_KEY, name), value, found, counts, outer=(body, name))
         return found
 
     @staticmethod
@@ -885,7 +890,9 @@ class KubeAgentsRedactionCallback(CustomLogger):
         self._check_shape(data)
         kept = self._carve(data)
         # The text rules' counts for each decoded tool output are taken when
-        # it is masked before decoding.
+        # it is masked before decoding. Counts are rule applications: a value
+        # a text rule masked in part and a structure rule then masked whole
+        # counts once for each.
         counts: Dict[str, int] = {}
         arguments = self._tool_arguments(data) + self._tool_outputs(data, counts)
         for key in list(data):
