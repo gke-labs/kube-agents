@@ -46,7 +46,7 @@ limitations under the License.
 // reply has been returned. The page polls GET /api/sessions/{id}/messages for
 // those, through a route limited to this console's own session IDs.
 //
-// Three read routes sit beside the chat. GET /api/insights (insights.go)
+// Four read routes sit beside the chat. GET /api/insights (insights.go)
 // returns the model, the token and spend totals (the operator's since-install
 // figures off the PlatformAgent status when readable, LiteLLM's own counters
 // otherwise), the agent's identity as recorded at install, and the cluster. GET /api/sessions/{id}/transcript
@@ -54,6 +54,9 @@ limitations under the License.
 // console session, and refuses every other session, Slack and Google Chat
 // included. GET /api/channels/{name}/posts (channels.go) lists the event
 // triage sessions as #alerts and the scheduled checks as #scheduled.
+// GET /api/scope (scope.go) enriches the gateway's fleet scope snapshot with
+// cluster connectivity outcomes, Event Watcher status, and the next scheduled
+// daily fleet audit.
 //
 // POST /api/chat/stream (stream.go) runs the same turn as POST /api/chat and
 // relays one status line per agent step as server-sent events, then the
@@ -580,6 +583,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("GET /api/sessions/{id}/transcript", s.requireLocalHost(http.HandlerFunc(s.handleTranscript)))
 	mux.Handle("GET /api/channels/{name}/posts", s.requireLocalHost(http.HandlerFunc(s.handleChannelPosts)))
 	mux.Handle("GET /api/insights", s.requireLocalHost(http.HandlerFunc(s.handleInsights)))
+	mux.Handle("GET /api/scope", s.requireLocalHost(http.HandlerFunc(s.handleScope)))
 	mux.Handle("GET /api/repositories", s.requireLocalHost(http.HandlerFunc(s.handleRepositoriesGet)))
 	mux.Handle("POST /api/repositories", s.requireLocalHost(s.requireConsoleRequest(http.HandlerFunc(s.handleRepositoriesSet))))
 	mux.Handle("POST /api/repositories/connect", s.requireLocalHost(s.requireConsoleRequest(http.HandlerFunc(s.handleRepositoriesConnect))))

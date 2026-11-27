@@ -2103,6 +2103,8 @@ spec:
               value: owner
             - name: API_SERVER_MODEL_NAME
               value: model-default
+            - name: KUBE_AGENTS_BUILTIN_SCHEDULES
+              value: '{"suspendAll":false,"overrides":{}}'
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"
@@ -2383,6 +2385,8 @@ spec:
               value: multiuser_memory
             - name: API_SERVER_MODEL_NAME
               value: model-default
+            - name: KUBE_AGENTS_BUILTIN_SCHEDULES
+              value: '{"suspendAll":false,"overrides":{}}'
             - name: HERMES_GATEWAY_PROFILE
             - name: CHAT_METRICS_PORT
               value: "9097"

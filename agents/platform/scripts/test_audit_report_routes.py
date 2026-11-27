@@ -1551,5 +1551,101 @@ class WriterStampTest(RoutesTestCase):
         self.assertEqual(listener["_WRITER_LABEL"], cp._REPORT_WRITER_LABEL)
 
 
+
+class RunStartRouteTest(RoutesTestCase):
+    """The run-start record (#6812): `runs/started-<run>` rides the run routes, under a run write's rules alone."""
+
+    START = f"{STREAM}/runs/started-task-1"
+
+    def test_the_matching_schedule_writes_and_reads_its_record_unstamped(self):
+        self.assert_relayed("PUT", self.START, self.request("PUT", self.START, token=REPORT["token"]), BODY)
+        # No writer stamp: the record is no report.
+        self.assertEqual([], self.store.seen[-1]["writer"])
+        self.assert_relayed("GET", self.START, self.request("GET", self.START, token=REPORT["token"]))
+
+    def test_the_shell_writes_and_reads_a_record_unstamped(self):
+        self.authenticator.principal = self.shell
+        self.assert_relayed("PUT", self.START, self.request("PUT", self.START), BODY)
+        self.assertEqual([], self.store.seen[-1]["writer"])
+        self.assert_relayed("GET", self.START, self.request("GET", self.START))
+
+    def test_a_forged_writer_on_a_record_is_dropped(self):
+        self.authenticator.principal = self.shell
+        self.assert_relayed("PUT", self.START, self.request("PUT", self.START, headers={"X-Report-Writer": "shell"}), BODY)
+        self.assertEqual([], self.store.seen[-1]["writer"])
+
+    def test_another_streams_record_is_refused_by_the_stream_rule(self):
+        path = f"/v1/audit-reports/{OTHER_AUDIT}/{GITOPS_KEY}/runs/started-task-1"
+        self.assert_refused(self.request("PUT", path, token=REPORT["token"]), credential_proxy.RULE_REPORT_TRIGGER_STREAM)
+
+    def test_another_repository_key_is_refused_by_the_key_rule(self):
+        for key in ("acme%2Fterraform", "no_forge%2Flocal", "Acme%2Fgitops"):
+            with self.subTest(key=key):
+                path = f"/v1/audit-reports/{AUDIT}/{key}/runs/started-task-1"
+                self.assert_refused(self.request("PUT", path, token=REPORT["token"]), credential_proxy.RULE_REPORT_REPOSITORY_KEY)
+
+    def test_a_profile_task_writes_only_its_own_runs_record(self):
+        # The run id in the name must be the verified credential's task id: a
+        # task cannot overwrite, mark done or crowd out another run's record.
+        self.assertEqual("task-1", REPORT["claims"]["task"])
+        for other in ("task-2", "local-0a1b2c3d4e5f", "cron-0123456789abcdef", "task-10"):
+            with self.subTest(run=other):
+                path = f"{STREAM}/runs/started-{other}"
+                self.assert_refused(
+                    self.request("PUT", path, token=REPORT["token"]), credential_proxy.RULE_REPORT_RUN_START_TASK
+                )
+        # Reading another run's record stays a read, and the shell is unbound.
+        other = f"{STREAM}/runs/started-task-2"
+        self.assert_relayed("GET", other, self.request("GET", other, token=REPORT["token"]))
+        self.store.seen.clear()
+        self.authenticator.principal = self.shell
+        self.assert_relayed("PUT", other, self.request("PUT", other), BODY)
+
+    def test_a_task_with_no_trigger_writes_no_record(self):
+        self.set_gate("read")
+        self.assert_refused(self.request("PUT", self.START, token=VALID["token"]), credential_proxy.RULE_REPORT_NO_TRIGGER)
+
+    def test_the_a2a_report_reader_neither_reads_nor_writes_a_record(self):
+        self.authenticator.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:kubeagents-system:platformagent-gateway", uid="gw-uid",
+            role=credential_proxy.CALLER_ROLE_A2A_REPORTS,
+        )
+        for stream in (STREAM, f"/v1/audit-reports/{AUDIT}/publish"):
+            with self.subTest(stream=stream):
+                path = f"{stream}/runs/started-task-1"
+                self.assert_refused(self.request("GET", path), credential_proxy.RULE_REPORT_A2A_REPORTS_ROUTE)
+                self.assert_refused(self.request("PUT", path), credential_proxy.RULE_REPORT_A2A_REPORTS_WRITE)
+
+    def test_every_other_route_refuses_the_name(self):
+        self.authenticator.principal = self.shell
+        for method, path in (
+            ("DELETE", self.START),
+            ("GET", f"{self.START}/latest"),
+            ("PUT", f"{STREAM}/started-task-1"),
+            ("DELETE", f"{STREAM}/latest/started-task-1"),
+            ("GET", f"{STREAM}/runs/started-Task-1"),
+            ("PUT", f"{STREAM}/runs/started-"),
+            ("PUT", f"{STREAM}/runs/started-{'a' * 64}"),
+            ("PUT", f"{STREAM}/runs/started-task-1.json"),
+            ("GET", f"{STREAM}/runs/started-task%2D1"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assert_refused(self.request(method, path), status=404)
+
+    def test_the_route_kind_and_the_listeners_names(self):
+        cp = credential_proxy
+        self.assertEqual(cp.REPORT_ROUTE_RUN_START, cp.report_route_kind(self.START))
+        self.assertEqual(cp.REPORT_ROUTE_RUN, cp.report_route_kind(f"{STREAM}/runs/{RUN}"))
+        self.assertNotIn(cp.REPORT_ROUTE_RUN_START, cp.REPORT_A2A_READ_ROUTES)
+        tree = ast.parse(LISTENER_PATH.read_text(encoding="utf-8"))
+        listener = {
+            target.id: node.value.value
+            for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        self.assertEqual(listener["RUN_START_PREFIX"], cp.REPORT_RUN_START_PREFIX)
+        self.assertEqual(f"{listener['RUN_START_PREFIX']}{listener['_RUN_ID']}", cp._REPORT_RUN_START)
+
+
 if __name__ == "__main__":
     unittest.main()

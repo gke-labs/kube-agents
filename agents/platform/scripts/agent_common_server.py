@@ -26,6 +26,10 @@ SESSION_MANAGER = SessionManager()
 # Shared Configuration Defaults
 CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yaml")
 DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
+# The target agent is an in-cluster Service: a proxy from the environment must
+# not get the call, with its prompt and headers, and urllib does not leave out
+# a cluster host by itself.
+_AGENT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # This module must not spawn a subprocess at import. platform_mcp_server.py
 # imports it, so module scope runs twice per platform-profile kanban worker
@@ -212,7 +216,7 @@ def call_agent(
 
     try:
         # 5-minute timeout to accommodate complex reasoning loops
-        with urllib.request.urlopen(req, timeout=300) as response:
+        with _AGENT_OPENER.open(req, timeout=300) as response:
             resp_data = json.loads(response.read().decode("utf-8"))
             return resp_data["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:

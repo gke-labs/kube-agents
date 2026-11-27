@@ -1257,6 +1257,7 @@ if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -f "$TARGET_DIR/profiles/platform/profile.
         --name platform \
         --template "$PLATFORM_TEMPLATE" \
         --plugins /opt/defaults/plugins \
+        --cron-suspend "${KUBE_AGENTS_BUILTIN_SCHEDULES:-}" \
         --description "$PLATFORM_DESC" || echo "WARN: platform profile scaffold failed; continuing" >&2
 fi
 # Point the platform profile's home-relative `scripts/` at the shared scripts dir
@@ -1394,6 +1395,12 @@ fi
 #
 # This list shrinks to nothing once no live volume can still be carrying the
 # entries. Until then, removing a name from it silently strands that id.
+#
+# `--cron-suspend` is the one say an install has over this roster: the operator renders
+# PlatformAgent spec.schedules (suspendAll and the per-name overrides) into
+# KUBE_AGENTS_BUILTIN_SCHEDULES, and the merge holds those jobs off on every start
+# (suspend_cron_jobs in profile_scaffold.py). Step 2.5 passes it too, so a first scaffold's
+# roster is held off before anything ticks.
 
 # Whether the platform profile is the one the GATEWAY runs as, rather than one only
 # kanban workers and cron jobs ever home to. The operator sets HERMES_GATEWAY_PROFILE
@@ -1427,6 +1434,7 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         --plugins /opt/defaults/plugins \
         --items "$(platform_sync_items)" \
         --cron-retire "blueprint-sync policy-propagation global-capacity-orchestrator standardization-validator lifecycle-deprecation-manager github-issue-resolver" \
+        --cron-suspend "${KUBE_AGENTS_BUILTIN_SCHEDULES:-}" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
 

@@ -3390,7 +3390,8 @@ type taskStart struct {
 	// the waiting profile tasks above it, set only by a profile parent's
 	// child mint.
 	ProfileChain []string
-	// Scheduled goes onto a profile task's history entry (TaskRef.Scheduled).
+	// Scheduled goes onto the task's history entry (TaskRef.Scheduled): a
+	// profile task's below a scheduled run, or a wake's continuing one.
 	Scheduled bool
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
@@ -3448,6 +3449,9 @@ type taskStart struct {
 	// turn only when it arrived with IntentConfirm; a child or a wake
 	// copies its chain's entry, never anything the session wrote.
 	ChangeRequested bool
+	// WakeDelegate goes onto a wake's entry (TaskRef.WakeDelegate). Set
+	// only by startWake, from wakeMayDelegate.
+	WakeDelegate bool
 }
 
 // childKeepsLine reports whether a task keeps its rolling line on a backend
@@ -3559,10 +3563,21 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A turn for the conversation's own session pod carries the agents its
 	// requester may delegate to, which the pod's delegate tool names. Per
 	// turn, so a reused pod sees profiles as they come and go.
-	// A wake runs without the tool, so it carries none.
+	// A wake the gateway didn't let delegate again runs without the tool, so
+	// it carries none; one it did (WakeDelegate, #6861) carries the list a
+	// human turn by its requester would, checked against the same authors.
 	var extra []lib.Part
-	if ts.Route == nil && ts.Role != taskRoleWake && ownSession {
+	if ts.Route == nil && (ts.Role != taskRoleWake || ts.WakeDelegate) && ownSession {
 		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
+		// A wake carries its child's steer authors (startWake), which the
+		// delegation checks (delegateEntryCheck) but the record's session set
+		// doesn't hold yet, so the list is built for them too.
+		for _, a := range ts.SteerAuthors {
+			if !slices.Contains(authors, a) {
+				authors = append(authors, a)
+			}
+		}
+		unknown = unknown || ts.SteerAuthorsOverflow || len(authors) > sessionAuthorCap
 		if unknown && approximate {
 			// The record's people overflow the cap, but the pod's seeded set
 			// (the primer's turns) may not: no list, so the tool falls back
@@ -3698,6 +3713,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		Request:      ts.Request,
 		// What a child of this task inherits (handleDelegateRequest).
 		ChangeRequested: ts.ChangeRequested,
+		WakeDelegate:    ts.WakeDelegate,
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID
@@ -3724,8 +3740,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.Tier = string(ts.Route.Tier)
 		ref.Scope = string(ts.Route.Scope)
 		ref.ProfileChain = ts.ProfileChain
-		ref.Scheduled = ts.Scheduled
 	}
+	// The schedule mark goes on whatever carries it: a profile task below a
+	// scheduled run, and a wake continuing such a chain, which has no route
+	// (startWake), so a delegation from it is refused as one below a schedule.
+	ref.Scheduled = ts.Scheduled
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
 		for i := range rec.Tasks {

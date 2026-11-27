@@ -317,7 +317,10 @@ would drop every open watch. Envoy's admin interface stays
 on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
-8643 and forwards to the agent on loopback using a non-secret sentinel. It is a
+8643, answers `GET /api/scope` directly from `fleet_scope.json`, the Cluster
+Agent profile directories on `/opt/data`, and `k8s-event-watcher`'s loopback
+`/metrics` port, and forwards other paths to the agent on loopback using a
+non-secret sentinel. It is a
 native sidecar in the gateway Pod, so the kubelet starts it before every app
 container and stops it after them, and an unready sidecar makes the Pod unready.
 It also hosts the `k8s-event-watcher`, which is why splitting the broker out
@@ -1180,8 +1183,10 @@ relay.
 
 The Kubernetes Service sends API traffic to port 8643 on `agent-api-auth`, the
 native sidecar in the gateway Pod. It validates the configured external bearer
-key and replaces it with the fixed, non-secret sentinel before forwarding to port
-8642 on loopback.
+key, answers `GET /api/scope` directly from `fleet_scope.json`, the Cluster
+Agent profile directories on the data volume, and `k8s-event-watcher`'s loopback
+`/metrics` listener, and replaces the key with the fixed, non-secret sentinel
+before forwarding other requests to port 8642 on loopback.
 Existing API clients retain bearer-key authentication without placing the real
 key in the sandbox.
 

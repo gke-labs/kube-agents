@@ -194,7 +194,7 @@ The change is picked up on the next pod restart.
 
 ### How an edit reaches an existing pod
 
-This part is about the **Planning Agent's** file, [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — the one the start-up reconcile below acts on. The Platform Agent's roster, which the rest of this page documents, reaches its profile by a separate path: `profile_scaffold.py` scaffolds it, and `merge_cron_store` merges it under the same per-key rule.
+This part is about the **Planning Agent's** file, [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/cron/jobs.json) — the one the start-up reconcile below acts on. The Platform Agent's roster, which the rest of this page documents, reaches its profile by a separate path: `profile_scaffold.py` scaffolds it, and `merge_cron_store` merges it under the same per-key rule. An install's own [suspend setting](/kube-agents/concepts/autonomous-watchdogs/#on-your-install) then holds jobs off.
 
 `$HERMES_HOME/cron/jobs.json` lives on the agent's persistent volume, and the scheduler writes `last_run` back into it on every tick — so the volume's copy is always newer than the image's, and the entrypoint's update-only defaults copy never overwrites it. Overwriting the file is not an option either. It would reset every `last_run` (making all jobs look due at once) and discard the chat binding [first-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) writes. It would also reinstate the two onboarding jobs that finishing onboarding deliberately removes, and `oobe` on an install that finished onboarding before it shipped.
 

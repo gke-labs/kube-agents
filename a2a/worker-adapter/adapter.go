@@ -22,6 +22,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
 )
 
@@ -128,6 +129,10 @@ type Config struct {
 	// Driver is the harness's headless contract (driver.go). Nil means
 	// Claude Code, the harness every argv below is built for.
 	Driver Driver
+	// PersonaMCP are the persona's MCP servers, for a harness that takes
+	// them in-process (core-agent): each turn's are built from these (and,
+	// once #6789 lands, the delegate server when the turn may delegate).
+	PersonaMCP []persona.MCPServer
 	// HarnessCommand is the full argv of the harness. Tests point it at a
 	// stub; the pod default is the native binary with the stream-json flags.
 	HarnessCommand []string
@@ -918,8 +923,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		return done(Result{State: lib.StateFailed}, fmt.Errorf("publish working: %w", err))
 	}
 
-	// The delegate tool is decided per task: off on a wake, whatever the
-	// pod was started with (delegateOffForTask). A task with the tool off
+	// The delegate tool is decided per task: off on a wake the gateway
+	// didn't let delegate again (its via without delegate: true), whatever
+	// the pod was started with (delegateOffForTask). A task with the tool off
 	// gets neither the listener nor the harness flags, the same shape as a
 	// pod started with A2A_DELEGATE_TOOL=off.
 	delegate := cfg.DelegateSocket != "" && !delegateOffForTask(origin)
@@ -957,6 +963,13 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 				"socket", socket)
 		}
 	}
+
+	// A harness that takes its MCP servers in-process gets this turn's in its
+	// envelope, built from source here each turn so nothing an earlier turn
+	// added carries over. The delegate server joins later (#6789); nil now.
+	// The turn's driver stays local: a reused pod's next turn, or a wake,
+	// starts again from the pod's.
+	drv = turnDriver(drv, cfg.PersonaMCP, nil)
 
 	if delegate {
 		// The agents this turn's requester may delegate to, as the gateway

@@ -492,6 +492,127 @@ def write(path: Path, text: str) -> None:
 # skills — with every later start skipping the scaffold again.
 
 
+class CronSuspendTest(unittest.TestCase):
+    """The operator's suspend setting holds the image's jobs off, and nothing else.
+
+    PlatformAgent spec.schedules reaches the merge as one JSON document. These
+    pin every input class: suspend all, an override either way, a job the image
+    ships disabled, an operator's own job, no setting, a first scaffold, the
+    setting lifted, and a document that cannot be read.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.template = root / "template"
+        self.home = root / "home"
+        for path in (self.template, self.home):
+            path.mkdir()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def overlay(self, image_jobs, live_jobs, setting):
+        write(self.template / "cron" / "jobs.json", json.dumps({"jobs": image_jobs}))
+        if live_jobs is not None:
+            write(self.home / "cron" / "jobs.json", json.dumps({"jobs": live_jobs}))
+        suspend = ps.parse_cron_suspend(json.dumps(setting)) if setting is not None else None
+        ps.overlay_template(self.home, self.template, None, ("cron",), cron_suspend=suspend)
+        jobs = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        return {j["id"]: j for j in jobs}
+
+    def test_suspend_all_holds_every_shipped_job_off_and_keeps_its_run_state(self):
+        merged = self.overlay(
+            [job("audit"), job("watch")],
+            [job("audit", last_run="2026-08-03T06:20:00Z"), job("watch")],
+            {"suspendAll": True, "overrides": {}},
+        )
+        self.assertIs(False, merged["audit"]["enabled"])
+        self.assertIs(False, merged["watch"]["enabled"])
+        self.assertEqual("2026-08-03T06:20:00Z", merged["audit"]["last_run"])
+
+    def test_an_override_turns_one_job_back_on_under_suspend_all(self):
+        merged = self.overlay(
+            [job("audit"), job("watch")],
+            [job("audit"), job("watch")],
+            {"suspendAll": True, "overrides": {"audit": False}},
+        )
+        self.assertIs(True, merged["audit"]["enabled"])
+        self.assertIs(False, merged["watch"]["enabled"])
+
+    def test_an_override_suspends_one_job_alone(self):
+        merged = self.overlay(
+            [job("audit"), job("watch")],
+            [job("audit"), job("watch")],
+            {"suspendAll": False, "overrides": {"watch": True}},
+        )
+        self.assertIs(True, merged["audit"]["enabled"])
+        self.assertIs(False, merged["watch"]["enabled"])
+
+    def test_an_override_cannot_start_a_job_the_image_ships_disabled(self):
+        merged = self.overlay(
+            [job("retired", enabled=False)],
+            [job("retired", enabled=False)],
+            {"suspendAll": False, "overrides": {"retired": False}},
+        )
+        self.assertIs(False, merged["retired"]["enabled"])
+
+    def test_an_operators_own_job_is_left_alone(self):
+        merged = self.overlay(
+            [job("audit")],
+            [job("audit"), job("mine")],
+            {"suspendAll": True, "overrides": {"mine": True}},
+        )
+        self.assertIs(True, merged["mine"]["enabled"])
+
+    def test_no_setting_changes_nothing(self):
+        merged = self.overlay([job("audit")], [job("audit")], None)
+        self.assertIs(True, merged["audit"]["enabled"])
+        self.assertIsNone(ps.parse_cron_suspend(""))
+
+    def test_a_first_scaffold_is_held_off_too(self):
+        # No roster on the volume yet, so the merge has nothing to run on and
+        # the image's copy lands as shipped.
+        merged = self.overlay([job("audit")], None, {"suspendAll": True, "overrides": {}})
+        self.assertIs(False, merged["audit"]["enabled"])
+
+    def test_lifting_the_setting_returns_a_job_to_the_images_value(self):
+        self.overlay([job("audit")], [job("audit")], {"suspendAll": True, "overrides": {}})
+        live = json.loads((self.home / "cron" / "jobs.json").read_text())["jobs"]
+        merged = self.overlay([job("audit")], live, {"suspendAll": False, "overrides": {}})
+        self.assertIs(True, merged["audit"]["enabled"])
+
+    def test_the_merge_writes_the_suspension_itself(self):
+        # One write, so no file ever holds the merged roster with the suspended
+        # jobs enabled: with the first-scaffold pass taken away, the merge alone
+        # still holds them off.
+        with unittest.mock.patch.object(ps, "_suspend_after_overlay"):
+            merged = self.overlay([job("audit")], [job("audit")], {"suspendAll": True, "overrides": {}})
+        self.assertIs(False, merged["audit"]["enabled"])
+
+    def test_a_first_scaffold_that_cannot_write_the_suspension_warns(self):
+        stderr = io.StringIO()
+        with unittest.mock.patch.object(ps.os, "replace", side_effect=OSError("disk full")), redirect_stderr(stderr):
+            merged = self.overlay([job("audit")], None, {"suspendAll": True, "overrides": {}})
+        self.assertIs(True, merged["audit"]["enabled"])
+        self.assertIn("could not suspend jobs in cron/jobs.json", stderr.getvalue())
+
+    def test_an_unreadable_setting_stops_before_the_roster_is_touched(self):
+        # A misspelled key is unreadable too: read as absent, it would mean
+        # "nothing suspended" and start every job an operator turned off.
+        for text in (
+            "{not json",
+            "[]",
+            '{"suspendAll": "yes"}',
+            '{"overrides": {"audit": "no"}}',
+            '{"overrides": []}',
+            '{"suspend_all": true}',
+            '{"suspendAll": true, "override": {"audit": false}}',
+        ):
+            with self.subTest(text=text), self.assertRaises(SystemExit):
+                ps.parse_cron_suspend(text)
+
+
 class EnsureProfileTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
