@@ -1835,6 +1835,200 @@ class TerminalPodsTest(unittest.TestCase):
         self.assertTrue(any(h["object"] == "CronJob/chatty" for h in hits))
 
 
+class FinishedJobFamilyTest(unittest.TestCase):
+    """3.9 files the finished Jobs that a spawner names `<stem>-<uuid>` as one finding on
+    `Job/<stem>`, by the family rule of the generated-name Deployments."""
+
+    NS = "lab"
+    U1 = "8daede4e-4620-426c-9e07-58f5f0505f39"
+    U2 = "1657c63c-8745-4ba0-a6a9-1d4365c43041"
+    U3 = "55fe5b6f-82b7-4fef-bfe3-877e9e5200b2"
+
+    def job(self, name, done="2026-07-01T00:00:00Z", ns=None, **overrides):
+        return obj("Job", name, ns=ns or self.NS, **{"status.succeeded": 1, "status.completionTime": done, **overrides})
+
+    def hits(self, jobs, **context):
+        return fw.check_terminal_pods({"pods": [], "jobs": jobs, "cronjobs": [], **context}, now=NOW)
+
+    def objects(self, jobs, **context):
+        return sorted(hit["object"] for hit in self.hits(jobs, **context))
+
+    def test_a_family_of_finished_jobs_is_one_finding_on_its_stem(self):
+        jobs = [self.job(f"reindex-{self.U1}", done="2026-06-01T00:00:00Z"), self.job(f"reindex-{self.U2}"), self.job(f"reindex-{self.U3}")]
+        [hit] = self.hits(jobs)
+        self.assertEqual((hit["namespace"], hit["object"], hit["severity"]), (self.NS, "Job/reindex", "minor"))
+        self.assertTrue(hit["excerpt"].startswith("3 finished Jobs `reindex-<uuid>`, no ttlSecondsAfterFinished, the oldest finished 2026-06-01T00:00:00Z (61d ago)."))
+        self.assertIn("`Job/reindex` is not an object in the cluster: it stands for 3 generated-name Jobs `reindex-<uuid>`.", hit["excerpt"])
+        self.assertIn("A member's name is in no file, so set `ttlSecondsAfterFinished` in the template that creates the Jobs, not on a member.", hit["excerpt"])
+        # The template's TTL does not remove the Jobs that the finding counts.
+        self.assertIn("The template reaches only later Jobs: each Job that this finding counts stays until a person deletes it.", hit["excerpt"])
+        # No member's name is in the finding.
+        for uuid in (self.U1, self.U2, self.U3):
+            self.assertNotIn(uuid, hit["object"] + hit["excerpt"])
+
+    def test_one_finished_job_with_a_generated_name_is_a_family(self):
+        [hit] = self.hits([self.job(f"reindex-{self.U1}")])
+        self.assertEqual(hit["object"], "Job/reindex")
+        self.assertIn("1 finished Job `reindex-<uuid>`,", hit["excerpt"])
+        self.assertIn("stands for 1 generated-name Job `reindex-<uuid>`.", hit["excerpt"])
+
+    def test_a_job_with_a_plain_name_keeps_its_name(self):
+        hits = self.hits([self.job("batch"), self.job(f"reindex-{self.U1}")])
+        self.assertEqual(sorted(hit["object"] for hit in hits), ["Job/batch", "Job/reindex"])
+        plain = next(hit for hit in hits if hit["object"] == "Job/batch")
+        self.assertEqual(plain["excerpt"], "finished 2026-07-01T00:00:00Z (31d ago), no ttlSecondsAfterFinished")
+        self.assertNotIn("_family", plain)
+
+    def test_a_member_that_the_check_does_not_file_is_not_counted(self):
+        jobs = [
+            self.job(f"reindex-{self.U1}"),
+            self.job(f"reindex-{self.U2}", **{"spec.ttlSecondsAfterFinished": 3600}),
+            self.job(f"reindex-{self.U3}", done="2026-07-30T00:00:00Z"),
+            self.job("reindex-0f8fad5b-d9cb-469f-a165-70867728950e", **{"metadata.ownerReferences": [{"kind": "CronJob", "name": "reindex"}]}),
+            obj("Job", "reindex-7c9e6679-7425-40de-944b-e07fc1f90ae7", ns=self.NS),
+        ]
+        [hit] = self.hits(jobs)
+        self.assertEqual(hit["object"], "Job/reindex")
+        self.assertIn("1 finished Job `reindex-<uuid>`,", hit["excerpt"])
+        # A family with no member to file gives no finding.
+        self.assertEqual(self.hits(jobs[1:]), [])
+
+    def test_a_failed_member_is_dated_by_its_condition(self):
+        failed = obj(
+            "Job", f"reindex-{self.U1}", ns=self.NS,
+            **{"status.failed": 1, "status.conditions": [{"type": "Failed", "status": "True", "lastTransitionTime": "2026-05-01T00:00:00Z"}]},
+        )
+        [hit] = self.hits([failed, self.job(f"reindex-{self.U2}")])
+        self.assertIn("2 finished Jobs `reindex-<uuid>`, no ttlSecondsAfterFinished, the oldest finished 2026-05-01T00:00:00Z (92d ago).", hit["excerpt"])
+
+    def test_a_job_with_the_stems_name_keeps_the_members_single(self):
+        """Two findings may not share one identity. The Job `reindex` need not be one that the check files."""
+        members = [self.job(f"reindex-{self.U1}"), self.job(f"reindex-{self.U2}")]
+        single = sorted([f"Job/reindex-{self.U1}", f"Job/reindex-{self.U2}"])
+        self.assertEqual(self.objects([self.job("reindex"), *members]), ["Job/reindex", *single])
+        running = obj("Job", "reindex", ns=self.NS)
+        self.assertEqual(self.objects([running, *members]), single)
+
+    def test_a_stem_with_a_name_that_lasts_makes_no_family(self):
+        members = [self.job(f"reindex-{self.U1}"), self.job(f"reindex-{self.U2}")]
+        single = sorted([f"Job/reindex-{self.U1}", f"Job/reindex-{self.U2}"])
+        # A member that the repository declares has a name that lasts, and the other member stays single too.
+        self.assertEqual(self.objects(members, declared_jobs={(self.NS, f"reindex-{self.U1}")}), single)
+        # The declaration of another namespace's Job says nothing here.
+        self.assertEqual(self.objects(members, declared_jobs={("other", f"reindex-{self.U1}")}), ["Job/reindex"])
+        # A chart release or an Argo CD Application that holds a member does the same.
+        for annotation in ("meta.helm.sh/release-name", "argocd.argoproj.io/tracking-id"):
+            held = self.job(f"reindex-{self.U1}", **{"metadata.annotations": {annotation: "reindex:batch/Job:lab/x"}})
+            self.assertEqual(self.objects([held, members[1]]), single, annotation)
+
+    def test_each_stem_and_each_namespace_has_its_own_family(self):
+        jobs = [
+            self.job(f"reindex-{self.U1}"),
+            self.job(f"reindex-{self.U2}"),
+            self.job(f"export-{self.U3}"),
+            self.job(f"reindex-{self.U3}", ns="other"),
+        ]
+        hits = self.hits(jobs)
+        self.assertEqual(sorted((hit["namespace"], hit["object"]) for hit in hits), [("lab", "Job/export"), ("lab", "Job/reindex"), ("other", "Job/reindex")])
+        counts = {(hit["namespace"], hit["object"]): hit["excerpt"].split(" ", 1)[0] for hit in hits}
+        self.assertEqual(counts, {("lab", "Job/export"): "1", ("lab", "Job/reindex"): "2", ("other", "Job/reindex"): "1"})
+
+    def test_the_excerpt_names_what_each_member_carries(self):
+        owner = [{"kind": "Workflow", "name": "nightly", "controller": True}]
+        labels = {"app.kubernetes.io/part-of": "reindex"}
+        jobs = [
+            self.job(f"reindex-{uuid}", **{"metadata.labels": dict(labels), "metadata.ownerReferences": owner})
+            for uuid in (self.U1, self.U2)
+        ]
+        [hit] = self.hits(jobs)
+        self.assertIn(" Each member is owned by `Workflow/nightly` and carries `app.kubernetes.io/part-of: reindex`.", hit["excerpt"])
+        # What the members do not share is not named.
+        jobs[1]["metadata"]["labels"] = {"app.kubernetes.io/part-of": "other"}
+        jobs[1]["metadata"]["ownerReferences"] = [{"kind": "Workflow", "name": "weekly", "controller": True}]
+        [hit] = self.hits(jobs)
+        self.assertNotIn("Each member", hit["excerpt"])
+
+    def test_the_excerpt_says_when_no_declaration_was_read(self):
+        jobs = [self.job(f"reindex-{self.U1}")]
+        self.assertNotIn(fw.FAMILY_NO_INDEX_SENTENCE, self.hits(jobs)[0]["excerpt"])
+        self.assertNotIn(fw.FAMILY_NO_INDEX_SENTENCE, self.hits(jobs, declarations_read=True)[0]["excerpt"])
+        self.assertTrue(self.hits(jobs, declarations_read=False)[0]["excerpt"].endswith(fw.FAMILY_NO_INDEX_SENTENCE))
+
+    def test_a_family_finding_takes_no_declaration_by_its_name(self):
+        """A file that declares `Job/reindex` declares another object."""
+        declarations = {("c1", "Job", self.NS, "reindex"): {"clusters/c1/lab/reindex.yaml"}}
+        joins = {"cluster": "c1", "declarations": declarations, "reconcilers": {}, "releases": {}}
+        [family] = self.hits([self.job(f"reindex-{self.U1}")])
+        candidate = fw._emit("terminal-pods", family, **joins)
+        self.assertEqual(candidate["object"], "Job/reindex")
+        self.assertNotIn("declaration", candidate)
+        self.assertNotIn("_family", candidate)
+        # Control: a real Job of that name takes the declaration.
+        [real] = self.hits([self.job("reindex")])
+        self.assertEqual(fw._emit("terminal-pods", real, **joins)["declaration"]["path"], "clusters/c1/lab/reindex.yaml")
+
+    def test_the_fixture_family_is_one_job_finding_and_the_namespace_finding(self):
+        """The shape of the seeded fleet's role `generated-name-job-family`: three finished Jobs
+        with one Completed pod each. The pod arm does not change, so the pods still count for
+        the namespace's finding: the pair is `Job/reindex` and `Namespace/seeded-family`."""
+        ns, labels = "seeded-family", {"app.kubernetes.io/part-of": "reindex"}
+        uuids = (self.U1, self.U2, self.U3)
+        pods = [
+            obj("Pod", f"reindex-{uuid}-abcde", ns=ns, **{"status.phase": "Succeeded", "metadata.creationTimestamp": "2026-07-01T00:00:00Z"})
+            for uuid in uuids
+        ]
+        jobs = [self.job(f"reindex-{uuid}", ns=ns, **{"metadata.labels": dict(labels)}) for uuid in uuids]
+        hits = fw.check_terminal_pods({"pods": pods, "jobs": jobs, "cronjobs": []}, now=NOW)
+        self.assertEqual(sorted((hit["namespace"], hit["object"], hit["severity"]) for hit in hits), [(ns, "Job/reindex", "minor"), (ns, "Namespace/seeded-family", "minor")])
+        family = next(hit for hit in hits if hit["object"] == "Job/reindex")
+        self.assertIn("3 finished Jobs `reindex-<uuid>`,", family["excerpt"])
+        self.assertIn(" Each member carries `app.kubernetes.io/part-of: reindex`.", family["excerpt"])
+        namespace = next(hit for hit in hits if hit["object"] == "Namespace/seeded-family")
+        self.assertIn("3 terminal pods", namespace["excerpt"])
+
+    def test_an_owner_with_a_generated_name_is_not_named(self):
+        """An owner that a spawner names `<stem>-<uuid>` does not last either, so it is no pointer to the template."""
+        owner = [{"kind": "Workflow", "name": "nightly-0f8fad5b-d9cb-469f-a165-70867728950e", "controller": True}]
+        jobs = [self.job(f"reindex-{uuid}", **{"metadata.ownerReferences": owner}) for uuid in (self.U1, self.U2)]
+        [hit] = self.hits(jobs)
+        self.assertEqual(hit["object"], "Job/reindex")
+        self.assertNotIn("is owned by", hit["excerpt"])
+        self.assertNotIn("0f8fad5b", hit["excerpt"])
+
+    def collected(self, jobs, declarations=None):
+        """The 3.9 candidates of one cluster, through `collect_cluster` with the repository's declarations."""
+        cluster = {"name": "prod-usc1", "project": "acme", "location": "us-central1", "autopilot": False}
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(obj("Node", "node-1"), *jobs)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fw, "KUBECONFIG_DIR", Path(tmp)):
+                entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW, declarations=declarations)
+        self.assertEqual(entry["outcome"], "collected")
+        return {c["object"]: c for c in entry["candidates"] if c["check"] == "terminal-pods"}
+
+    def test_a_member_that_the_repository_declares_reaches_the_check_through_collect_cluster(self):
+        jobs = [self.job(f"reindex-{uuid}") for uuid in (self.U1, self.U2, self.U3)]
+        path = "clusters/prod-usc1/lab/reindex.yaml"
+        # A declaration of another kind, of another cluster or of another namespace is not this Job's.
+        for key in (("prod-usc1", "Deployment", self.NS, f"reindex-{self.U1}"), ("other", "Job", self.NS, f"reindex-{self.U1}"), ("prod-usc1", "Job", "other", f"reindex-{self.U1}")):
+            with self.subTest(key=key):
+                self.assertEqual(sorted(self.collected(jobs, {key: {path}})), ["Job/reindex"])
+        # The declared member has a name that lasts: it keeps its finding and its file, and the
+        # other Jobs of the stem stay single too.
+        found = self.collected(jobs, {("prod-usc1", "Job", self.NS, f"reindex-{self.U1}"): {path}})
+        self.assertEqual(sorted(found), sorted(f"Job/reindex-{uuid}" for uuid in (self.U1, self.U2, self.U3)))
+        self.assertEqual(found[f"Job/reindex-{self.U1}"]["declaration"]["path"], path)
+        self.assertNotIn("declaration", found[f"Job/reindex-{self.U2}"])
+
+
 class IdleNamespaceTest(unittest.TestCase):
     def ns(self, name, created="2026-01-01T00:00:00Z"):
         return obj("Namespace", name, **{"metadata.creationTimestamp": created})

@@ -542,18 +542,19 @@ resource "kubernetes_pod_disruption_budget_v1" "calibration" {
 # Posture (waste, generated names, finished Jobs): three Jobs that a spawner
 # would make, each named `reindex-<uuid>`, with one common parent label, no
 # owner and no ttl_seconds_after_finished. Each one ran to completion and
-# stays. The cost SOP's 3.9 `terminal-pods` files a finished Job that has no
-# TTL once it finished 7 days ago: one finding for each member, under a name
-# that no file in a GitOps repository declares. They live in the Deployment
-# family's namespace, so the fleet gets no new namespace and no new policy.
+# stays. The cost SOP's 3.9 `terminal-pods` files finished Jobs that have no
+# TTL once they finished 7 days ago: one finding on `Job/reindex` for the
+# family, because no file in a GitOps repository declares a member's name.
+# They live in the Deployment family's namespace, so the fleet gets no new
+# namespace and no new policy.
 #
 # The names are literals for the reason the calibration names are. A changed
 # literal plans as a replace, which the reconciler refuses without a row in
 # reconcile-allow.json, and a new Job starts the 7-day clock again: the role
 # is not ready until then (fixtures.json, `ready_after_hours` on
 # status.completionTime). Plant no object with the exact name `reindex` in
-# this namespace: an audit that rolls such a family up to its parent would
-# take that name for the parent, as the waste audit does for the Deployments
+# this namespace: the waste audit rolls such a family up to its parent, and it
+# would take that name for the parent, as it does for the Deployments
 # above. No TTL also keeps each later apply a no-op, as for
 # legacy_endpoints_writer_first_run below.
 #

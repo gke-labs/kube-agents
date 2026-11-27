@@ -2,11 +2,10 @@
 # finding (#2900, #3005, #6955, #7098): `seeded-family` on `seeded-a` carries
 # three finished Jobs (`reindex-<uuid>`, role `generated-name-job-family`)
 # sharing `app.kubernetes.io/part-of=reindex` with no `ttlSecondsAfterFinished`.
-# Until #6955 lands, `fleet_waste.py` groups only Deployments in
-# `_generated_families` and check 3.9 emits each finished Job individually
+# `fleet_waste.py` groups finished generated-name Jobs as it groups
+# Deployments (#6955), so check 3.9 files one family finding
+# (`seeded-family.job-reindex`) and none for a member
 # (`job-reindex-8daede4e`, `job-reindex-1657c63c`, `job-reindex-55fe5b6f`).
-# Marked `expected_fail: true` until #6955 collapses them into one family
-# finding (`seeded-family.job-reindex`) and flips the marker.
 #
 # Planted defect required: `generated-name-job-family` role in
 # `bench/tf/fleet/fixtures.json` (`seeded-family` on `seeded-a`).
@@ -17,7 +16,6 @@ id: cost-finished-job-family-grouped
 name: Waste audit files completed generated-name Jobs as one family finding on the cost ledger
 
 domain: cost
-expected_fail: true
 
 prompt: >-
   Run the fleet waste audit, following the fleet-wide-cost-analysis SOP.
