@@ -6,6 +6,7 @@ import dataclasses
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chat_cases  # noqa: E402
 import fleet_scope_args  # noqa: E402
 import fleet_scope_targets  # noqa: E402
 import upgrade_readiness_watch as watch  # noqa: E402
@@ -42,6 +44,14 @@ def envelope(members: list[dict], tables: str = "| table |", errors: list | None
 def loader_argv(stdin: str) -> list[str]:
     line = next(line for line in stdin.splitlines() if line.startswith(ARGV_LINE_PREFIX))
     return json.loads(line[len(ARGV_LINE_PREFIX):])
+
+
+def run_main_split(sandbox: FakeSandbox, argv: list[str] | None = None) -> tuple[int, str, str]:
+    """``main``'s exit code, what it posts to chat (stdout) and its log lines (stderr), apart."""
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox.run), redirect_stdout(out), redirect_stderr(err):
+        code = watch.main(argv or [])
+    return code, out.getvalue(), err.getvalue()
 
 
 def scope_targets(
@@ -421,9 +431,10 @@ class Retired(Base):
     def test_a_version_no_cluster_is_pending_leaves_the_ledger_with_one_line(self) -> None:
         self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
         sandbox = FakeSandbox(envelope([member("b", "current", target=OLDER_TARGET)]))
-        code, out = self.run_tick(sandbox)
+        code, chat, log = run_main_split(sandbox)
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), f"upgrade readiness: {OLDER_TARGET} is no longer pending on any cluster; retired from the watch")
+        self.assertEqual(chat, f"**No cluster is due for GKE {OLDER_TARGET} any more.** The upgrade readiness check stops tracking it.\n")
+        self.assertEqual(log, f"upgrade readiness: {OLDER_TARGET} is no longer pending on any cluster; retired from the watch\n")
         self.assertEqual(self.ledger()["targets"], {})
 
 
@@ -431,10 +442,15 @@ class Retired(Base):
         self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
         partial = envelope([member("a", "current")], errors=[{"project": "p1", "message": "clusters list failed"}], exit_code=1)
         sandbox = FakeSandbox(partial)
-        code, out = self.run_tick(sandbox)
+        code, chat, log = run_main_split(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual(
-            out.strip(),
+            chat,
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p1. The clusters there keep any earlier results "
+            "until it reads them again. It will try again at its next scheduled run. The details are in the agent's log.\n",
+        )
+        self.assertEqual(
+            log.strip(),
             "upgrade readiness watch: the version table was partial (1 read error(s), exit 1): p1: clusters list failed; a version is retired only once "
             "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it",
         )
@@ -1044,10 +1060,11 @@ class Budget(Base):
         # Describe is back: the number resolves to the id already tabled, so the id spelling is skipped and the table is whole.
         with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=1)):
             sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"})
-            code, out = self.run_tick(sandbox)
+            code, chat, log = run_main_split(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual([c[1][1] for c in sandbox.calls if c[0] == "versions"], ["123456"], "one project, one table run")
-        self.assertEqual(out, "upgrade readiness watch: the version table reads every project again\n")
+        self.assertEqual(chat, "**The upgrade readiness check can read the whole fleet again.**\n")
+        self.assertEqual(log, "upgrade readiness watch: the version table reads every project again\n")
         self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj", "my-proj": "my-proj"})
 
     def test_a_number_the_credential_can_never_resolve_fails_the_tick_once_with_the_remedy_then_recovers(self) -> None:
@@ -1080,7 +1097,7 @@ class Budget(Base):
         with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=3)):
             code, out = self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[0], watch.RECOVERED_LINE)
+        self.assertIn(watch.RECOVERED_LINE, out.splitlines(), "the recovery is announced, after the report")
         self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
         self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj"})
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
@@ -1406,7 +1423,7 @@ class Failures(Base):
         self.assertTrue(self.marker().exists())
         code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[0], watch.RECOVERED_LINE)
+        self.assertIn(watch.RECOVERED_LINE, out.splitlines(), "the recovery is announced, after the report")
         self.assertIn("new target version", out)
         self.assertFalse(self.marker().exists())
         code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")])))
@@ -1720,9 +1737,10 @@ class DeclaredScope(Base):
         """A project the scope does not list but whose clusters the ledger
         pended before (declared later, or dropped from the declaration) keeps
         them pending; its readiness run is refused every due day, and the
-        ungraded line says why in the install's terms, once, and then, as for
-        an unreachable cluster, at the weekly refresh: the condition needs the
-        operator, and the weekly line carries the remedy."""
+        ungraded line's log line says why in the install's terms, once, and
+        then, as for an unreachable cluster, at the weekly refresh: the
+        condition needs the operator, and the weekly log line carries the
+        remedy."""
         self.declare_scope(["p1"])
         self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
         versions = envelope([member("a", "current")])
@@ -1918,7 +1936,7 @@ class DeclaredScope(Base):
             self.declare_scope(["p1", "p2"], containers=[resolved])
             code, out = self.run_tick(FakeSandbox(envelope([])))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines(), [watch.RECOVERED_LINE])
+        self.assertEqual(out.splitlines(), [watch.RECOVERED_LINE, watch.RECOVERED_LOG_LINE.format(prefix=watch.LINE_PREFIX)])
         self.assertEqual(self.ledger()["standing_outside"], {})
         self.assertFalse(self.marker().exists())
 
@@ -1954,7 +1972,7 @@ class DeclaredScope(Base):
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
             self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")])
             code, out = self.run_tick(FakeSandbox(versions))
-            self.assertEqual(out.splitlines()[0], watch.RECOVERED_LINE)
+            self.assertIn(watch.RECOVERED_LINE, out.splitlines(), "the recovery is announced, after the partial table's line")
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertNotIn("the declaration is not fully resolved", out)
 
@@ -3186,6 +3204,306 @@ class SaveFailure(unittest.TestCase):
         self.assertIn("didn't finish today", first)
         self.assertEqual(second, "")
 
+
+def blocked_member(cluster: str, **readiness) -> dict:
+    """A blocked member of p1 below TARGET, with what blocks it as the report writes it."""
+    entry = member(cluster, "lagging")
+    entry["readiness"] = {"status": "blocked", **readiness}
+    return entry
+
+
+# What chat must not carry (.agents/rules/chat_ux.md, "No plumbing in user text"): a file path
+# (a namespace/name is content), an ISO date, an exit code, and the internal terms the lines
+# used to carry.
+CHAT_PLUMBING = re.compile(
+    r"(?<![\w.-])/|\d{4}-\d{2}-\d{2}|\bexit \d|cluster\(s\)|upgrade readiness:|upgrade readiness watch|pending|scheduled refresh|\btick\b|version table|kubectl"
+)
+
+
+class ChatWording(Base):
+    """What chat reads: a bold headline in plain words, why, and what happens next; the
+    technical line goes to the agent's log."""
+
+    def assert_plain(self, chat: str) -> None:
+        for item in chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR):
+            self.assertTrue(item.startswith("**"), item)
+            self.assertEqual(chat_cases.lint({"schema": chat_cases.SCHEMA, "headline": item.splitlines()[0]}), [], item)
+            self.assertIsNone(CHAT_PLUMBING.search(item.replace(TARGET, "").replace(OLDER_TARGET, "")), item)
+        self.assertLessEqual(len(chat.rstrip("\n").encode("utf-8")), watch.CHAT_POST_MAX_BYTES, "one post, not a thread of pieces")
+
+    def test_a_report_leads_with_the_blocked_clusters_and_why_each_is_blocked(self) -> None:
+        budget = {"pdb": "shop/checkout", "namespace": "shop", "name": "checkout", "field": "maxUnavailable: 0", "workloads": []}
+        pool = {"name": "gpu-pool", "version": "1.32.9-gke.100", "minors_behind_target": 3, "verdict": "blocks"}
+        # A maintenance exclusion's name is free text a GKE admin writes: put on one line and cut.
+        freeze = "year-end\nfreeze " + "x" * watch.CHAT_NAME_MAX_CHARS
+        members = [
+            blocked_member("east", pdbs={"blocking": [budget]}, skew={"pools": [pool]}),
+            blocked_member("west", webhooks={"blocking": [{"config": "policy-gate", "name": "validate.policy.example.com"}], "outage": []}),
+            blocked_member("batch", rule_blocking=[{"rule": "removed-api-callers", "entry": 6, "text": "a writer of a removed API"}]),
+            blocked_member("freeze", maintenance={"exclusions": [{"name": freeze, "end_time": "2026-12-02T00:00:00Z", "blocks": True}]}),
+            blocked_member("gpu", skew={"pools": [pool, {"name": "default-pool", "version": "1.34.1-gke.1", "verdict": "ok"}]}),
+            member("r1", "lagging", readiness="ready"),
+            member("r2", "lagging", readiness="ready"),
+            member("u1", "lagging", readiness="unknown"),
+        ]
+        sandbox = FakeSandbox(envelope([member(m["cluster"], "lagging") for m in members]), envelope(members))
+        code, chat, log = run_main_split(sandbox)
+        self.assertEqual(code, 0)
+        shown_freeze = "`" + ("year-end freeze " + "x" * watch.CHAT_NAME_MAX_CHARS)[: watch.CHAT_NAME_MAX_CHARS - 1] + watch.ELLIPSIS + "`"
+        self.assertEqual(
+            chat,
+            f"**5 clusters aren't ready for GKE {TARGET} yet.**\n"
+            "- batch: A served API version is removed.\n"
+            "- east: PodDisruptionBudget `shop/checkout` allows no evictions. Fix: let it evict at least one pod. Plus 1 more problem.\n"
+            f"- freeze: maintenance exclusion {shown_freeze} holds upgrades until December 2. Fix: end it early if the freeze is over.\n"
+            "- gpu: node pool `gpu-pool` (1.32.9-gke.100) is too far behind. Fix: upgrade the node pool first.\n"
+            "- west: admission webhook `policy-gate` fails closed and its backend is unreachable. Fix: restore the backend, or set its failurePolicy to Ignore "
+            "if it is not a security control.\n"
+            "2 more are ready. 1 cluster couldn't be fully checked. The next report is due on October 15.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn(f"new target version {TARGET}, 8 cluster(s) pending (batch, east, freeze, gpu, r1, r2, +2 more): 5 blocked", log)
+        self.assertIn("report on the gateway pod at", log)
+        on_disk = (Path(self.tmp.name) / "logs" / watch.WATCH_LOG_FILE).read_text(encoding="utf-8")
+        self.assertIn("report on the gateway pod at", on_disk, "the technical line is on record in the agent's log")
+
+    def test_more_blocked_clusters_than_the_message_shows_are_counted(self) -> None:
+        members = [member(f"c{i}", "lagging", readiness="blocked") for i in range(watch.MAX_BLOCKED_CLUSTERS_SHOWN + 2)] + [member("r1", "lagging", readiness="ready")]
+        code, chat, _ = run_main_split(FakeSandbox(envelope([member(m["cluster"], "lagging") for m in members]), envelope(members)))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            f"**7 clusters aren't ready for GKE {TARGET} yet.**\n- c0\n- c1\n- c2\n- c3\n- c4\n- and 2 more\n1 more is ready. The next report is due on October 15.\n",
+        )
+        self.assert_plain(chat)
+
+    def test_a_report_with_nothing_blocked_leads_with_what_is_ready_or_unchecked(self) -> None:
+        cases = (
+            ([member("a", "lagging", readiness="ready"), member("b", "lagging", readiness="ready")], f"**2 clusters are ready for GKE {TARGET}.**\nThe next report is due on October 15.\n"),
+            ([member("a", "lagging", readiness="ready"), member("b", "lagging")], f"**1 cluster is ready for GKE {TARGET}, and 1 couldn't be fully checked.**\nThe next report is due on October 15.\n"),
+            ([member("a", "lagging", readiness="unknown")], f"**1 cluster couldn't be fully checked for GKE {TARGET}.**\nThe next report is due on October 15.\n"),
+        )
+        for graded, expected in cases:
+            with self.subTest(expected=expected):
+                (self.home / watch.LEDGER_FILE_NAME).unlink(missing_ok=True)
+                versions = envelope([member(m["cluster"], "lagging") for m in graded])
+                code, chat, _ = run_main_split(FakeSandbox(versions, envelope([m for m in graded if "readiness" in m])))
+                self.assertEqual((code, chat), (0, expected))
+                self.assert_plain(chat)
+
+    def test_a_name_two_projects_share_is_told_apart_by_its_project(self) -> None:
+        members = [member("a", "lagging", readiness="blocked"), member("a", "lagging", readiness="blocked", project="p2")]
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, _ = run_main_split(FakeSandbox(envelope([member("a", "lagging"), member("a", "lagging", project="p2")]), envelope(members)))
+        self.assertEqual(code, 0)
+        self.assertEqual(chat, f"**2 clusters aren't ready for GKE {TARGET} yet.**\n- a in p1\n- a in p2\nThe next report is due on October 15.\n")
+
+    def test_a_name_two_locations_of_one_project_share_is_told_apart_by_its_location(self) -> None:
+        members = [
+            member("a", "lagging", readiness="blocked"),
+            dict(member("a", "lagging", readiness="blocked"), location="us-east1-b"),
+            member("a", "lagging", readiness="blocked", project="p2"),
+        ]
+        versions = envelope([member("a", "lagging"), dict(member("a", "lagging"), location="us-east1-b"), member("a", "lagging", project="p2")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, _ = run_main_split(FakeSandbox(versions, envelope(members)))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            f"**3 clusters aren't ready for GKE {TARGET} yet.**\n- a in p1 in us-central1-a\n- a in p1 in us-east1-b\n- a in p2\nThe next report is due on October 15.\n",
+        )
+        self.assert_plain(chat)
+
+    def test_a_long_post_shows_fewer_blocked_clusters_and_stays_one_post(self) -> None:
+        third = "1.33.5-gke.1000000"
+        hook = {"blocking": [{"config": "linkerd-policy-validator-webhook-configuration-" + "x" * 20}], "outage": []}
+        members = [
+            dict(blocked_member(f"regular-us-central1-shop-cluster-{target[:4]}-{i}", webhooks=hook), target_version=target)
+            for target in (TARGET, OLDER_TARGET, third)
+            for i in range(watch.MAX_BLOCKED_CLUSTERS_SHOWN)
+        ]
+        versions = envelope([dict(member(m["cluster"], "lagging"), target_version=m["target_version"]) for m in members])
+        code, chat, _ = run_main_split(FakeSandbox(versions, envelope(members)))
+        self.assertEqual(code, 0)
+        items = chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR)
+        self.assertEqual(sorted(item.splitlines()[0] for item in items), sorted(f"**5 clusters aren't ready for GKE {t} yet.**" for t in (TARGET, OLDER_TARGET, third)))
+        self.assertLessEqual(len(chat.rstrip("\n").encode("utf-8")), watch.CHAT_POST_MAX_BYTES)
+        shown = [len([line for line in item.splitlines() if line.startswith("- regular-")]) for item in items]
+        self.assertTrue(all(0 < count < watch.MAX_BLOCKED_CLUSTERS_SHOWN for count in shown), shown)
+        self.assertTrue(all(f"- and {watch.MAX_BLOCKED_CLUSTERS_SHOWN - count} more" in item for item, count in zip(items, shown)))
+
+    def test_the_verdict_comes_before_the_notices(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
+        versions = envelope([member("a", "lagging"), member("b", "current", target=OLDER_TARGET)])
+        code, chat, log = run_main_split(FakeSandbox(versions, envelope([member("a", "lagging", readiness="blocked")])))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            f"**1 cluster isn't ready for GKE {TARGET} yet.**\n- a\nThe next report is due on October 15.\n\n"
+            f"**No cluster is due for GKE {OLDER_TARGET} any more.** The upgrade readiness check stops tracking it.\n",
+        )
+        self.assert_plain(chat)
+
+    def test_a_report_whose_project_failed_points_at_the_log_not_the_pod(self) -> None:
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2")])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, log = run_main_split(FakeSandbox(versions, readiness, failing_projects={"p2"}))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            f"**1 cluster is ready for GKE {TARGET}, and 1 couldn't be fully checked.**\nThe next report is due on October 15. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("next refresh after 2026-10-15; readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection", log)
+
+    def test_an_ungraded_version_says_what_happens_next_then_when_it_waits_a_week(self) -> None:
+        readiness = envelope([], errors=[{"project": "p1", "location": "us-central1-a", "cluster": "a", "message": "403"}])
+        chats = [run_main_split(FakeSandbox(envelope([member("a", "lagging")]), readiness))[1] for _ in range(watch.UNGRADED_ATTEMPTS_BEFORE_WEEKLY)]
+        self.assertEqual(
+            chats,
+            [
+                f"**The upgrade readiness check couldn't read the cluster due for GKE {TARGET}.** It will try again at its next scheduled run. The details are in the agent's log.\n",
+                "",
+                f"**The upgrade readiness check couldn't read the cluster due for GKE {TARGET}.** It has failed 3 times in a row, so it waits until "
+                "October 15 to try again. The details are in the agent's log.\n",
+            ],
+        )
+        for chat in chats:
+            if chat:
+                self.assert_plain(chat)
+
+    def test_a_refusal_no_retry_clears_asks_for_an_admin_then_at_the_weekly_attempt(self) -> None:
+        self.declare_scope(["p1"])
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        admin = f"**The upgrade readiness check couldn't read the cluster due for GKE {OLDER_TARGET}.** An admin needs to fix this first; the details are in the agent's log.\n"
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, log = run_main_split(FakeSandbox(envelope([member("a", "current")])))
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                chat,
+                "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p2. The clusters there keep any earlier results until it reads "
+                "them again. An admin needs to fix this first; the details are in the agent's log.\n\n" + admin,
+            )
+            self.assert_plain(chat)
+            self.assertIn("the remedy is on the install, not this job: name the project in spec.scope", log)
+            self.assertEqual(run_main_split(FakeSandbox(envelope([member("a", "current")])))[1], "")
+            self.assertEqual(run_main_split(FakeSandbox(envelope([member("a", "current")])))[1], admin, "parked, the weekly line still asks for an admin")
+
+    def test_a_refusal_that_clears_on_its_own_promises_the_retry(self) -> None:
+        self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[resolved], retiring=["p2"])
+            code, chat, _ = run_main_split(FakeSandbox(envelope([member("a", "current")])))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p2. The clusters there keep any earlier results until it reads "
+            "them again. It will try again at its next scheduled run. The details are in the agent's log.\n\n"
+            f"**The upgrade readiness check couldn't read the cluster due for GKE {OLDER_TARGET}.** It will try again at its next scheduled run. "
+            "The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+
+    def test_an_unresolved_project_number_asks_for_an_admin(self) -> None:
+        versions = envelope([member("a", "lagging", project="my-proj"), member("b", "lagging", project="p2", target=OLDER_TARGET)])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready"), member("b", "lagging", project="p2", target=OLDER_TARGET, readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456,p2"}):
+            code, chat, _ = run_main_split(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, describe_down={"123456"}))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat.split(watch.CHAT_ITEM_SEPARATOR),
+            [
+                f"**1 cluster is ready for GKE {OLDER_TARGET}.**\nThe next report is due on October 15.",
+                "**The upgrade readiness check couldn't read part of the fleet today.** Not read: 123456. The clusters there keep any earlier results until it "
+                "reads them again. An admin needs to fix this first; the details are in the agent's log.\n",
+            ],
+        )
+        self.assert_plain(chat)
+
+    def test_a_version_the_budget_left_unread_says_where_it_starts_next_time(self) -> None:
+        versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2", target=OLDER_TARGET)])
+        readiness = envelope([member("a", "lagging", readiness="ready"), member("b", "lagging", project="p2", target=OLDER_TARGET, readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}), self.monotonic_readings(0.0, 0.0, 0.0, 0.0, watch.TICK_BUDGET_SECONDS - 10.0):
+            code, chat, log = run_main_split(FakeSandbox(versions, readiness))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat.rstrip("\n").split(watch.CHAT_ITEM_SEPARATOR),
+            [
+                f"**1 cluster is ready for GKE {TARGET}.**\nThe next report is due on October 15.",
+                f"**The upgrade readiness check ran out of time before it read the cluster due for GKE {OLDER_TARGET}.** It will try again at its next "
+                "scheduled run. Next time it starts with p2.",
+            ],
+        )
+        self.assert_plain(chat)
+        self.assertIn("the tick budget was spent before p2 finished", log)
+
+    def test_the_resolved_scope_s_gap_is_named_as_the_install_s_scope(self) -> None:
+        live = fleet_scope_targets.ProjectClusters("p1", fleet_scope_targets.STATUS_LIST_LIVE)
+        gap = fleet_scope_targets.ProjectClusters(fleet_scope_targets.UNRESOLVED_SCOPE_ROW, fleet_scope_targets.STATUS_UNREAD, reason="too-large")
+        unusable = fleet_scope_targets.ScopeClusters(source=fleet_scope_targets.SOURCE_RESOLVED_SCOPE, projects=(live, gap), note="is in state 'too-large'")
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "p1"}), mock.patch.object(
+            watch.fleet_scope_targets, "list_scope_clusters", return_value=unusable
+        ):
+            code, chat, _ = run_main_split(FakeSandbox(envelope([])))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: the install's declared scope. The clusters there keep any earlier "
+            "results until it reads them again. An admin needs to fix this first; the details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+
+    def test_a_location_whose_read_failed_is_named_as_that_location_not_its_project(self) -> None:
+        errors = [{"project": "p1", "location": "europe-west1", "message": "get-server-config failed: 503"}]
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, chat, log = run_main_split(FakeSandbox(envelope([member("a", "current")], errors=errors, exit_code=1), table_failing_projects={"p2"}))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            "**The upgrade readiness check couldn't read part of the fleet today.** Not read: p2, p1 in europe-west1. The clusters there keep any earlier "
+            "results until it reads them again. It will try again at its next scheduled run. The details are in the agent's log.\n",
+        )
+        self.assert_plain(chat)
+        self.assertIn("p1 in europe-west1: get-server-config failed: 503", log)
+        self.assertEqual(watch.unread_places(errors + [{"project": "p1", "message": "clusters list failed"}]), ["p1"], "a project not read covers its locations")
+        # Each place chat names has its reason in the log line, a second location of one project included.
+        two = errors + [{"project": "p1", "location": "us-east1", "message": "get-server-config failed: RESOURCE_EXHAUSTED"}]
+        self.assertEqual(watch.unread_places(two), ["p1 in europe-west1", "p1 in us-east1"])
+        self.assertEqual(watch.error_reasons(two), "p1 in europe-west1: get-server-config failed: 503; p1 in us-east1: get-server-config failed: RESOURCE_EXHAUSTED")
+
+    def test_the_post_s_ceiling_is_the_gateway_s(self) -> None:
+        # The gateway posts a notify longer than its chunk in pieces (a2a/gateway/relay.go); the watch fits its post to the same figure.
+        relay = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "relay.go").read_text(encoding="utf-8")
+        match = re.search(r"^const discordChunk = (\d+)$", relay, re.MULTILINE)
+        self.assertIsNotNone(match, "the gateway's chunk constant moved; find it and keep CHAT_POST_MAX_BYTES equal to it")
+        self.assertEqual(int(match.group(1)), watch.CHAT_POST_MAX_BYTES)
+
+    def test_each_line_of_a_post_is_its_own_paragraph(self) -> None:
+        self.seed(OLDER_TARGET, NOW, ["p1/us-central1-a/b"])
+        partial = envelope([member("a", "current")], errors=[{"project": "p1", "message": "clusters list failed"}], exit_code=1)
+        run_main_split(FakeSandbox(partial))
+        code, chat, log = run_main_split(FakeSandbox(envelope([member("b", "current", target=OLDER_TARGET)])))
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            chat,
+            f"**No cluster is due for GKE {OLDER_TARGET} any more.** The upgrade readiness check stops tracking it.\n\n"
+            "**The upgrade readiness check can read the whole fleet again.**\n",
+        )
+        self.assert_plain(chat)
+        self.assertEqual(len(log.splitlines()), 2, "each chat line's technical line, one per line")
+
+    def test_a_name_a_tenant_wrote_stays_on_one_line_and_short_and_renders_nothing(self) -> None:
+        self.assertEqual(watch.chat_name("year-end\nfreeze  now"), "`year-end freeze now`")
+        long_name = "x" * (watch.CHAT_NAME_MAX_CHARS + 10)
+        self.assertEqual(watch.chat_name(long_name), "`" + "x" * (watch.CHAT_NAME_MAX_CHARS - 1) + watch.ELLIPSIS + "`")
+        # Set as code, a link or emphasis in a name is text; a backtick cannot close the span early.
+        self.assertEqual(watch.chat_name("[runbook](https://example.com/x)"), "`[runbook](https://example.com/x)`")
+        self.assertEqual(watch.chat_name("**loud** `x`"), "`**loud** x`")
+        self.assertEqual(watch.chat_name(None), "")
+        self.assertEqual(watch.plain_date(datetime(2027, 1, 5, 18, 27, tzinfo=timezone.utc), NOW), "January 5, 2027")
+        self.assertEqual(watch.plain_date(datetime(2026, 12, 2, tzinfo=timezone.utc), NOW), "December 2")
 
 if __name__ == "__main__":
     unittest.main()

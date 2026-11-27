@@ -27,10 +27,10 @@ type conditionDoc struct {
 
 // degradedConditionReasons are the reasons the Degraded condition carries,
 // for its row, in the order updateStatusReady ranks them. A parked pass reads
-// the ones ahead of A2ABusStreamsMissing as ranked above it
-// (degradedRanksAboveBusStreams), so a new reason goes where the chain puts
-// it. Listed by constant, so a renamed reason fails to compile; a
-// new reason has to be added here by hand (the writer passes it as a value,
+// this order (degradedRanksAbove) when following poller-owned Degraded reasons
+// (A2ABusStreamsMissing and SlackConnectionFailed), so a new reason goes where
+// the chain puts it. Listed by constant, so a renamed reason fails to compile;
+// a new reason has to be added here by hand (the writer passes it as a value,
 // which the completeness test cannot follow).
 var degradedConditionReasons = []string{
 	conditionReasonInvalidGitRepoURL,
@@ -38,6 +38,7 @@ var degradedConditionReasons = []string{
 	conditionReasonMinterPruningHeld,
 	conditionReasonA2ABusStreamsMissing,
 	conditionReasonA2AGatewayWaitingForTasks,
+	conditionReasonSlackConnectionFailed,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
@@ -105,6 +106,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "`status: False`, `Reason: WaitingForReplica`. Every install runs the A2A gateway, on the console door alone when no chat backend is configured. After the upgrade the next pass renders it at one replica, `Ready` waits on it, and the condition clears once a replica is ready. [What `A2AGateway` reports](#what-a2agateway-reports) covers the older `NoChatBackend` reason and the `discord-bot` Secret.",
 	},
 	{
+		Type:    slackConnectedConditionType,
+		Written: "While Slack is enabled on the A2A gateway and any scraped gateway pod exports `kubeagents_a2a_gateway_slack_connected` (first poll 30 seconds after operator leader election, then every five minutes); removed when Slack is disabled or after two consecutive polls with no pod exporting the gauge",
+		Meaning: "`True`, `SocketModeConnected`: the A2A gateway's Slack Socket Mode connection is up (maximum reading across reporting replicas is `1`; set on the first poll reading `1`). `False`, `ConnectionFailed`: two consecutive polls read `0` across reporting replicas (Slack `auth.test` or Socket Mode is failing); projects onto `Degraded=True` (`Reason: SlackConnectionFailed`) without changing `Ready` or `phase` so an external Slack outage does not take down the console, A2A doors, or gateway PodDisruptionBudget.",
+	},
+	{
 		Type:    busProvisionedConditionType,
 		Written: "From the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs",
 		Meaning: "`status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.",
@@ -148,6 +154,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Type:    kanbanDispatcherFailingCondition,
 		Written: "From the first time the task-board dispatcher fails for a whole poll, or a tick on a board runs past 300 s or fails on a database lock after a busy timeout",
 		Meaning: "`True` with reason `TicksFailing` once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old. `True` with reason `TickStuck` once a board's tick runs past 300 s or fails on a database lock after waiting the busy timeout (120 s by default), as on a locked board; a stuck board takes precedence over a streak, and a good tick that runs past 300 s can set it for one poll. The message names the board with the last error class, or the stuck board, and no tick count or duration; it is written again when the reason, the board, the error class or the count of failing boards changes. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board, and a quick failure of another kind ends a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt drops out after ten minutes too.",
+	},
+	{
+		Type:    forgeConnectedCondition,
+		Written: "While the credential broker reports a forge that holds a managed repository",
+		Meaning: "`True` (`RepositoriesAnswer`) when every managed repository on every forge answered the broker's last readings sweep, which attempts each one about every four minutes, the GitOps repository among them. `False` when one did not, with the worst state as the reason: `Unauthorized` (the forge refused the credential, or none could be had, as for a GitHub App with no installation on the repository), `NotFound`, `Unreachable`, `IdentityUnknown` (the credential cannot name its account), `RateLimited` or `Failed`. `Unknown` (`SweepStale`) when no forge reports a failure and one was last attempted over an hour ago. A repository in the `IdentityUnknown` state is not attempted again until the broker restarts: the reason does not clear before then, and a forge that holds only such repositories turns `Unknown` after an hour. The message names forges by provider and the hosts the spec declares for it. When `True` it gives every forge with how many of its managed repositories answer; when `False`, only the forges that do not answer, with their failing repositories by state out of the forge's total; when `Unknown`, only the forges last attempted over an hour ago. It names no repository, and the broker's log does. The broker reports by provider, so two hosts of one provider are counted together. A change shows in about two polls. A poll that cannot read the broker leaves the condition as it is. The condition is removed while the broker reports no forge: on an install with no managed repository, with the readings sweep turned off, or after a broker restart until its first sweep ends. It does not change `phase` or `Ready`, since the agent still answers.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,

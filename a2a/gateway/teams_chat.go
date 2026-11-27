@@ -349,8 +349,9 @@ func (c teamsChatCard) actions() []map[string]any {
 
 // chatCard lays m's chat message out as the card messageID shows next
 // (empty for a new message), with the Stop button of a running task's line
-// and the rating controls of an answer marked for feedback, and refuses a
-// layout that draws nothing or does not fit one activity. An answered
+// and the rating controls of a message marked for feedback when the card
+// still fits with them, and refuses a layout that draws nothing or does
+// not fit one activity. An answered
 // question keeps its line through an edit that lays out no choices.
 func (a *TeamsAdapter) chatCard(messageID string, m OutMessage) (teamsChatCard, error) {
 	layout, err := renderTeamsChat(m.Chat)
@@ -364,11 +365,18 @@ func (a *TeamsAdapter) chatCard(messageID string, m OutMessage) (teamsChatCard, 
 	if m.Stop != "" {
 		card.rest = append(card.rest, teamsStopActions(m.Stop)...)
 	}
-	if a.ratesTask(m.Feedback) {
-		card.rest = append(card.rest, teamsRatingActions(m.Feedback, a.feedbackRecorder().KeptDays())...)
-	}
 	if !teamsFitsCard(card.text, card.actions()) {
 		return teamsChatCard{}, fmt.Errorf("%w: %w", ErrLayoutRefused, errTeamsChatTooLarge)
+	}
+	if a.ratesTask(m.Feedback) {
+		// The rating controls must not cost the message its layout: a
+		// card they would push past the budget goes out without them, as
+		// on Slack and Google Chat.
+		rated := card
+		rated.rest = append(append([]map[string]any(nil), card.rest...), teamsRatingActions(m.Feedback, a.feedbackRecorder().KeptDays())...)
+		if teamsFitsCard(rated.text, rated.actions()) {
+			return rated, nil
+		}
 	}
 	return card, nil
 }

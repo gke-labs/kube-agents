@@ -2,6 +2,9 @@ package hermesbridge
 
 import (
 	"context"
+	"log"
+	"log/slog"
+	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/taskguard"
@@ -12,9 +15,11 @@ import (
 //
 //   - each worker's task: guardTask around runTask;
 //   - a card stop's goroutine: guardTask around cardStop;
-//   - the activity door, for a delivery routed to a task: takeDelivery
+//   - the activity door: its routing, before a delivery is matched to a
+//     task (routeGuarded, which fails closed every run the delivery could
+//     still have been for); for a delivery routed to a task, takeDelivery
 //     (the decode, the tool result's secret collection, the observation),
-//     with observeDelivery recovering the observation itself under run.mu,
+//     with observeDelivery recovering the observation itself under run.mu;
 //     and collectCardWorkerSecrets for a card worker's delivery;
 //   - each heartbeat tick (runActivity).
 //
@@ -25,9 +30,7 @@ import (
 // (accept, a cancel or follow-up delivery, and the finalizes it runs), the
 // deadline and kill-grace timer callbacks, the API executor's recordOrigin
 // goroutine, abortCanceledSessionKanbanCards, the synthesis's closing
-// watcher, the board's action goroutine, and the activity door's routing
-// before a delivery is matched to a task (net/http recovers a handler's
-// panic there; no task is marked).
+// watcher and the board's action goroutine.
 //
 // Failing closed means the task ends failed with taskguard.Reason and the
 // recovery path publishes no answer: it finalizes with no result, so no
@@ -108,4 +111,32 @@ func (b *Bridge) panicTerminalLocked(run *taskRun) (tried bool, err error) {
 	run.terminalTried = true
 	b.clearSeenSecrets(run)
 	return true, err
+}
+
+// quietServerLog is the activity door's http.Server ErrorLog: net/http's
+// own messages go to the bridge's logger, except a handler panic net/http
+// recovered, whose line carries the panic's value and stack, which may
+// have been built from model or user text. That one is logged without
+// them. The door's own stages are guarded (taskguard), so this is for
+// whatever net/http still recovers.
+func quietServerLog(l *slog.Logger) *log.Logger {
+	if l == nil {
+		l = slog.Default()
+	}
+	return log.New(serverLogWriter{l}, "", 0)
+}
+
+type serverLogWriter struct{ log *slog.Logger }
+
+func (w serverLogWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimSpace(string(p))
+	if strings.HasPrefix(msg, "http: panic serving") {
+		w.log.Error("activity door: net/http recovered a handler panic; its value and stack are not logged")
+		return len(p), nil
+	}
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	w.log.Warn("activity door server: " + msg)
+	return len(p), nil
 }

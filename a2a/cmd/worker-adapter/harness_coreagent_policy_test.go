@@ -226,6 +226,9 @@ func TestASessionPodsCoreAgentGrantMatchesItsClaudeArgv(t *testing.T) {
 				t.Errorf("cluster view %v but Claude Code prefixes %q", view, claudePrefixes)
 			}
 			// The named difference: no delegate tool on core-agent yet.
+			if p.AnyShellCommand {
+				t.Errorf("a session's shell runs any command: %+v", p)
+			}
 			if slices.ContainsFunc(p.Allow, func(a string) bool { return strings.HasPrefix(a, "mcp:") }) {
 				t.Errorf("policy %+v grants MCP; only the delegate server may add MCP", p)
 			}

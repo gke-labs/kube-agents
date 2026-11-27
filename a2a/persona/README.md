@@ -87,8 +87,8 @@ shipped skills, and rewrites references to its scripts, reference files,
 example files, settings and unshipped skill files as not in this session. Of
 each skill, only `SKILL.md` ships. The tool also writes `skills_manifest.sha256`
 over `CLAUDE.md` and `skills/`. The Dockerfile copies the result into
-`CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root. At start, the
-session worker compares the shipped tree with the manifest: a difference stops
+`CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root. At start, a
+Claude Code session worker compares the shipped tree with the manifest: a difference stops
 the worker, and a missing manifest is logged as unverified. The harness's own
 state in that directory is not checked (see
 [Content manifest](../lib/persona/README.md#content-manifest)).

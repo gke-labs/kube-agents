@@ -59,6 +59,16 @@ type Policy struct {
 	// A call no Allow pattern matches is refused, never prompted.
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
+	// WebSearch turns on the model's server-side Google Search, the one
+	// server-side built-in a policy may turn on. The model provider runs
+	// it, so no gate or plugin sees its calls.
+	WebSearch bool `json:"web_search,omitempty"`
+	// AnyShellCommand lets the shell run any command, compound ones
+	// (pipes, chains, redirections, expansions) included: the harness's
+	// shell then skips the gate's single-command check, keeping its deny
+	// rules and its built-in denylist. Only a persona's shell grant sets
+	// it; a session's shell is its command prefixes.
+	AnyShellCommand bool `json:"any_shell_command,omitempty"`
 }
 
 // MCPServer is one MCP server a turn may use; the harness runs it for the

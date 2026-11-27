@@ -189,6 +189,11 @@ type flags struct {
 	// a reconcile.
 	gitopsManagers string
 
+	// ownRelease names the Helm release this install was made by, as
+	// <namespace>/<name>, in the cluster the direct credentials reach. Empty
+	// turns the own-release rule off (ownRelease.wrote).
+	ownRelease string
+
 	// batchJoinBudget caps how long one batch may spend on its lookups. A flag
 	// because the ack deadline it has to fit inside lives in Terraform, not
 	// here: the default is sized against the drift-pubsub module's 60 seconds,
@@ -230,6 +235,8 @@ func parseFlags(args []string) (*flags, error) {
 		"Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile becomes a joinable cluster, whichever project its cluster is in, addressed by asking the GKE API about that profile's cluster_identity. The set of profiles is also the install's scope: an unreachable record from a cluster no readable profile names is logged and held out of the inject. Combines with --in-cluster / --kubeconfig, which add the directly-reachable cluster on top and win if a profile names the same one.")
 	fs.StringVar(&f.gitopsManagers, "gitops-managers", "",
 		"Comma-separated managedFields managers that are the GitOps controller (for example argocd-controller). Matched exactly, and only on writes to the object in a second later than the audited change: a claim made through a subresource such as status does not count, and neither does one sharing the change's own second, which a person applying under the manager's name would produce. Empty means ownership is reported without any reconciliation claim.")
+	fs.StringVar(&f.ownRelease, "own-release", "",
+		"The Helm release this install was made by, as <namespace>/<name>. On the cluster --in-cluster or --kubeconfig reaches, a write by a client other than kubectl to an object in that namespace or its -profiles namespace, to a cluster-scoped RBAC or admission object named <name>-..., or to an object carrying the release's annotations, and any write to a kube-agents CRD, is marked as the install's own and sent to the daemon's digest route when the daemon advertises "+featureDriftOwnRelease+"; the daemon digests the release writes only while their principal has a Helm upgrade under way. Requires --in-cluster or --kubeconfig. Empty turns the rule off.")
 	fs.DurationVar(&f.batchJoinBudget, "batch-join-budget", defaultBatchJoinBudget,
 		"Longest one batch may spend on live-object lookups before the rest fail open. Keep it to half the subscription's ack deadline or less, leaving the rest for the batch's Ack; startup reads the real deadline and warns when it does not. Exceeding the whole deadline means Pub/Sub redelivers the batch this process is still working on.")
 
@@ -255,13 +262,19 @@ func parseFlags(args []string) (*flags, error) {
 // way and for the same reason: building it needs a validated token out of the
 // environment, which a test should not have to set to exercise the wiring.
 //
-// skipBacklog is the inject handler's backlogRoute, and an argument rather than
-// a field set afterwards: DriftEvent.Digest, which the handler routes on, is
-// derived from it, so dropping the wiring has to be a compile error rather than
-// a detector that cards every backlog record.
-func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool, skipBacklog bool) (*driftFilter, *joiner) {
+// routes is the inject handler's, and an argument rather than fields set
+// afterwards: DriftEvent.Digest, which the handler routes on, is derived from
+// it, so dropping the wiring has to be a compile error rather than a detector
+// that cards every backlog record.
+func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool, routes digestRoutes) (*driftFilter, *joiner) {
 	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), newProfileScope(f.profilesDir), alreadyInjected, onDrift)
-	join.skipBacklog = skipBacklog
+	join.skipBacklog = routes.backlog
+	if routes.ownRelease {
+		// realMain has already refused a malformed --own-release, so the error
+		// cannot occur here; a zero release matches nothing.
+		release, _ := parseOwnRelease(f.ownRelease)
+		join.own = ownRelease{release: release, cluster: directClusterIdentity(f)}
+	}
 	return newDriftFilter(NewClassifier(f.automationPrincipals, f.humanDomains), join.Handle, f.logDropped), join
 }
 
@@ -431,6 +444,12 @@ func realMain(argv []string) error {
 	if err := refuseProjectNumber(f.project, hasCredentials); err != nil {
 		return err
 	}
+	if _, err := parseOwnRelease(f.ownRelease); err != nil {
+		return err
+	}
+	if f.ownRelease != "" && !hasCredentials {
+		return errors.New("--own-release was given without --in-cluster or --kubeconfig, so no cluster is named as the one the release runs in")
+	}
 
 	// Cancelled on SIGINT or SIGTERM, which stops the pull loop. Settling the
 	// batch it was working on does not run on this context -- see
@@ -541,7 +560,7 @@ func realMain(argv []string) error {
 	}
 
 	injectHandler := newDriftInjectHandler(inject)
-	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected, injectHandler.backlogRoute)
+	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected, injectHandler.routes())
 
 	// Said at startup, because the difference between the two modes is nearly
 	// invisible in every later line: a run with the inject off emits the DRIFT
@@ -558,6 +577,14 @@ func realMain(argv []string) error {
 			log.Printf("%s: backlog records (published before this process's first pull, or waiting over %s) go to %s for one digest, not a card each; a late kubectl write is carded", commandName, backlogMaxWait, driftBacklogPath)
 		} else {
 			log.Printf("%s: the daemon does not advertise %q; backlog records will be injected as a card each, as live ones are", commandName, featureDriftBacklog)
+		}
+		// Said either way for the same reason: with the rule off, an upgrade
+		// of the install is a card for each of its writes.
+		if f.ownRelease != "" && injectHandler.ownReleaseRoute {
+			log.Printf("%s: writes to the objects of Helm release %s on cluster %s by a client other than kubectl, and writes to a *%s CRD there, go to the digest route too, where the daemon cards a release write with no Helm upgrade under way; a delete is carded",
+				commandName, f.ownRelease, direct, productCRDSuffix)
+		} else if f.ownRelease != "" {
+			log.Printf("%s: the daemon does not advertise %q; writes to the objects of Helm release %s are not marked and each is injected as a card", commandName, featureDriftOwnRelease, f.ownRelease)
 		}
 	}
 
