@@ -126,7 +126,7 @@ class ComposeTests(unittest.TestCase):
         bundle = nudge.build_nudge(plan, 2, daily=True, rows=rows)
         self.assertIn("1 open issue is pausing new findings", bundle.text)
         self.assertIn(
-            "New findings are paused until you accept, snooze, or dismiss this open item (1 critical issue waiting behind it).",
+            "New findings are paused until you accept, snooze until a date, or dismiss this open item (1 critical issue waiting behind it).",
             bundle.text,
         )
         # The notice names the decisions the queue takes, each by its verb, and no other:
@@ -136,6 +136,8 @@ class ComposeTests(unittest.TestCase):
         for notice in (nudge.BLOCKING_NOTICE_SINGLE, nudge.BLOCKING_NOTICE_MULTI):
             self.assertEqual([verb for verb in verbs.values() if verb not in notice], [])
             self.assertNotIn("resolve", notice)
+            # "snoozed" is refused without snoozed_until, so the notice says a date is needed.
+            self.assertIn("snooze until a date", notice)
         self.assertIn("no limits", bundle.text)
         self.assertNotIn("id: m0", bundle.text)
         self.assertIn("id=m0", bundle.card["thread_context"])
