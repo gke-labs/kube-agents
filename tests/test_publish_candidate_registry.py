@@ -2,9 +2,10 @@
 
 An environment and the release read a commit's images from the candidate
 repository through their registry variables, and autopush starts when this
-workflow completes. GHCR holds releases: nothing here pushes to it, moves its
-`latest` or signs a commit image, and the decision whether a release-branch
-commit already has images asks the candidate repository.
+workflow completes. GHCR holds releases: nothing here pushes to it or moves
+its `latest`, each image is signed on its candidate reference, and the decision
+whether a release-branch commit already has images asks the candidate
+repository.
 """
 
 import pathlib
@@ -27,7 +28,6 @@ _DECIDE_JOB = "decide"
 _DECIDE_SCRIPT = "./scripts/release/decide_image_publish.sh"
 _GHCR_HOST = "ghcr.io"
 _PACKAGES_PERMISSION = "packages"
-_SIGNING_COMMAND = "cosign"
 _BRIDGE_BUILD_STEP_ID = "build-hermes-bridge"
 _DOCKERIGNORE = _REPO_ROOT / ".dockerignore"
 # What google-github-actions/auth names the credentials file it writes into the workspace.
@@ -81,8 +81,8 @@ class PublishToCandidateRegistryTest(unittest.TestCase):
         self.assertEqual(self.doc["permissions"], {"contents": "read"})
 
     def test_nothing_in_the_workflow_reaches_ghcr(self):
-        """No step names GHCR, no job may write packages and nothing signs: a
-        release publishes there and signs what it publishes."""
+        """No step names GHCR and no job may write packages: a release
+        publishes there."""
         self.assertNotIn(_PACKAGES_PERMISSION, self.doc.get("permissions", {}))
         for job_name, job in self.doc["jobs"].items():
             with self.subTest(job=job_name):
@@ -90,7 +90,20 @@ class PublishToCandidateRegistryTest(unittest.TestCase):
                 for step in job["steps"]:
                     rendered = yaml.safe_dump(step)
                     self.assertNotIn(_GHCR_HOST, rendered, step.get("name"))
-                    self.assertNotIn(_SIGNING_COMMAND, rendered.lower(), step.get("name"))
+
+    def test_each_image_is_signed_once_on_its_candidate_reference(self):
+        """By digest, in the registry the image was pushed to."""
+        signed = {}
+        for job in self.jobs.values():
+            for step in job["steps"]:
+                for line in str(step.get("run", "")).splitlines():
+                    match = re.fullmatch(r'cosign sign --yes "(.+)/([a-z0-9-]+)@\$([A-Z0-9_]+)"', line.strip())
+                    if match:
+                        signed.setdefault(match.group(2), []).append(match.group(1))
+        self.assertEqual(sorted(signed), sorted(parse_required_release_images(_COMMON_SH.read_text())))
+        for image, registries in signed.items():
+            with self.subTest(image=image):
+                self.assertEqual(registries, ["$CANDIDATE_REGISTRY_PREFIX"])
 
     def test_the_bridge_is_built_from_the_platform_image_this_job_pushed(self):
         bridge = next(step for step in self.builds if step.get("id") == _BRIDGE_BUILD_STEP_ID)

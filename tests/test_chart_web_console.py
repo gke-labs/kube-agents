@@ -515,10 +515,10 @@ class WebConsoleImageTest(unittest.TestCase):
     def test_release_requires_the_image(self) -> None:
         self.assertIn(IMAGE_NAME, parse_required_release_images(RELEASE_COMMON.read_text()))
 
-    def test_publish_workflow_builds_it(self) -> None:
+    def test_publish_workflow_builds_and_signs_it(self) -> None:
         workflow = PUBLISH_WORKFLOW.read_text()
         self.assertIn(f"file: {DOCKERFILE}", workflow)
-        self.assertIn(f"/{IMAGE_NAME}:${{{{ github.sha }}}}", workflow)
+        self.assertIn(f"/{IMAGE_NAME}@$WEB_CONSOLE_DIGEST", workflow)
         self.assertTrue((REPO_ROOT / DOCKERFILE).is_file())
 
 

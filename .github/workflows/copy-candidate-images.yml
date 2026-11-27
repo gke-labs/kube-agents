@@ -9,7 +9,7 @@ name: Copy Images to the Candidate Repository
 # commit by hand: one published by a release line whose own copy of the publish
 # workflow pushes to GHCR, or a `main` commit published before the workflow
 # pushed to the candidate repository.
-# Unsigned on purpose: nothing verifies a commit image's signature.
+# A copy is not signed: the publish workflow signs what it pushes itself.
 
 on:
   #checkov:skip=CKV_GHA_7:A hand-started copy has to name the commit whose images it copies
