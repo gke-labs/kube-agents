@@ -451,12 +451,14 @@ func parseServedModels(body []byte) (servedModels, error) {
 			out.patterns = true
 			continue
 		}
+		// The provider is the start of the route, which is what the chart
+		// joins litellm.modelProvider into; litellm_provider can name the
+		// same provider otherwise, and speaks only for a route with no
+		// provider in it.
 		provider := strings.TrimSpace(item.ModelInfo.LitellmProvider)
 		id := raw
 		if p, m, found := strings.Cut(raw, "/"); found {
-			if provider == "" {
-				provider = p
-			}
+			provider = p
 			id = m
 		}
 		if id == "" {
@@ -610,6 +612,7 @@ func findCatalogOption(id, target string) (ModelOption, bool) {
 func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) ModelsResponse {
 	served, servedOK := s.readServedModels(ctx)
 	activeModel, activeTarget, clusterReasoning := s.recordedModelAmong(ctx, served, servedOK)
+	recorded := activeModel != ""
 	activeProvider := ""
 	reasoningLevel := clusterReasoning
 
@@ -663,6 +666,22 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 			activeModel = s.cfg.ModelName
 		} else {
 			activeModel = defaultGeminiModel
+		}
+	}
+	if activeProvider == "" && recorded {
+		// A recorded pick carries no provider. Its own is the start of its
+		// target, or the provider of the model the gateway lists under
+		// that name; the default alias's provider, read below, is another
+		// model's. The presets are no evidence: they assume a provider.
+		if p, _, found := strings.Cut(activeTarget, "/"); found {
+			activeProvider = p
+		} else if servedOK {
+			for _, c := range candidates {
+				if c.ID == activeModel {
+					activeProvider = c.Provider
+					break
+				}
+			}
 		}
 	}
 	if activeProvider == "" {
@@ -840,20 +859,24 @@ func (s *server) handleModelsPost(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), modelsTimeout)
 	defer cancel()
 
-	// Resolve current active model
-	activeModel, _, _ := s.getActiveModelFromCluster(ctx)
-	if activeModel == "" {
-		s.model.mu.Lock()
-		activeModel = s.model.value.Name
-		s.model.mu.Unlock()
-	}
-	if activeModel == "" {
-		activeModel = s.cfg.AssistModel
-		if activeModel == "" || activeModel == defaultAssistModel {
-			activeModel = s.cfg.ModelName
+	// Resolve the current active model. Only a request with a reasoning
+	// level reads it, so a plain pick skips the gateway and cluster reads.
+	activeModel := ""
+	if reqReasoning != "" {
+		activeModel, _, _ = s.getActiveModelFromCluster(ctx)
+		if activeModel == "" {
+			s.model.mu.Lock()
+			activeModel = s.model.value.Name
+			s.model.mu.Unlock()
 		}
 		if activeModel == "" {
-			activeModel = defaultGeminiModel
+			activeModel = s.cfg.AssistModel
+			if activeModel == "" || activeModel == defaultAssistModel {
+				activeModel = s.cfg.ModelName
+			}
+			if activeModel == "" {
+				activeModel = defaultGeminiModel
+			}
 		}
 	}
 

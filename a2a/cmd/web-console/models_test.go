@@ -407,6 +407,15 @@ func TestParseServedModels(t *testing.T) {
 		}
 	}
 
+	// The provider is the start of the route, whatever litellm_provider says.
+	labelled, err := parseServedModels([]byte(`{"data":[{"model_name":"model-default","litellm_params":{"model":"vertex_ai/gemini-3.8-flash"},"model_info":{"litellm_provider":"vertex_ai-language-models"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labelled.inUse.Provider != "vertex_ai" {
+		t.Errorf("provider: got %q, want the route's vertex_ai", labelled.inUse.Provider)
+	}
+
 	// A target with more than one path segment keeps them all in the ID: it
 	// is the modelDefaultName that selects the model. An entry with no model
 	// after the provider is not a model.
@@ -741,6 +750,95 @@ func TestOpenAICompatibleInstallKeepsItsChartProvider(t *testing.T) {
 	// On any other install hosted_vllm is a provider slug of its own.
 	if res := getModels(t, modelsServer(gw.URL, nil)); res.ActiveProvider != "hosted_vllm" {
 		t.Errorf("an install that is not openai_compatible: provider %q, want hosted_vllm", res.ActiveProvider)
+	}
+}
+
+// A recorded pick's Helm values name the pick's own provider, not the
+// provider of the model the default alias routes to: from the recorded
+// target, from the listed model when only the name is recorded, and from
+// the target again when the gateway cannot be asked and the presets show.
+func TestRecordedPickKeepsItsOwnProvider(t *testing.T) {
+	mixed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"model_name":"model-default","litellm_params":{"model":"vertex_ai/gemini-3.8-flash"},"model_info":{"litellm_provider":"vertex_ai"}},
+			{"model_name":"gpt","litellm_params":{"model":"openai/gpt-5.4"},"model_info":{"litellm_provider":"openai"}}
+		]}`))
+	}))
+	defer mixed.Close()
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer down.Close()
+
+	for name, c := range map[string]struct {
+		gateway     string
+		annotations map[string]string
+	}{
+		"name and target recorded": {mixed.URL, map[string]string{activeModelAnnotation: "gpt-5.4", activeTargetAnnotation: "openai/gpt-5.4"}},
+		"name alone recorded":      {mixed.URL, map[string]string{activeModelAnnotation: "gpt-5.4"}},
+		"gateway down, presets":    {down.URL, map[string]string{activeModelAnnotation: "gpt-5.4", activeTargetAnnotation: "openai/gpt-5.4"}},
+	} {
+		kube, _ := recordedAgent(t, c.annotations)
+		res := getModels(t, modelsServer(c.gateway, kube))
+		if res.ActiveProvider != "openai" || res.ActiveTarget != "openai/gpt-5.4" {
+			t.Errorf("%s: got provider %q, target %q; want openai, openai/gpt-5.4", name, res.ActiveProvider, res.ActiveTarget)
+		}
+		if !strings.Contains(res.HelmValuesYAML, "modelProvider: openai\n  modelDefaultName: gpt-5.4\n") {
+			t.Errorf("%s: Helm values:\n%s", name, res.HelmValuesYAML)
+		}
+	}
+
+	// With nothing recorded and the gateway down, the provider is the
+	// install's MODEL_PROVIDER, not the one the presets assume for the name.
+	unrecorded := modelsServer(down.URL, nil)
+	unrecorded.cfg.ModelName, unrecorded.cfg.ModelProvider = "gemini-3.8-flash", "gemini"
+	if res := getModels(t, unrecorded); res.ActiveProvider != "gemini" {
+		t.Errorf("nothing recorded, gateway down: provider %q, want the install's gemini", res.ActiveProvider)
+	}
+
+	// The same install with only a name recorded: the presets list that name
+	// under a provider of their own, which is no evidence of this install's.
+	nameOnly, _ := recordedAgent(t, map[string]string{activeModelAnnotation: "gemini-3.8-flash"})
+	geminiInstall := modelsServer(down.URL, nameOnly)
+	geminiInstall.cfg.ModelName, geminiInstall.cfg.ModelProvider = "gemini-3.8-flash", "gemini"
+	if res := getModels(t, geminiInstall); res.ActiveProvider != "gemini" {
+		t.Errorf("a name alone recorded, gateway down: provider %q, want the install's gemini", res.ActiveProvider)
+	}
+
+	// A recorded model no list names has only its target to say its provider.
+	kube, _ := recordedAgent(t, map[string]string{activeModelAnnotation: "tuned-7", activeTargetAnnotation: "openai/tuned-7"})
+	if res := getModels(t, modelsServer(down.URL, kube)); !strings.Contains(res.HelmValuesYAML, "modelProvider: openai\n  modelDefaultName: tuned-7\n") {
+		t.Errorf("a recorded model outside every list: Helm values:\n%s", res.HelmValuesYAML)
+	}
+}
+
+// A plain pick reads the gateway's list once, for its response: the active
+// model is resolved only for a request that carries a reasoning level.
+func TestPlainPickReadsTheGatewayListOnce(t *testing.T) {
+	lists := 0
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/model/info" {
+			lists++
+			_, _ = w.Write([]byte(`{"data":[{"model_name":"model-default","litellm_params":{"model":"vertex_ai/gemini-3.8-flash"},"model_info":{"litellm_provider":"vertex_ai"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	}))
+	defer gw.Close()
+	kube, _ := recordedAgent(t, nil)
+	s := modelsServer(gw.URL, kube)
+	s.fetchModel = func(context.Context, string) (modelInfo, error) { return modelInfo{}, nil }
+
+	rec := httptest.NewRecorder()
+	s.handleModelsPost(rec, httptest.NewRequest(http.MethodPost, "/api/models",
+		strings.NewReader(`{"model":"gemini-3.8-flash","provider":"vertex_ai","model_target":"vertex_ai/gemini-3.8-flash"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if lists != 1 {
+		t.Errorf("a plain pick read /model/info %d times, want 1", lists)
 	}
 }
 
