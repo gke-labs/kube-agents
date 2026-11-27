@@ -43,3 +43,5 @@ first-install-hello-filed
 fleet-audit-remediation-right-and-not-stale
 # Added 2026-11-23 when the case joined the nightly (#6724): the shortest chain then.
 findings-decision-reply-names-no-id
+# gitops-drift-own-release-digest (#3613): 900s, into the shortest chain when it joined the nightly.
+gitops-drift-own-release-digest

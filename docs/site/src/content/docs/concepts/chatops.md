@@ -696,7 +696,23 @@ Each cluster-event alert and each drift alert spends one unit of a daily budget.
 
 Most drift changes that reach the drift detector late do not spend the `GitOpsDrift` budget. A change is late when its audit record was published before the detector started to read, for example most changes that an install or a restart of the agent pod makes, or when the record waited more than 30 minutes. The agent posts one "Drift backlog" message for each group of late changes. The message counts the changes by principal and names some of them. On an install with no chat platform enabled, the message is one card on the task board instead. The card has no assignee and waits on a person; no agent acts on it.
 
-Late changes in the message get no triage turn, and the feed `GET /v1/intercepted-events` lists them with the status `backlog`. Some late changes get a triage card and spend the budget instead: a change made with `kubectl`, and every late change of a principal with fewer than three late changes in the group. When the budget is spent, a late change of such a principal is counted in the message instead. A late `kubectl` change is handled as a live change is, so it is lost from chat and the feed lists it as `suppressed`.
+Late changes in the message get no triage turn, and the feed `GET /v1/intercepted-events` lists them with the status `backlog`. Some late changes get a triage card and spend the budget instead: a change made with `kubectl`, and every late change of a principal with fewer than three changes in the group. When the budget is spent, a late change of such a principal is counted in the message instead. A late `kubectl` change is handled as a live change is, so it is lost from chat and the feed lists it as `suppressed`.
+
+One `kubectl` change is not in that rule: a change to a kube-agents CRD on an install that Helm made, as the installer does. The paragraphs below describe it.
+
+An upgrade of kube-agents changes its own objects while the drift detector reads, so those changes are not late. On an install that Helm made, they go to "Drift backlog" messages too and do not spend the budget. One upgrade usually makes two messages: one for the CRDs, which the installer applies first, and one for the other objects. A long upgrade can make more.
+
+This applies only while the same person has a Helm upgrade of kube-agents under way, and only to a change that is not made with `kubectl`. The change must be to one of these objects:
+
+- an object in the two kube-agents namespaces
+- a cluster-wide access object or admission object named after the kube-agents Helm release
+- an object elsewhere that Helm marks as part of the release
+
+The message names that person, the Helm release and its revision.
+
+Without a Helm upgrade, each such change gets a triage card, about one minute later than other changes. When the budget is spent, the message names the change on a "Review:" line.
+
+A change to a kube-agents CRD needs no Helm upgrade: it goes to the message when its person has three or more changes in the group, and it gets a triage card when the person has fewer. A change to the other kube-agents objects that is made without a Helm upgrade is not in that count. A delete gets a triage card. The detector of the release that is in service reads the upgrade, so the first upgrade to a release with this rule still gets a drift alert for each change.
 
 Set a ceiling in one of these places:
 

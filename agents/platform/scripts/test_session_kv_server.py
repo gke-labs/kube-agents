@@ -13138,6 +13138,12 @@ class TestDriftBacklog(unittest.TestCase):
         body = self.client.get("/healthz").json()
         self.assertIn(session_kv_server.DRIFT_BACKLOG_FEATURE, body["features"])
 
+    def test_healthz_advertises_that_it_reads_the_own_release_marks(self):
+        """The detector sends a live own-release record to the digest route
+        only when it reads this, so the name is part of the contract."""
+        body = self.client.get("/healthz").json()
+        self.assertIn("drift-own-release", body["features"])
+
     def test_a_backlog_record_is_recorded_with_no_session_quota_or_turn(self):
         with patch.object(session_kv_server, "trigger_agent_troubleshooter") as trigger:
             response = self._post()
@@ -13262,6 +13268,432 @@ class TestDriftBacklog(unittest.TestCase):
         by_principal = {r["principal"]: r["backlog"] for r in self._rows()}
         self.assertEqual(by_principal["installer@example.com"], session_kv_server.DRIFT_BACKLOG_DIGESTED)
         self.assertEqual(by_principal["ada@example.com"], session_kv_server.DRIFT_BACKLOG_CARDED)
+
+    RELEASE_RECORD = {"version": "v1", "namespace": "kubeagents-system", "resource": "secrets"}
+    # An object no other row of a test names, for the row a digest asks a person to review.
+    REVIEWED = {"group": "apps", "version": "v1", "namespace": "payments", "resource": "deployments", "name": "ledger"}
+
+    def _own(self, insert_id, principal="installer@example.com", kind="release", **overrides):
+        """A live write the detector marked as kube-agents' own."""
+        return self._post(insert_id=insert_id, principal=principal, backlog=False, own_release=kind, **overrides)
+
+    def _upgrade_start(self, principal="installer@example.com", revision="12", insert_id="", **overrides):
+        """The create of Helm's record Secret for a new revision: the start of an upgrade."""
+        record = dict(self.RELEASE_RECORD, name=f"sh.helm.release.v1.kube-agents.v{revision}")
+        return self._own(
+            insert_id or f"start-{principal}-{revision}",
+            principal,
+            verb="create",
+            resource=record,
+            own_release_revision=revision,
+            **overrides,
+        )
+
+    def _upgrade_end(self, principal="installer@example.com", revision="12", insert_id="", **overrides):
+        """Helm's update of that Secret: the end of the upgrade, deployed or failed."""
+        record = dict(self.RELEASE_RECORD, name=f"sh.helm.release.v1.kube-agents.v{revision}")
+        return self._own(
+            insert_id or f"end-{principal}-{revision}",
+            principal,
+            verb="update",
+            resource=record,
+            own_release_revision_end=revision,
+            **overrides,
+        )
+
+    UPGRADE_LINE = "Helm upgrade: installer@example.com started revision {revision} of release kubeagents-system/kube-agents at {started} UTC."
+
+    def _digest(self):
+        """Post the pending rows' digest and return the chat message, or None when none was posted."""
+        with patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        return run.call_args.args[0][-1] if run.called else None
+
+    def _marks(self):
+        return {r["object_uid"]: r["backlog"] for r in self._rows()}
+
+    def _wait_for_triggers(self, count):
+        deadline = time.monotonic() + 5
+        while self.trigger.call_count < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.trigger.call_count, count)
+
+    def _drift_sent(self):
+        return self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]["sent"]
+
+    def test_an_upgrade_window_digests_its_principals_own_release_rows(self):
+        """A principal that started a Helm upgrade has its own-release rows in
+        one digest that names the upgrade and spends nothing. A second
+        principal's own-release row in the same burst has no upgrade behind it
+        and is carded."""
+        self._chat()
+        self._upgrade_start()
+        for i in range(4):
+            self._own(f"own-{i}")
+        self._own("ada-own", principal="ada@example.com")
+        message = self._digest()
+        self.assertIn(
+            "5 changes touched only kube-agents' own objects while a Helm upgrade by the same principal was under way", message
+        )
+        self.assertIn(", so they are listed here instead of triaged one card each.\n", message)
+        self.assertIn(self.UPGRADE_LINE.format(revision="12", started="2026-09-20 11:04:07"), message)
+        self.assertNotIn("late", message)
+        self.assertIn("installer@example.com (5)", message)
+        self.assertNotIn("ada@example.com", message)
+        marks = self._marks()
+        self.assertEqual(marks.pop("ada-own"), session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(set(marks.values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        self._wait_for_triggers(1)
+        self.assertEqual(self._drift_sent(), 1)
+
+    def test_own_release_rows_with_no_upgrade_are_carded_whatever_their_count(self):
+        """Where a write lands does not show that an upgrade made it: a live
+        burst on kube-agents' own objects with no Helm upgrade is a person's
+        burst. Late rows on the same objects keep the rule of three, as an
+        install's burst did before the detector could mark them."""
+        self._chat()
+        for i in range(4):
+            self._own(f"own-{i}")
+        for i in range(3):
+            self._post(insert_id=f"late-{i}", principal="bob@example.com", own_release="release")
+        # A live one by the principal whose late rows are a burst: still a card.
+        self._own("bob-live", principal="bob@example.com")
+        message = self._digest()
+        self.assertIn("3 changes reached drift detection late", message)
+        self.assertIn("bob@example.com (3)", message)
+        self.assertNotIn("installer@example.com", message)
+        marks = self._marks()
+        self.assertEqual({marks[f"late-{i}"] for i in range(3)}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        self.assertEqual({marks[f"own-{i}"] for i in range(4)}, {session_kv_server.DRIFT_BACKLOG_CARDED})
+        self.assertEqual(marks["bob-live"], session_kv_server.DRIFT_BACKLOG_CARDED)
+        self._wait_for_triggers(5)
+        self.assertEqual(self._drift_sent(), 5)
+
+    def test_a_window_covers_only_the_principal_that_opened_it(self):
+        self._chat()
+        self._upgrade_start()
+        for i in range(3):
+            self._own(f"ada-{i}", principal="ada@example.com")
+        message = self._digest()
+        self.assertIn(
+            "1 change touched only kube-agents' own objects while a Helm upgrade by the same principal was under way, "
+            "so it is listed here instead of triaged on a card of its own.",
+            message,
+        )
+        self.assertNotIn("ada@example.com", message)
+        marks = self._marks()
+        self.assertEqual(marks.pop("start-installer@example.com-12"), session_kv_server.DRIFT_BACKLOG_DIGESTED)
+        self.assertEqual(set(marks.values()), {session_kv_server.DRIFT_BACKLOG_CARDED})
+        self._wait_for_triggers(3)
+
+    def test_a_window_runs_from_the_start_of_the_upgrade_to_its_end(self):
+        """The window is the upgrade itself, by the time each change was made:
+        from Helm's create of the release record to its update of it. A change
+        before the start or after the end is a person's, and is carded: the
+        hand fix after a failed upgrade is what a drift alert is for. The
+        start and the end are read from the ledger, so they need not be in the
+        same digest as the row."""
+        self._chat()
+        self._own("before", timestamp="2026-09-20T10:59:00Z")
+        self._upgrade_start(timestamp="2026-09-20T11:00:00Z")
+        self.assertIn(self.UPGRADE_LINE.format(revision="12", started="2026-09-20 11:00:00"), self._digest())
+        self.assertEqual(self._marks()["before"], session_kv_server.DRIFT_BACKLOG_CARDED)
+        self._wait_for_triggers(1)
+
+        self._own("during-live", timestamp="2026-09-20T11:04:00Z")
+        self._post(insert_id="during-late", principal="installer@example.com", own_release="release", timestamp="2026-09-20T11:04:30Z")
+        self._upgrade_end(timestamp="2026-09-20T11:05:00Z")
+        self._own("same-second-as-the-end", timestamp="2026-09-20T11:05:01Z")
+        self._own("after-the-end", timestamp="2026-09-20T11:05:30Z")
+        message = self._digest()
+        self.assertIn("4 changes touched only kube-agents' own objects", message)
+        marks = self._marks()
+        self.assertEqual(marks.pop("after-the-end"), session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(marks.pop("before"), session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(set(marks.values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        self._wait_for_triggers(2)
+
+    def test_a_window_with_no_end_seen_closes_after_its_longest_time(self):
+        """A failed or killed upgrade may never update its record. The window
+        then closes on its own, and an end of another revision does not close
+        it early."""
+        self._chat()
+        self._upgrade_start(timestamp="2026-09-20T11:00:00Z")
+        self._upgrade_end(revision="11", timestamp="2026-09-20T11:00:02Z")
+        self._own("inside", timestamp="2026-09-20T11:14:00Z")
+        self._own("past-the-window", timestamp="2026-09-20T11:15:30Z")
+        self._own("no-time", timestamp="")
+        message = self._digest()
+        self.assertIn("3 changes touched only kube-agents' own objects", message)
+        marks = self._marks()
+        self.assertEqual(marks["inside"], session_kv_server.DRIFT_BACKLOG_DIGESTED)
+        self.assertEqual(marks["past-the-window"], session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(marks["no-time"], session_kv_server.DRIFT_BACKLOG_CARDED)
+        self._wait_for_triggers(2)
+
+    def test_a_later_update_of_an_old_record_does_not_stretch_its_upgrade(self):
+        """Helm updates a revision's record twice: when its upgrade ends, and
+        again when the next upgrade supersedes it. The first one is the end.
+        A change by hand between two upgrades is then outside both, and is
+        carded, and each row names the upgrade it was made in."""
+        self._chat()
+        self._upgrade_start(revision="9", timestamp="2026-09-20T11:00:00Z")
+        self._upgrade_end(revision="9", timestamp="2026-09-20T11:01:00Z")
+        self._own("by-hand-between", timestamp="2026-09-20T11:05:00Z")
+        self._upgrade_start(revision="10", timestamp="2026-09-20T11:10:00Z")
+        self._own("in-the-second", timestamp="2026-09-20T11:10:30Z")
+        self._upgrade_end(revision="9", insert_id="superseded", timestamp="2026-09-20T11:11:00Z")
+        self._upgrade_end(revision="10", timestamp="2026-09-20T11:12:00Z")
+        message = self._digest()
+        self.assertIn("6 changes touched only kube-agents' own objects", message)
+        # In the order they ran, which the revisions' text order is not.
+        self.assertEqual(
+            [line for line in message.split("\n") if line.startswith("Helm upgrade: ")],
+            [
+                self.UPGRADE_LINE.format(revision="9", started="2026-09-20 11:00:00"),
+                self.UPGRADE_LINE.format(revision="10", started="2026-09-20 11:10:00"),
+            ],
+        )
+        marks = self._marks()
+        self.assertEqual(marks.pop("by-hand-between"), session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(set(marks.values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        self._wait_for_triggers(1)
+
+    def test_an_update_from_before_the_create_does_not_end_the_upgrade(self):
+        """A revision's record can be made again after it was removed, as the
+        eval fixture does on each repetition. The update that ended the
+        earlier one is before this create, so it is not this upgrade's end."""
+        self._chat()
+        self._upgrade_start(timestamp="2026-09-20T11:00:00Z")
+        self._upgrade_end(timestamp="2026-09-20T11:01:00Z")
+        self._upgrade_start(insert_id="made-again", timestamp="2026-09-20T11:10:00Z")
+        self._own("in-the-second", timestamp="2026-09-20T11:10:30Z")
+        self.assertIn("4 changes touched only kube-agents' own objects", self._digest())
+        self.assertEqual(set(self._marks().values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        time.sleep(0.05)
+        self.trigger.assert_not_called()
+
+    def test_a_row_inside_two_upgrades_names_the_newer(self):
+        """An upgrade with no end seen stays open for its longest time, so a
+        second one can start inside it. A row made in both is the second's."""
+        self._chat()
+        self._upgrade_start(timestamp="2026-09-20T11:00:00Z")
+        self._digest()
+        self._upgrade_start(revision="13", timestamp="2026-09-20T11:10:00Z")
+        self._digest()
+        self._own("in-both", timestamp="2026-09-20T11:11:00Z")
+        message = self._digest()
+        self.assertIn(self.UPGRADE_LINE.format(revision="13", started="2026-09-20 11:10:00"), message)
+        self.assertNotIn("revision 12", message)
+
+    def test_crd_rows_need_no_upgrade_and_keep_the_count_rule(self):
+        """The installer applies the CRDs before Helm starts, so no upgrade is
+        asked of them; one principal's lone CRD write is still carded."""
+        self._chat()
+        for i in range(3):
+            self._own(f"crd-{i}", kind="crd")
+        self._own("ada-crd", principal="ada@example.com", kind="crd")
+        message = self._digest()
+        self.assertIn(
+            "3 changes were made to kube-agents' own CRDs, as its installer makes them before an upgrade, so they are",
+            message,
+        )
+        self.assertNotIn("Helm upgrade:", message)
+        marks = self._marks()
+        self.assertEqual(marks.pop("ada-crd"), session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(set(marks.values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        self._wait_for_triggers(1)
+
+    def test_a_digest_of_several_causes_says_the_point_first_and_one_cause_a_line(self):
+        """The first line alone says what the message is. Each cause then has
+        its own line, the one a person has to act on first, and each agrees in
+        number with its own count."""
+        self._chat()
+        self._burst()
+        self._upgrade_start()
+        self._own("own-0")
+        for i in range(3):
+            self._own(f"crd-{i}", kind="crd")
+        self._own("ada-own", principal="ada@example.com", resource=self.REVIEWED)
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+            message = self._digest()
+        wait = session_kv_server.DRIFT_BACKLOG_MAX_WAIT_TEXT
+        lines = message.split("\n")
+        self.assertEqual(
+            lines[:6],
+            [
+                "🗂️ **Drift backlog:** 9 changes: they are listed here instead of triaged one card each; 1 needs review.",
+                "1 touched kube-agents' own objects with no Helm upgrade by the same principal seen under way and "
+                "got no drift alert (today's limit is spent, or the alert could not be recorded).",
+                "Review: ada@example.com changed payments/deployments/ledger on prod-us-east1",
+                f"3 reached drift detection late (they queued before it started pulling, or waited over {wait}).",
+                "3 were made to kube-agents' own CRDs, as its installer makes them before an upgrade.",
+                "2 touched only kube-agents' own objects while a Helm upgrade by the same principal was under way.",
+            ],
+        )
+        self.assertTrue(lines[6].startswith("Helm upgrade: "))
+        # The row to review is named once, on its own line, and not among the rest.
+        [including] = [line for line in lines if line.startswith("Including: ")]
+        self.assertNotIn("payments/deployments/ledger", including)
+        time.sleep(0.05)
+        self.trigger.assert_not_called()
+
+    def test_a_card_of_several_causes_keeps_the_lines_that_explain_them_together(self):
+        self._headless()
+        self._burst()
+        self._upgrade_start()
+        self._own("own-0")
+        self._own("ada-own", principal="ada@example.com", resource=self.REVIEWED)
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)), \
+             patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        argv = run.call_args.args[0]
+        body = argv[argv.index("--body") + 1].split("\n")
+        self.assertEqual(body[0], "6 changes; 1 needs review:")
+        self.assertTrue(body[1].startswith("1 touched kube-agents' own objects with no Helm upgrade by the same"))
+        self.assertEqual(body[2], "Review: ada@example.com changed payments/deployments/ledger on prod-us-east1")
+        self.assertEqual(body[5], self.UPGRADE_LINE.format(revision="12", started="2026-09-20 11:04:07"))
+        self.assertEqual(body[6], session_kv_server.DRIFT_BACKLOG_BOARD_REMARK)
+
+    def test_an_own_release_row_the_ceiling_refuses_is_named_as_having_no_upgrade(self):
+        self._chat()
+        for i in range(3):
+            self._own(f"own-{i}")
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+            message = self._digest()
+        lines = message.split("\n")
+        self.assertEqual(
+            lines[0],
+            "🗂️ **Drift backlog:** 3 changes touched kube-agents' own objects with no Helm upgrade by the same "
+            "principal seen under way and got no drift alert (today's limit is spent, or the alert could not be "
+            "recorded), so they are listed here instead of triaged one card each.",
+        )
+        # The ledger does not say why a row was digested, so the digest names the rows to review itself.
+        one = "installer@example.com changed prod/deployments/checkout on prod-us-east1"
+        self.assertEqual(lines[1], "Review: " + ", ".join([one] * 3))
+        self.assertFalse([line for line in lines if line.startswith("Including: ")])
+        self.assertEqual(set(self._marks().values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        time.sleep(0.05)
+        self.trigger.assert_not_called()
+
+    def test_an_oversize_payload_whose_join_failed_keeps_its_own_reason(self):
+        self._chat()
+        owners = [{"manager": "helm", "fields": ["x" * session_kv_server.DRIFT_BACKLOG_PAYLOAD_MAX_CHARS]}]
+        self._own("crd-0", kind="crd", owners=owners, join="failed", lookup_error="forbidden")
+        stored = json.loads(self._rows()[0]["payload"])
+        self.assertEqual((stored["join"], stored["lookup_error"]), ("failed", "forbidden"))
+
+    def test_a_row_carded_as_a_persons_does_not_count_toward_the_three(self):
+        """Two changes by hand to kube-agents' objects get a card each. A CRD
+        edit and a late row by the same person are then two rows, and are
+        carded too: the first two are no burst that a digest speaks for."""
+        self._chat()
+        self._own("hand-0")
+        self._own("hand-1")
+        self._own("crd-alone", kind="crd")
+        self._post(insert_id="late-alone", principal="installer@example.com")
+        self.assertIsNone(self._digest())
+        self.assertEqual(set(self._marks().values()), {session_kv_server.DRIFT_BACKLOG_CARDED})
+        self._wait_for_triggers(4)
+
+    def test_a_time_no_window_can_be_reckoned_from_is_no_time(self):
+        """A time at the edge of what a datetime holds would raise in the
+        window arithmetic, and the rows would stay pending for good."""
+        self._chat()
+        self._upgrade_start(timestamp="9999-12-31T23:59:59Z")
+        self._upgrade_start(revision="13", insert_id="first-year", timestamp="0001-01-01T00:00:00Z")
+        self._own("own-0", timestamp="9999-12-31T23:59:59+14:00")
+        self.assertIsNone(self._digest())
+        self.assertEqual(set(self._marks().values()), {session_kv_server.DRIFT_BACKLOG_CARDED})
+        self._wait_for_triggers(3)
+
+    def test_the_review_line_is_capped_as_the_digests_objects_are(self):
+        self._chat()
+        count = session_kv_server.DRIFT_BACKLOG_MAX_OBJECTS + 2
+        for i in range(count):
+            self._own(f"own-{i}")
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+            message = self._digest()
+        one = "installer@example.com changed prod/deployments/checkout on prod-us-east1"
+        named = ", ".join([one] * session_kv_server.DRIFT_BACKLOG_MAX_OBJECTS)
+        self.assertIn(f"\nReview: {named}, and 2 more\n", message)
+
+    def test_one_late_row_the_ceiling_refuses_is_worded_as_one(self):
+        self._chat()
+        self._post(insert_id="alone")
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+            message = self._digest()
+        wait = session_kv_server.DRIFT_BACKLOG_MAX_WAIT_TEXT
+        self.assertIn(
+            f"1 change reached drift detection late (it queued before the detector started pulling, or waited over {wait}), "
+            "so it is listed here instead of triaged on a card of its own.",
+            message,
+        )
+        self.assertNotIn("Review:", message)
+
+    def test_an_oversize_own_release_payload_keeps_its_marks(self):
+        self._chat()
+        padding = "x" * session_kv_server.DRIFT_BACKLOG_PAYLOAD_MAX_CHARS
+        self._upgrade_start(summary=padding)
+        self._own("own-0", summary=padding)
+        self.assertEqual(
+            sorted(r["payload"] for r in self._rows()),
+            [
+                '{"own_release": "release", "own_release_revision": "12", "timestamp": "2026-09-20T11:04:07Z"}',
+                '{"own_release": "release", "timestamp": "2026-09-20T11:04:07Z"}',
+            ],
+        )
+        message = self._digest()
+        self.assertIn("2 changes touched only kube-agents' own objects while a Helm upgrade", message)
+        self.assertIn(self.UPGRADE_LINE.format(revision="12", started="2026-09-20 11:04:07"), message)
+
+    def test_an_oversize_own_release_payload_loses_only_its_field_ownership(self):
+        """A joined record's field ownership is what grows with the object. A
+        row stored without it still makes a card that says who changed what."""
+        self._chat()
+        owners = [{"manager": "helm", "fields": ["x" * session_kv_server.DRIFT_BACKLOG_PAYLOAD_MAX_CHARS]}]
+        self._own("crd-0", kind="crd", owners=owners)
+        [row] = self._rows()
+        stored = json.loads(row["payload"])
+        self.assertNotIn("owners", stored)
+        self.assertEqual(stored, {k: v for k, v in dict(self.PAYLOAD, **stored).items() if k != "owners"})
+        self.assertEqual(stored["principal"], "installer@example.com")
+        # The join read the ownership; the row does not hold it. A card that
+        # said "read, and no managedFields entries" would state that nothing
+        # manages an object the installer's apply owns.
+        self.assertNotIn("lookup_error", stored)
+        ownership = session_kv_server._drift_ownership_block(stored)
+        self.assertTrue(ownership.startswith("- **Field ownership: read, but too large to keep with this record.**"))
+        self.assertNotIn("Nothing is managing it", ownership)
+        self.assertNotIn("not read", ownership)
+        self.assertIsNone(self._digest())
+        self._wait_for_triggers(1)
+        carded = self.trigger.call_args.args[2]
+        self.assertEqual(carded["summary"], self.PAYLOAD["summary"])
+        self.assertEqual(carded["resource"], self.PAYLOAD["resource"])
+        self.assertEqual(carded["user_agent"], self.PAYLOAD["user_agent"])
+
+    def test_an_upgrade_digest_with_no_chat_route_is_a_card_that_names_the_upgrade(self):
+        self._headless()
+        self._upgrade_start()
+        for i in range(2):
+            self._own(f"own-{i}")
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[3], "Drift backlog: 3 changes listed here, not triaged one card each")
+        body = argv[argv.index("--body") + 1]
+        self.assertTrue(body.startswith("3 changes touched only kube-agents' own objects while a Helm upgrade"))
+        self.assertIn(self.UPGRADE_LINE.format(revision="12", started="2026-09-20 11:04:07"), body)
+        self.assertNotIn("late", body.split("By principal")[0])
+        self.assertEqual(set(self._marks().values()), {session_kv_server.DRIFT_BACKLOG_HEADLESS})
+
+    def test_a_card_of_one_own_release_row_is_titled_as_one(self):
+        self._headless()
+        self._upgrade_start()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual(run.call_args.args[0][3], "Drift backlog: 1 change listed here, not triaged on a card of its own")
 
     def test_an_install_with_no_chat_route_files_one_blocked_card(self):
         self._headless()
