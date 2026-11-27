@@ -3506,14 +3506,19 @@ every message through either stamps its own backend.
   connection is answered with the task the first attempt started, and starts nothing.
 - `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
   caller started is not found rather than forbidden, so the door confirms no id it will not
-  serve. The door holds tasks in the active gateway's memory only, so after a gateway restart
-  or a failover to another replica the new gateway doesn't know a task the old one accepted.
-  The task itself is not lost: its executor may have finished it or may still be running it.
-  Every not-found answer (`-32001`, here and for `tasks/cancel` and a follow-up's `taskId`)
+  serve. A task the door doesn't hold in memory (after a gateway restart, a failover to
+  another replica, or an eviction) is read from its conversation's session record and the
+  task's stream: a door task keeps a `doortasks.<id>` index entry, naming its conversation, for
+  as long as the conversation's record lists the task (its last 50), and the read answers only
+  the caller whose conversation it is. A terminal on the stream gives that terminal and the
+  result; no terminal gives `working` only while the record still holds the task as active.
+  Such a task carries `metadata.recovered: true`, and has no posts in its history. Past that
+  (the record no longer lists it, or its end has left the stream) the door doesn't know the
+  task. Every not-found answer (`-32001`, here and for `tasks/cancel` and a follow-up's `taskId`)
   carries `data` a client acts on without reading the message: `reason`, `servingSince` (when
   this gateway started serving the door) and `mayHaveRun: true`. `reason` is `evicted` for the
   caller's own task the door dropped to stay inside its bounds, and `not-held-since-serving`
-  for anything else: a task submitted before `servingSince`, the caller's own task evicted so long
+  for anything else: a task past the read above, the caller's own task evicted so long
   ago that the door no longer remembers it (it keeps 4096 such ids), and equally another caller's
   id or one no door minted, so the answer still confirms nothing. A client that resubmits with a
   new `messageId` starts the task again and should expect possible duplicate work: the

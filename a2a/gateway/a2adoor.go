@@ -105,13 +105,13 @@ const (
 	// a2aNotHeldEvicted: the door held the caller's task and evicted it to
 	// stay inside its bounds, running or not.
 	a2aNotHeldEvicted = "evicted"
-	// a2aNotHeldSinceServing: this gateway holds no record of the id. The
-	// door keeps tasks in the active gateway's memory only, so a task
-	// submitted before servingSince, before a restart or failover, is
-	// unknown here: its executor may have finished it or may still be
-	// running it. Also the answer for an id that is another caller's or
-	// that no door minted, so it confirms nothing about ids the caller
-	// can't read.
+	// a2aNotHeldSinceServing: this gateway holds no record of the id. A
+	// task the door doesn't hold in memory is read from its conversation's
+	// session record and the stream (recoverTask) while the record lists it
+	// and its end is on the stream, so this is a task past that: its
+	// executor may have finished it or may still be running it. Also the
+	// answer for an id that is another caller's or that no door minted, so
+	// it confirms nothing about ids the caller can't read.
 	a2aNotHeldSinceServing = "not-held-since-serving"
 
 	// a2aMaxEvictedIDs bounds the ids the door remembers having evicted,
@@ -203,8 +203,12 @@ type a2aTask struct {
 	// cancelPublished: a cancel for this task reached the bus, so a retried
 	// tasks/cancel is answered with the task, not refused.
 	cancelPublished bool
-	created         time.Time
-	updated         time.Time
+	// recovered: the door rebuilt this task from the record and the stream
+	// rather than seeing it start (recoverTask), so its posts and rolling
+	// line aren't there; metadata.recovered says so.
+	recovered bool
+	created   time.Time
+	updated   time.Time
 }
 
 // a2aConversation is one caller's context: the turn accounting message/send
@@ -351,6 +355,9 @@ type A2ADoor struct {
 	// and not read yet: the read that consults it, for a task the door
 	// stopped holding across a restart, is a later change.
 	probe ConversationProbe
+	// locate is the gateway's door task index (TaskLocatorSink), under mu:
+	// how a task this door didn't see start is found (recoverTask).
+	locate TaskLocator
 
 	// listener, when set, is an already-bound listener Run serves on. Test
 	// injection only.
@@ -745,7 +752,7 @@ func (d *A2ADoor) send(r *http.Request, verified string, handler func(InboundMes
 		// A follow-up onto a task: it lands on that task's conversation,
 		// where the gateway treats it as a steer. The task must be the
 		// caller's own and still running.
-		task, ok := d.taskFor(msg.TaskID, caller)
+		task, ok := d.heldOrRecovered(r.Context(), msg.TaskID, caller)
 		if !ok {
 			return d.a2aTaskNotHeld(req.ID, msg.TaskID, caller)
 		}
@@ -890,7 +897,7 @@ func (d *A2ADoor) get(r *http.Request, verified string, req rpcRequest) rpcRespo
 	if strings.TrimSpace(params.ID) == "" {
 		return rpcFail(req.ID, rpcInvalidParams, "id is required", nil)
 	}
-	if _, ok := d.taskFor(params.ID, caller); !ok {
+	if _, ok := d.heldOrRecovered(r.Context(), params.ID, caller); !ok {
 		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
 	}
 	obj := d.taskObject(params.ID)
@@ -916,7 +923,7 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	if strings.TrimSpace(params.ID) == "" {
 		return rpcFail(req.ID, rpcInvalidParams, "id is required", nil)
 	}
-	task, ok := d.taskFor(params.ID, caller)
+	task, ok := d.heldOrRecovered(r.Context(), params.ID, caller)
 	if !ok {
 		return d.a2aTaskNotHeld(req.ID, params.ID, caller)
 	}
@@ -1642,13 +1649,14 @@ func (d *A2ADoor) a2aTaskNotHeld(id json.RawMessage, taskID, caller string) rpcR
 	if wasEvicted && evictedCaller == caller {
 		data.Reason = a2aNotHeldEvicted
 		return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
-			"; the door held it and evicted it to stay inside its bounds, so its outcome is unknown here: "+
+			"; the door held it and evicted it to stay inside its bounds, and its conversation's record no longer lists it, so its outcome is unknown here: "+
 			"it may have run or may still be running. Resubmitting with a new messageId starts it again; "+
 			"reusing the original messageId does not", data)
 	}
 	return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
-		"; the A2A door keeps tasks in the active gateway's memory only, and this gateway has served the door since "+
-		data.ServingSince+": a task submitted before then is unknown here and may have run or may still be running. "+
+		"; this gateway has served the A2A door since "+data.ServingSince+
+		", and no conversation of this caller's still lists the task: one that has left its conversation's record, or whose end is no longer on the bus, "+
+		"is unknown here and may have run or may still be running. "+
 		"Resubmitting starts it again, and a repeated messageId doesn't dedupe across a restart", data)
 }
 
@@ -1743,6 +1751,9 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 	}
 	if task.terminal {
 		metadata["terminalSource"] = string(task.source)
+	}
+	if task.recovered {
+		metadata["recovered"] = true
 	}
 	return a2aTaskObject{
 		ID: task.id, ContextID: task.contextID, Status: status,

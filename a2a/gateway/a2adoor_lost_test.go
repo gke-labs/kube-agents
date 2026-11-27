@@ -24,9 +24,10 @@ func notHeldData(t *testing.T, resp rpcResponse) a2aNotHeldData {
 	return data
 }
 
-// A task accepted by one gateway and asked after on another, as after a
-// restart or a failover to the other replica: the new gateway holds no
-// record of it, and the error says so in data a client can act on, with
+// A task accepted by one gateway and asked after on another that has no
+// record of it at all (here, a gateway on another bus; across a handover on
+// the same bus the door reads the task from its record, door_recovery_test):
+// the error says so in data a client can act on, with
 // when this gateway started serving the door and that the task may have
 // run (its outcome is unknown here, so a resubmit may duplicate it). It keeps the protocol's task-not-found code, so a client
 // that reads only the code behaves as before.
@@ -78,6 +79,9 @@ func TestAnEvictedTaskIsReportedEvictedToItsCallerAlone(t *testing.T) {
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("short-lived", "m-evict", "", false)))
 	r.door.mu.Lock()
+	// No door task index to read the task back from: an evicted task the
+	// record still lists is recovered instead (TestAnEvictedTaskComesBackFromItsRecord).
+	r.door.locate = nil
 	for len(r.door.taskOrder) > 0 {
 		r.door.evictOldestTaskLocked(nil)
 	}
@@ -90,6 +94,24 @@ func TestAnEvictedTaskIsReportedEvictedToItsCallerAlone(t *testing.T) {
 	other := notHeldData(t, r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": task.ID}))
 	if other.Reason != a2aNotHeldSinceServing {
 		t.Errorf("another caller learns the id was evicted: data = %+v", other)
+	}
+}
+
+// An evicted task its conversation's record still lists comes back from the
+// record and the stream, for its caller only.
+func TestAnEvictedTaskComesBackFromItsRecord(t *testing.T) {
+	r := startA2ARig(t)
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("evicted but listed", "m-evict-back", "", false)))
+	r.door.mu.Lock()
+	for len(r.door.taskOrder) > 0 {
+		r.door.evictOldestTaskLocked(nil)
+	}
+	r.door.mu.Unlock()
+	if got := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodGet, map[string]any{"id": task.ID})); got.ID != task.ID || got.Metadata["recovered"] != true {
+		t.Errorf("the owner's evicted task reads %+v, want it recovered", got)
+	}
+	if other := notHeldData(t, r.rpc(t, a2aTestOtherCaller, a2aMethodGet, map[string]any{"id": task.ID})); other.Reason != a2aNotHeldSinceServing {
+		t.Errorf("another caller: data = %+v", other)
 	}
 }
 

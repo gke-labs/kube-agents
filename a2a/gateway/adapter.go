@@ -614,6 +614,19 @@ type ProbeSink interface {
 	SetProbe(ConversationProbe)
 }
 
+// TaskLocator answers which door conversation's record lists a task, or ""
+// when none does (Registry.LocateDoorTask). It says where a task is, not
+// whose: the door checks the conversation is its caller's before it reads
+// the task. It may delete an index entry it finds leading nowhere, so only
+// the active gateway hands it out.
+type TaskLocator func(ctx context.Context, taskID string) (string, error)
+
+// TaskLocatorSink is the optional extension a door implements to find a
+// task it didn't see start, as after a gateway handover (#7454).
+type TaskLocatorSink interface {
+	SetTaskLocator(TaskLocator)
+}
+
 // SessionLookup answers whether the gateway has started a task in a
 // conversation and the session is not idle past the idle TTL, and, with a
 // true, the moment that answer stops being trustworthy. A running task
