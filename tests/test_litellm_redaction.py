@@ -677,6 +677,32 @@ class TestCallback(unittest.TestCase):
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": ok}]})["messages"][0]["content"]
         self.assertIn("[REDACTED_SECRET]", out)
 
+    def test_decoding_tool_output_never_masks_less_than_the_text_rules_did(self) -> None:
+        # A JSON string under a credential key, and a number there, are masked
+        # whole as before decoding; decoding must not open them up.
+        cases = [
+            ('{"token": "{\\"v\\":\\"opaque-zz\\"}"}', "opaque-zz"),
+            ('{"token": 123456789, "n":"x"}', "123456789"),
+            ('{"password": 98765432}', "98765432"),
+            ('{"outer": {"token": "[\\"opaque-zz\\"]"}}', "opaque-zz"),
+        ]
+        for text, secret in cases:
+            with self.subTest(text=text):
+                out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
+                self.assertNotIn(secret, out)
+        # The same at the Gemini response level, where the response is already
+        # a mapping: a JSON string under a credential key stays a string and is
+        # masked whole.
+        for key in ("token", "password", "apiKey"):
+            with self.subTest(key=key):
+                req = {"contents": [{"role": "user", "parts": [{"functionResponse": {"name": "t", "response": {key: '{"v":"opaque-zz"}'}}}]}]}
+                out = self._run(req, "agenerate_content")["contents"][0]["parts"][0]["functionResponse"]["response"]
+                self.assertNotIn("opaque-zz", json.dumps(out))
+        # A Secret's data value that is itself JSON is masked whole, not opened.
+        secret = json.dumps({"kind": "Secret", "data": {"cfg": '{"v":"opaque-zz"}'}})
+        out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": secret}]})["messages"][0]["content"]
+        self.assertNotIn("opaque-zz", out)
+
     def test_a_tool_output_with_a_repeated_key_is_re_encoded_from_what_was_walked(self) -> None:
         text = '{"auth":"opaque-value-xyz","auth":"second-value-abc"}'
         out = self._run({"messages": [{"role": "tool", "tool_call_id": "x", "content": text}]})["messages"][0]["content"]
