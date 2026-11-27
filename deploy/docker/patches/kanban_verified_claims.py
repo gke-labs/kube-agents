@@ -35,8 +35,8 @@ verify-on-stop is on; a ``kubectl`` or ``gcloud`` read is never in it.
 
 What a claim is
 ---------------
-Only an entry in ``verified_claims`` is a verified claim. Prose in ``result``
-is not parsed. Each entry gives ``claim``, ``command`` and ``excerpt``:
+Only an entry in ``verified_claims`` is a verified claim; ``verified_claims_rule``
+does not parse prose in ``result``. Each entry gives ``claim``, ``command`` and ``excerpt``:
 
 - ``command`` must equal, after whitespace is collapsed, a terminal command
   this card ran;
@@ -101,7 +101,10 @@ Limits
   deception. It proves that a command string ran and printed the excerpt, not
   where its output came from: a worker can change ``PATH`` or ``KUBECONFIG``
   in the sandbox between calls.
-- Prose in ``result`` is not checked. A card can skip ``verified_claims`` and
+- Prose in ``result`` is not checked by ``verified_claims_rule`` (a separate
+  rule, :func:`gitops_preflight_consistency_rule`, checks ``result`` only for
+  contradictions against a ``gitops_preflight.py --list`` output recorded on
+  the same card). A card can skip ``verified_claims`` and
   write the evidence heading by hand; the platform and cluster ``SOUL.md``
   rules, not this gate, cover that. A card that quotes a child card's result
   carries that child's real heading, so the heading alone proves nothing.
@@ -527,6 +530,159 @@ def verified_claims_rule(
     return reasons, append_section(result, render_evidence(stored)), metadata
 
 
+#: Exit codes of ``agents/platform/scripts/gitops_preflight.py --list``.
+PREFLIGHT_EXIT_REGISTERED = 0
+PREFLIGHT_EXIT_NO_REPO = 3
+PREFLIGHT_NO_REGISTERED_TOKEN = "NO_REGISTERED_REPO:"
+#: Identifies a real ``gitops_preflight.py --list`` invocation (not grep/cat).
+PREFLIGHT_LIST_CMD_RE = re.compile(
+    r"\bpython3?\b[^;&|\n]*\bgitops_preflight\.py(?:\s|$)[^;&|\n]*--list\b"
+)
+#: Matches exact ``MANAGED: none`` in whitespace-collapsed preflight output
+#: (never ``MANAGED: none usable (...)``).
+PREFLIGHT_MANAGED_NONE_RE = re.compile(r"(?:^|\s)MANAGED:\s+none\s+CONTEXT:(?:\s|$)")
+#: Matches a concrete ``MANAGED: <repo...>`` list in whitespace-collapsed output.
+PREFLIGHT_MANAGED_REPOS_RE = re.compile(r"(?:^|\s)MANAGED:\s+(.+?)\s+CONTEXT:(?:\s|$)")
+PREFLIGHT_NONE_WORD = "none"
+#: A ``[next: ...]`` button proposing a pull/merge request.
+PREFLIGHT_PR_NEXT_STEP_RE = re.compile(
+    r"(?im)^[^\S\n]*\[next:[^\]\n]*\b(?:pr|mr|pull\s+request|merge\s+request)\b[^\]\n]*\][^\S\n]*$"
+)
+#: Phrases that contradict an observed ``MANAGED: none`` preflight result.
+PREFLIGHT_CONTRADICTS_NO_REPO_RE = re.compile(
+    r"(?i)\bregistered\s+repo\s*:\s*none\b"
+    r"|\basked\s+for\s+diagnosis\s+only\b"
+    r"|\bin\s+your\s+gitops\s+repo(?:sitory)?\b"
+)
+PREFLIGHT_WHAT_TO_DO_RE = re.compile(r"(?im)^[^\S\n]*##\s+What\s+to\s+do\b")
+PREFLIGHT_FENCE_RE = re.compile(r"(?im)^[^\S\n]*(?:```|~~~)")
+PREFLIGHT_REGISTRATION_HINT_RE = re.compile(
+    r"spec\.integration\.repositories|--gitops-repo|\bintegration:\s*\n[ \t]+repositories:",
+    re.IGNORECASE,
+)
+PREFLIGHT_STATES_NO_REPO_RE = re.compile(
+    r"(?i)\bno\s+(?:(?:usable|managed|registered|configured)\s+)*(?:gitops\s+)?repo(?:sitor(?:y|ies))?\b"
+    r"|\bno\s+(?:[\w-]+\s+){0,2}forge\b"
+)
+PREFLIGHT_STATES_NO_PR_RE = re.compile(
+    r"(?i)\bno\s+(?:pull\s+request|merge\s+request|pr|mr)\s+(?:was\s+|has\s+been\s+|will\s+be\s+|can\s+be\s+)?"
+    r"(?:opened|created|submitted)"
+    r"|(?:not|did\s+not|didn't|cannot|can't)\s+open\s+(?:a\s+)?(?:pull\s+request|merge\s+request|pr|mr)\b"
+)
+PREFLIGHT_FALSE_NO_REPO_RE = re.compile(
+    r"(?i)\bno\s+(?:(?:usable|managed|registered|configured)\s+)*(?:gitops|managed)\s+repo(?:sitor(?:y|ies))?"
+    r"\s+(?:is|are)\s+(?:configured|registered)\b"
+)
+PREFLIGHT_NO_REPO_SENTENCE = "No GitOps repository is configured, so no pull request was opened."
+
+
+def _latest_gitops_preflight_state(calls: list) -> tuple[str | None, str]:
+    """Return ``("none", "")`` or ``("registered", "<repos>")`` from the last
+    ``gitops_preflight.py --list`` call recorded on this card, else ``(None, "")``."""
+    state: tuple[str | None, str] = (None, "")
+    for call in calls:
+        cmd = str(call.get("command") or "")
+        if not PREFLIGHT_LIST_CMD_RE.search(cmd):
+            continue
+        state = (None, "")
+        exit_code = call.get("exit_code")
+        output = str(call.get("output") or "")
+        if PREFLIGHT_MANAGED_NONE_RE.search(output) and (
+            exit_code == PREFLIGHT_EXIT_NO_REPO or PREFLIGHT_NO_REGISTERED_TOKEN in output
+        ):
+            state = ("none", "")
+        elif exit_code == PREFLIGHT_EXIT_REGISTERED:
+            match = PREFLIGHT_MANAGED_REPOS_RE.search(output)
+            if match:
+                repos_text = match.group(1).strip()
+                if repos_text and repos_text.split()[0].lower() != PREFLIGHT_NONE_WORD:
+                    state = ("registered", repos_text)
+    return state
+
+
+def _strip_pr_next_steps(text: str) -> str:
+    """Drop dead ``[next: ... PR ...]`` button lines when no repository is registered."""
+    kept = [line for line in text.splitlines() if not PREFLIGHT_PR_NEXT_STEP_RE.match(line)]
+    return "\n".join(kept).rstrip()
+
+
+def _is_remediation_report(result: str, *, has_pr_button: bool, has_contradiction: bool) -> bool:
+    """True when ``result`` is a remediation/proposal report rather than a repo listing
+    or a no-op false-signal stand-down."""
+    if has_pr_button or has_contradiction or PREFLIGHT_WHAT_TO_DO_RE.search(result):
+        return True
+    if PREFLIGHT_STATES_NO_PR_RE.search(result):
+        return True
+    if PREFLIGHT_FENCE_RE.search(result):
+        # A plain "which repos do you manage?" reply showing how to register a repo
+        # carries a registration snippet (YAML or --gitops-repo) and no remediation heading.
+        if PREFLIGHT_STATES_NO_REPO_RE.search(result) and PREFLIGHT_REGISTRATION_HINT_RE.search(result):
+            return False
+        return True
+    return False
+
+
+def gitops_preflight_consistency_rule(
+    *, result: object, metadata: object, calls: list, retry: bool, **_
+) -> tuple[list, object, object]:
+    """Keep ``kanban_complete.result`` consistent with the card's own
+    ``gitops_preflight.py --list`` output (see :data:`RULES`).
+
+    Runs before :func:`verified_claims_rule` so it inspects only the worker's
+    own ``result`` (never appended evidence fences) and strips any dead PR
+    ``[next: ...]`` line on retry before evidence is appended.
+
+    When ``gitops_preflight.py --list`` printed exact ``MANAGED: none``, refuses
+    once if ``result`` offers a dead PR/MR ``[next: ...]`` button, claims the
+    ask was diagnosis-only / ``(registered repo: none)``, tells the user to edit
+    a GitOps repository, or omits why no PR was opened on a remediation report.
+    When ``gitops_preflight.py --list`` exited 0 with a concrete ``MANAGED:``
+    repository, refuses once if ``result`` falsely claims no GitOps or managed
+    repository is configured.
+    """
+    if not isinstance(result, str) or not result.strip():
+        return [], result, metadata
+    state, repos_text = _latest_gitops_preflight_state(calls)
+    if state is None:
+        return [], result, metadata
+
+    reasons: list[str] = []
+    if state == "none":
+        has_pr_button = bool(PREFLIGHT_PR_NEXT_STEP_RE.search(result))
+        has_contradiction = bool(PREFLIGHT_CONTRADICTS_NO_REPO_RE.search(result))
+        is_remediation = _is_remediation_report(
+            result, has_pr_button=has_pr_button, has_contradiction=has_contradiction
+        )
+        if has_pr_button:
+            reasons.append(
+                "gitops_preflight.py --list returned MANAGED: none (no GitOps repository is "
+                "configured), so remove the [next: ...] pull-request button."
+            )
+        if has_contradiction:
+            reasons.append(
+                "gitops_preflight.py --list returned MANAGED: none (no GitOps repository is "
+                "configured). Do not say the request asked for diagnosis only, do not write "
+                "'(registered repo: none)', and do not tell the user to edit a GitOps repository."
+            )
+        if is_remediation and not (
+            PREFLIGHT_STATES_NO_REPO_RE.search(result) and PREFLIGHT_STATES_NO_PR_RE.search(result)
+        ):
+            reasons.append(
+                "gitops_preflight.py --list returned MANAGED: none. State verbatim in result: "
+                f'"{PREFLIGHT_NO_REPO_SENTENCE}"'
+            )
+        if retry and has_pr_button:
+            result = _strip_pr_next_steps(result)
+        return reasons, result, metadata
+
+    if PREFLIGHT_FALSE_NO_REPO_RE.search(result):
+        reasons.append(
+            f"gitops_preflight.py --list exited 0 with MANAGED: {repos_text}. Do not claim no "
+            f"GitOps repository is configured; name {repos_text} instead."
+        )
+    return reasons, result, metadata
+
+
 #: The rules :func:`apply_completion_rules` runs, in order. Each is called with
 #: keyword arguments ``task_id``, ``args`` (the ``kanban_complete`` arguments),
 #: ``result``, ``metadata``, ``calls`` (:func:`card_terminal_calls`), ``retry``,
@@ -537,7 +693,7 @@ def verified_claims_rule(
 #: is then accepted whatever the reasons, so a rule must return a ``result``
 #: and ``metadata`` that are safe to store as they are. A rule should accept
 #: ``**kwargs`` so that a new argument does not break it.
-RULES: list = [verified_claims_rule]
+RULES: list = [gitops_preflight_consistency_rule, verified_claims_rule]
 
 
 def apply_completion_rules(

@@ -993,7 +993,7 @@ variable "enable_pubsub_platform" {
 }
 
 variable "enable_stockout_investigator" {
-  description = "Enable the GKE Stockout Investigator AgentPlugin (diagnoses autoscaler capacity failures and proposes GitOps PRs). Automatically enables the `pubsub-platform` adapter (`AgentPlugin/pubsubplatform`) for alert ingress."
+  description = "Enable the GKE Stockout Investigator AgentPlugin (diagnoses autoscaler capacity failures and proposes GitOps PRs, or posts chat-only diagnostic reports without a GitOps repository). Automatically enables the `pubsub-platform` adapter (`AgentPlugin/pubsubplatform`) for alert ingress."
   type        = bool
   default     = false
 }

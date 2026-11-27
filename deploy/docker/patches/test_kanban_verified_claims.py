@@ -584,5 +584,153 @@ class ApplierTest(unittest.TestCase):
         self.assertNotIn(MARKER, (root / TERMINAL_RELATIVE).read_text())
 
 
+PREFLIGHT_LIST_CMD = 'python3 "$HERMES_HOME"/scripts/gitops_preflight.py --list'
+PREFLIGHT_NONE_OUT = (
+    "MANAGED: none\nCONTEXT: none\n"
+    "NO_REGISTERED_REPO: this install has no registered GitOps repository."
+)
+PREFLIGHT_UNUSABLE_OUT = (
+    "MANAGED: none usable (1 registered, unusable: github.example.com:8443/acme/fleet)\n"
+    "CONTEXT: none\nNO_REGISTERED_REPO: 1 registered entry is not usable."
+)
+PREFLIGHT_REPO_OUT = "MANAGED: gitea-http.gitea.svc.cluster.local/platform-ops/gke-fleet-iac\nCONTEXT: none"
+
+
+class GitopsPreflightConsistencyRuleTest(GateTestCase):
+    def test_managed_none_accepts_verbatim_no_repo_remediation_report(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        report = (
+            "**inference-server cannot scale up.**\n\n## What to do\n\n"
+            "No GitOps repository is configured, so no pull request was opened.\n\n"
+            "```yaml\nautoscaling:\n  maxNodeCount: 4\n```"
+        )
+        err, out, _ = run_rules(CARD, None, report, None)
+        self.assertIsNone(err)
+        self.assertEqual(out, report)
+
+    def test_managed_none_refuses_diagnosis_only_and_dead_pr_button_and_strips_on_retry(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        bad = (
+            "**inference-server cannot scale up.**\n\n## What to do\n\n"
+            "No pull request was opened because this request asked for diagnosis only (registered repo: none).\n\n"
+            "```yaml\n# Apply in your GitOps repository\nautoscaling:\n  maxNodeCount: 4\n```\n"
+            "[next: open a remediation PR]"
+        )
+        err, _, _ = run_rules(CARD, None, bad, None)
+        self.assertIsNotNone(err)
+        self.assertIn("remove the [next: ...] pull-request button", err)
+        self.assertIn("No GitOps repository is configured, so no pull request was opened.", err)
+        # Retry never wedges and strips the dead PR button.
+        with self.assertLogs(kvc.logger, "WARNING"):
+            err2, cleaned, _ = run_rules(CARD, None, bad, None)
+        self.assertIsNone(err2)
+        self.assertNotIn("[next: open a remediation PR]", cleaned)
+
+    def test_managed_none_refuses_remediation_yaml_that_omits_no_pr_sentence(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        omitted = "**Cannot scale up.**\n\nRaise maxNodeCount:\n\n```yaml\nmaxNodeCount: 4\n```"
+        err, _, _ = run_rules(CARD, None, omitted, None)
+        self.assertIsNotNone(err)
+        self.assertIn(kvc.PREFLIGHT_NO_REPO_SENTENCE, err)
+
+    def test_managed_none_leaves_plain_repo_listing_and_false_signal_alone(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        for benign in (
+            "No GitOps repositories are registered on this install.",
+            "**inference-server in seeded-capacity has no Pending pods with scheduling errors; no capacity remediation is needed.**",
+        ):
+            with self.subTest(benign=benign[:40]):
+                err, out, _ = run_rules(CARD, None, benign, None)
+                self.assertIsNone(err)
+                self.assertEqual(out, benign)
+
+    def test_managed_none_usable_is_not_treated_as_managed_none(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_UNUSABLE_OUT, exit_code=3)
+        report = "## What to do\n\nThe configured repository entry is unusable, so no pull request was opened.\n\n```yaml\nmaxNodeCount: 4\n```"
+        err, out, _ = run_rules(CARD, None, report, None)
+        self.assertIsNone(err)
+        self.assertEqual(out, report)
+
+    def test_registered_repo_refuses_false_no_gitops_repo_claim_and_allows_valid_offer(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_REPO_OUT, exit_code=0)
+        wrong = "## What to do\n\nNo GitOps repository is configured, so no pull request was opened."
+        err, _, _ = run_rules(CARD, None, wrong, None)
+        self.assertIsNotNone(err)
+        self.assertIn("gitea-http.gitea.svc.cluster.local/platform-ops/gke-fleet-iac", err)
+
+        good = (
+            "## What to do\n\nNo pull request was opened because this request asked for diagnosis only; "
+            "gitea-http.gitea.svc.cluster.local/platform-ops/gke-fleet-iac is registered if you want a remediation PR.\n\n"
+            "[next: open a remediation PR]"
+        )
+        err2, out2, _ = run_rules(CARD, None, good, None)
+        self.assertIsNone(err2)
+        self.assertEqual(out2, good)
+
+    def test_false_signal_with_verified_claims_is_not_refused_by_evidence_fences(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        record()
+        stand_down = (
+            "**inference-server in seeded-capacity has no Pending pods with scheduling errors; "
+            "no capacity remediation is needed.**"
+        )
+        err, out, _ = run_rules(CARD, [GOOD], stand_down, None)
+        self.assertIsNone(err)
+        self.assertIn(kvc.EVIDENCE_HEADING, out)
+
+    def test_repo_listing_with_registration_yaml_snippet_passes(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        for answer in (
+            "No GitOps repositories are registered on this install. Register one:\n\n"
+            "```yaml\nspec:\n  integration:\n    repositories:\n      - repository: org/repo\n```",
+            "No GitOps repositories are registered on this install. Re-run the installer:\n\n"
+            "```bash\n./install.sh --gitops-repo org/repo\n```",
+        ):
+            with self.subTest(answer=answer[:45]):
+                err, out, _ = run_rules(CARD, None, answer, None)
+                self.assertIsNone(err)
+                self.assertEqual(out, answer)
+
+    def test_drift_no_usable_gitops_line_passes(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_NONE_OUT, exit_code=3)
+        drift = (
+            "## What to do\n\n"
+            "- No usable GitOps repository is registered with this install, so the agent cannot "
+            "open a pull request to revert or codify this change."
+        )
+        err, out, _ = run_rules(CARD, None, drift, None)
+        self.assertIsNone(err)
+        self.assertEqual(out, drift)
+
+    def test_compound_or_true_preflight_catches_managed_none_and_clears_earlier_state(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_REPO_OUT, exit_code=0)
+        record(
+            command=f"{PREFLIGHT_LIST_CMD} || true\nkubectl config get-contexts -o name",
+            output=f"{PREFLIGHT_NONE_OUT}\ngke_proj_zone_cluster",
+            exit_code=0,
+        )
+        bad = (
+            "## What to do\n\nNo pull request was opened because this request asked for diagnosis only.\n"
+            "\u00a0[next: open a merge request]"
+        )
+        err, _, _ = run_rules(CARD, None, bad, None)
+        self.assertIsNotNone(err)
+        self.assertIn("remove the [next: ...] pull-request button", err)
+        with self.assertLogs(kvc.logger, "WARNING"):
+            err2, cleaned, _ = run_rules(CARD, None, bad, None)
+        self.assertIsNone(err2)
+        self.assertNotIn("open a merge request", cleaned)
+
+    def test_registered_repo_with_no_context_repos_is_not_falsely_refused(self):
+        record(command=PREFLIGHT_LIST_CMD, output=PREFLIGHT_REPO_OUT, exit_code=0)
+        answer = (
+            "**Managed repository: gitea-http.gitea.svc.cluster.local/platform-ops/gke-fleet-iac.**\n\n"
+            "For read-only context, no repositories are configured."
+        )
+        err, out, _ = run_rules(CARD, None, answer, None)
+        self.assertIsNone(err)
+        self.assertEqual(out, answer)
+
+
 if __name__ == "__main__":
     unittest.main()

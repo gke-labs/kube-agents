@@ -1542,5 +1542,264 @@ class TestRouterEnvCarriesTheRosterInputs(unittest.TestCase):
             self.assertEqual(env.get(name), "${" + name + "}", name)
 
 
+class TestInstalledProfilePlugins(unittest.TestCase):
+    """Mounted profile-targeted AgentPlugins appear on that profile's roster line and stay absent when off."""
+
+    def test_mount_root_matches_profile_plugins_script(self):
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location(
+            "_test_profile_plugins",
+            repo_root / "deploy" / "shared" / "profile_plugins.py",
+        )
+        self.assertIsNotNone(spec)
+        shared_dir = str(repo_root / "deploy" / "shared")
+        added = shared_dir not in sys.path
+        if added:
+            sys.path.insert(0, shared_dir)
+        try:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.assertEqual(str(agent_roster.AGENT_PLUGINS_MOUNT_ROOT), mod.DEFAULT_MOUNT_ROOT)
+        finally:
+            if added:
+                sys.path.remove(shared_dir)
+
+    def test_mounted_plugin_skills_render_only_when_linked_and_invalidate_cache(self):
+        from unittest import mock
+
+        _forget()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "profiles"
+            mount_root = root / "agent-plugins"
+            base.mkdir()
+            platform_dir = base / "platform"
+            platform_dir.mkdir()
+            (platform_dir / "CAPABILITIES.md").write_text("Platform specialist.\n", encoding="utf-8")
+            # A built-in directory (not a symlink under mount_root) is never advertised as an AgentPlugin.
+            (platform_dir / "plugins" / "hermes_otel").mkdir(parents=True)
+            _age(platform_dir / "plugins")
+            _age(base)
+
+            with mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root):
+                off_out = _render_roster(base, {})
+                self.assertIn("- platform: Platform specialist.", off_out)
+                self.assertNotIn("installed plugins", off_out)
+
+                # Mount and link gkestockoutinvestigator with plugin.yaml
+                plugin_src = mount_root / "platform" / "gkestockoutinvestigator"
+                plugin_src.mkdir(parents=True)
+                (plugin_src / "plugin.yaml").write_text(
+                    "name: gkestockoutinvestigator\nprovides_skills: [gke-stockout-investigator]\n",
+                    encoding="utf-8",
+                )
+                link = platform_dir / "plugins" / "gkestockoutinvestigator"
+                link.symlink_to(plugin_src, target_is_directory=True)
+                # Also add a dangling symlink that must be ignored.
+                dangling = platform_dir / "plugins" / "staleplugin"
+                dangling.symlink_to(mount_root / "platform" / "gone", target_is_directory=True)
+                for p in (mount_root, mount_root / "platform", platform_dir / "plugins"):
+                    _age(p, seconds=CACHE_REAGED_SECONDS)
+
+                on_out = _render_roster(base, {})
+                self.assertIn(
+                    "- platform (installed plugins: gkestockoutinvestigator:gke-stockout-investigator): Platform specialist.",
+                    on_out,
+                )
+                self.assertNotIn("staleplugin", on_out)
+                self.assertNotIn("hermes_otel", on_out)
+
+                # Cache hit with plugins installed: zero reads on the next call.
+                with _counting_reads() as counts:
+                    cached_out = _render_roster(base, {})
+                self.assertEqual(cached_out, on_out)
+                self.assertEqual(counts["reads"].call_count, 0)
+
+                # Removing the symlink inside an already-existing mount_root invalidates the cache.
+                link.unlink()
+                _age(platform_dir / "plugins", seconds=CACHE_AGED_SECONDS - 10)
+                removed_out = _render_roster(base, {})
+                self.assertIn("- platform: Platform specialist.", removed_out)
+                self.assertNotIn("installed plugins", removed_out)
+        _forget()
+
+    def test_yaml_block_lists_nested_keys_comments_and_symlink_boundaries(self):
+        from unittest import mock
+
+        _forget()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "profiles"
+            mount_root = root / "agent-plugins"
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "plugin.yaml").write_text("name: escaped\nprovides_skills: [bad]\n", encoding="utf-8")
+
+            base.mkdir()
+            platform_dir = base / "platform"
+            (platform_dir / "plugins").mkdir(parents=True)
+            (platform_dir / "CAPABILITIES.md").write_text("Platform specialist.\n", encoding="utf-8")
+
+            # Zero-indented YAML block list + nested `name:` + inline comment.
+            p1 = mount_root / "platform" / "zero_indent"
+            p1.mkdir(parents=True)
+            (p1 / "plugin.yaml").write_text(
+                "name: alpha # top-level name\n"
+                "author:\n"
+                "  name: WrongAuthor\n"
+                "provides_skills:\n"
+                "- skill-one # first\n"
+                "- 'skill-two'\n",
+                encoding="utf-8",
+            )
+            (platform_dir / "plugins" / "zero_indent").symlink_to(p1, target_is_directory=True)
+
+            # Inline flow list with trailing comment.
+            p2 = mount_root / "platform" / "inline_comment"
+            p2.mkdir(parents=True)
+            (p2 / "plugin.yaml").write_text(
+                "name: beta\nprovides_skills: [skill-three] # trailing comment\n",
+                encoding="utf-8",
+            )
+            (platform_dir / "plugins" / "inline_comment").symlink_to(p2, target_is_directory=True)
+
+            # Traversal symlink whose lexical prefix looks like mount_root/platform must be rejected.
+            traversal = mount_root / "platform" / ".." / ".." / "outside"
+            (platform_dir / "plugins" / "traversal").symlink_to(traversal, target_is_directory=True)
+
+            # Symlink pointing to another profile's mount directory must be rejected.
+            other_src = mount_root / "other" / "foreign"
+            other_src.mkdir(parents=True)
+            (other_src / "plugin.yaml").write_text("name: foreign\nprovides_skills: [nope]\n", encoding="utf-8")
+            (platform_dir / "plugins" / "foreign").symlink_to(other_src, target_is_directory=True)
+
+            for p in (base, mount_root, mount_root / "platform", platform_dir / "plugins"):
+                _age(p)
+
+            with mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root):
+                out = _render_roster(base, {})
+            self.assertIn(
+                "- platform (installed plugins: beta:skill-three, alpha:skill-one, alpha:skill-two): Platform specialist.",
+                out,
+            )
+            self.assertNotIn("WrongAuthor", out)
+            self.assertNotIn("escaped", out)
+            self.assertNotIn("foreign", out)
+        _forget()
+
+    def test_oserror_on_plugin_mount_or_entry_degrades_without_dropping_roster(self):
+        from unittest import mock
+
+        _forget()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / "profiles"
+            mount_root = root / "agent-plugins"
+            base.mkdir()
+            platform_dir = base / "platform"
+            (platform_dir / "plugins").mkdir(parents=True)
+            (platform_dir / "CAPABILITIES.md").write_text("Platform specialist.\n", encoding="utf-8")
+            plugin_src = mount_root / "platform" / "gkestockoutinvestigator"
+            plugin_src.mkdir(parents=True)
+            manifest = plugin_src / "plugin.yaml"
+            manifest.write_text(
+                "name: gkestockoutinvestigator\nprovides_skills: [gke-stockout-investigator]\n",
+                encoding="utf-8",
+            )
+            link = platform_dir / "plugins" / "gkestockoutinvestigator"
+            link.symlink_to(plugin_src, target_is_directory=True)
+            for p in (base, mount_root, mount_root / "platform", platform_dir / "plugins"):
+                _age(p)
+
+            real_is_dir = Path.is_dir
+            real_read_text = Path.read_text
+
+            # 1. PermissionError on mount_root.is_dir() must not raise out of render().
+            def deny_mount_root(path):
+                if path == mount_root:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real_is_dir(path)
+
+            with (
+                mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root),
+                mock.patch.object(Path, "is_dir", autospec=True, side_effect=deny_mount_root),
+            ):
+                out = _render_roster(base, {})
+            self.assertIn("- platform: Platform specialist.", out)
+
+            # 2. PermissionError on a single plugin symlink keeps `platform` in the roster.
+            def deny_link(path):
+                if path == link:
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real_is_dir(path)
+
+            with (
+                mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root),
+                mock.patch.object(Path, "is_dir", autospec=True, side_effect=deny_link),
+            ):
+                out = _render_roster(base, {})
+            self.assertIn("- platform: Platform specialist.", out)
+
+            # 3. OSError reading platform/plugins does not flip render_filtered to FILTER_UNREAD.
+            def deny_plugins_dir(path):
+                if path == platform_dir / "plugins":
+                    raise PermissionError(13, "Permission denied", str(path))
+                return real_is_dir(path)
+
+            with (
+                mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root),
+                mock.patch.object(Path, "is_dir", autospec=True, side_effect=deny_plugins_dir),
+            ):
+                filtered = _render_filtered("unmanaged-cluster", base, {})
+            self.assertEqual(filtered, agent_roster.FILTER_NONE.format(query="unmanaged-cluster", total=1))
+
+            # 4. Transient OSError reading plugin.yaml falls back and is not cached.
+            def flaky_manifest(path, *args, **kwargs):
+                if path == link / "plugin.yaml":
+                    raise OSError(5, "EIO")
+                return real_read_text(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root),
+                mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky_manifest),
+            ):
+                degraded_out = _render_roster(base, {})
+            self.assertIn("- platform (installed plugins: gkestockoutinvestigator): Platform specialist.", degraded_out)
+
+            # Next call succeeds and re-reads because the degraded walk was not cached.
+            with mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root):
+                recovered_out = _render_roster(base, {})
+            self.assertIn(
+                "- platform (installed plugins: gkestockoutinvestigator:gke-stockout-investigator): Platform specialist.",
+                recovered_out,
+            )
+
+            # 5. Transient OSError in os.readlink() degrades without poisoning the cache.
+            _forget()
+            real_readlink = os.readlink
+
+            def flaky_readlink(path, *args, **kwargs):
+                if Path(path) == link:
+                    raise OSError(5, "EIO")
+                return real_readlink(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root),
+                mock.patch.object(os, "readlink", side_effect=flaky_readlink),
+            ):
+                degraded_readlink_out = _render_roster(base, {})
+            self.assertIn("- platform: Platform specialist.", degraded_readlink_out)
+
+            with mock.patch.object(agent_roster, "AGENT_PLUGINS_MOUNT_ROOT", mount_root):
+                recovered_readlink_out = _render_roster(base, {})
+            self.assertIn(
+                "- platform (installed plugins: gkestockoutinvestigator:gke-stockout-investigator): Platform specialist.",
+                recovered_readlink_out,
+            )
+        _forget()
+
+
 if __name__ == "__main__":
     unittest.main()

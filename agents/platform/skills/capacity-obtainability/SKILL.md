@@ -10,8 +10,9 @@ description: >-
   capacity / capacity-history) across zones and provisioning models, and
   future window advice (gcloud beta compute advice calendar-mode) for "when
   will this shape be obtainable". For handling an inbound cluster-autoscaler
-  stockout alert end to end — triage, GitOps remediation, Pull Request — use
-  the gke-stockout-investigator plugin skill instead.
+  stockout alert end to end — triage, GitOps remediation PR, or chat-only
+  diagnostic report when no GitOps repository is configured — use the
+  gke-stockout-investigator plugin skill instead.
 metadata:
   category: Containers
 ---
