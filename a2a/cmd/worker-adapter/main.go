@@ -256,6 +256,7 @@ func run() int {
 			// Whether the persona must carry a build-time content manifest.
 			RequirePersonaIntegrity: requireIntegrity,
 			Harness:                 harness,
+			Workdir:                 workdir,
 			ConfigRoot:              envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
@@ -265,6 +266,13 @@ func run() int {
 			// What a script-run task's credential is verified against
 			// (#5622): rendered into Job templates only.
 			TaskSigningKeys: os.Getenv("A2A_TASK_SIGNING_PUBLIC_KEYS"),
+			// The pod's kube-proxy, when the operator names one: kubectl then
+			// goes through the worker's loopback rather than the broker.
+			KubeProxy: workeradapter.KubeProxyLoopbackConfig{
+				Upstream:     os.Getenv(workeradapter.EnvKubeProxyURL),
+				CAFile:       os.Getenv(workeradapter.EnvKubeProxyCAFile),
+				PodTokenFile: os.Getenv(workeradapter.EnvCredentialProxyTokenFile),
+			},
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -276,7 +284,7 @@ func run() int {
 	// The session's shipped persona and skills, checked against their
 	// build-time manifest before the harness first runs.
 	if dir := harnessConfigDir(); dir != "" {
-		if err := workeradapter.CheckSessionHome(dir, log); err != nil {
+		if err := checkSessionPersona(activeHarness, dir, log); err != nil {
 			log.Error("session worker failed", "err", err)
 			return 1
 		}
@@ -722,10 +730,16 @@ func harnessUserSettings() string {
 	return activeHarness.userSettings(os.Getenv)
 }
 
-// harnessConfigDir is the harness's config directory: $CLAUDE_CONFIG_DIR,
-// else ~/.claude. "" when neither is known.
+// checkSessionPersona checks the persona in dir against b's scope.
+func checkSessionPersona(b harnessBuilder, dir string, log *slog.Logger) error {
+	return workeradapter.CheckSessionHome(dir, b.personaCovers, log)
+}
+
+// harnessConfigDir is the directory holding the active harness's shipped
+// persona (for Claude Code, $CLAUDE_CONFIG_DIR, else ~/.claude), or "" when
+// it isn't known.
 func harnessConfigDir() string {
-	return claudeConfigDir(os.Getenv)
+	return activeHarness.configDir(os.Getenv)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare

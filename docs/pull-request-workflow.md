@@ -708,7 +708,8 @@ The two labels are the two people:
   (2026-10-22 14:43Z) has no stored tree, and a push still strips it.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root,
-  [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
+  [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS) and [`kube-proxy/OWNERS`](../kube-proxy/OWNERS),
+  which add approvers for those modules, and
   [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
   the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/replay-proxy/`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change

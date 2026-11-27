@@ -38,8 +38,10 @@ an empty published set as the scheduled baseline. A clean run with full
 coverage closes it with nothing new, nothing resolved and no gap, which is the
 run that `finish` calls quiet when it is scheduled.
 
-Both seed modes write the number of the issue they opened to a file in the
-stream's report store directory, for teardown.
+Both seed modes write the number of the issue they opened to a file, for
+teardown: in the stream's report store directory with the file store, and in
+the sandbox's scratch with the broker store, which is not a directory here
+(FLEET_AUDIT_REPORT_STORE, `report_store`).
 
 teardown: closes, as not planned, each open ledger of the stream whose number
 the seed wrote or whose body names the invented cluster. Only the two cases of
@@ -48,6 +50,7 @@ gap ledger's body, so the number is what finds that ledger.
 """
 
 import json
+import os
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -81,6 +84,44 @@ SEEDED_FROM_LEDGER_KEY = "seeded_from_ledger"
 # issue the seed opened. audit_report reads only latest.json and runs/ there.
 SEEDED_ISSUE_FILE = "eval-stale-ledger-issue.json"
 SEEDED_ISSUE_KEY = "issue_number"
+# The report store's switch, which the operator renders on the sandbox's shell
+# container (report_status.py: REPORT_STORE_ENV). Unset, empty or `file` is the
+# store in this pod's own directory; `broker` is the store the credential broker
+# serves, whose files are not in this pod. audit_report picks the store the same
+# way, so its writes and this script's reads agree; any other value stops the
+# script rather than guess which store the run uses.
+REPORT_STORE_ENV = "FLEET_AUDIT_REPORT_STORE"
+REPORT_STORE_FILE = "file"
+REPORT_STORE_BROKER = "broker"
+# Where the seeded issue's number is kept with the broker store: the sandbox's
+# scratch, since the store is not a directory in this pod.
+BENCH_SCRATCH = "/opt/data/scratch/bench-ledgers"
+
+
+def report_store():
+    """`file` or `broker`, from this container's FLEET_AUDIT_REPORT_STORE; exits on any other value."""
+    value = os.environ.get(REPORT_STORE_ENV, "")
+    if value in ("", REPORT_STORE_FILE):
+        return REPORT_STORE_FILE
+    if value == REPORT_STORE_BROKER:
+        return REPORT_STORE_BROKER
+    sys.exit(
+        f"ERROR: {REPORT_STORE_ENV}={value!r} on the shell sandbox is neither "
+        f"{REPORT_STORE_FILE!r} nor {REPORT_STORE_BROKER!r}, so which report store to use is unknown."
+    )
+
+
+def latest_is_stored(audit_report, audit_id, repo):
+    """True when the store the run uses holds the stream's latest.json for `repo`."""
+    if report_store() == REPORT_STORE_BROKER:
+        return audit_report.report_store_dir(audit_id, repo).has(audit_report.REPORT_LATEST_NAME)
+    latest = audit_report.reports_dir_for(audit_id, repo) / audit_report.REPORT_LATEST_NAME
+    return latest.is_file()
+
+
+def scratch_path(audit_id, repo, name):
+    """`name` under BENCH_SCRATCH for one stream's repository."""
+    return Path(BENCH_SCRATCH) / audit_id / repo.lower().replace("/", "%2F") / name
 
 
 def stale_document(audit_report, audit_id, gap=False):
@@ -218,9 +259,8 @@ def seed(audit_report, audit_id, repo, now, gap=False):
     # `write_report` never fails the run, and `previous_run_memory` seeds a
     # memory from the ledger when the store has no directory. So check that
     # the file is there and that the memory is the one written here.
-    latest = audit_report.reports_dir_for(audit_id, repo) / audit_report.REPORT_LATEST_NAME
     memory = audit_report.previous_run_memory(audit_id, number, repo, rendered.body)
-    if not latest.is_file() or memory is None or memory.get(SEEDED_FROM_LEDGER_KEY):
+    if not latest_is_stored(audit_report, audit_id, repo) or memory is None or memory.get(SEEDED_FROM_LEDGER_KEY):
         sys.exit(
             f"ERROR: the stored record of #{number} was not written or is not one that "
             "finish trusts, so the run would hold the ledger open over a lost memory "
@@ -231,6 +271,8 @@ def seed(audit_report, audit_id, repo, now, gap=False):
 
 def seeded_issue_path(audit_report, audit_id, repo):
     """The file that holds the number of the issue the seed opened."""
+    if report_store() == REPORT_STORE_BROKER:
+        return scratch_path(audit_id, repo, SEEDED_ISSUE_FILE)
     return audit_report.reports_dir_for(audit_id, repo) / SEEDED_ISSUE_FILE
 
 
@@ -270,6 +312,8 @@ def main(argv):
         sys.exit(f"usage: ledger.py {{{'|'.join(MODES)}}} <audit id> [<repo>]")
     sys.path[:0] = [SKILL_SCRIPTS, PLATFORM_SCRIPTS]
     import audit_report  # noqa: PLC0415 -- the path is the sandbox's, set just above
+    # Before the forge is touched, so an unknown switch opens and closes nothing.
+    report_store()
 
     mode, audit_id = argv[1], argv[2]
     repo = audit_report.resolve_repo(audit_id, argv[3] if len(argv) > 3 else None)

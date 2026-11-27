@@ -10,6 +10,11 @@
 // a file read mid-rotation, an empty file, or a certificate that does not match its key,
 // is reported through Options.OnReloadError and the last good value keeps being served.
 // Only the first load, in the constructor, returns an error.
+//
+// NewCAPoolUnion pools the certificates of several bundles, such as the client CAs of
+// more than one caller authenticator that a TLS listener advertises together. Each bundle
+// reloads on its own: one that fails to load keeps its last good certificates in the pool
+// while the others follow their files.
 package certreload
 
 import (
@@ -93,9 +98,7 @@ func newReloader[T any](paths []string, parse func([][]byte) (T, error), opts Op
 		r.interval = DefaultCheckInterval
 	}
 	if r.onError == nil {
-		r.onError = func(err error) {
-			slog.Default().Warn("certreload: keeping the last good contents", "err", err)
-		}
+		r.onError = logReloadError
 	}
 	if r.now == nil {
 		r.now = time.Now
@@ -114,6 +117,11 @@ func newReloader[T any](paths []string, parse func([][]byte) (T, error), opts Op
 	}
 	r.value, r.raw, r.seen, r.checkedAt = value, raw, identity, r.now()
 	return r, nil
+}
+
+// logReloadError is the OnReloadError of Options that set none.
+func logReloadError(err error) {
+	slog.Default().Warn("certreload: keeping the last good contents", "err", err)
 }
 
 // get returns the current value, first reloading it when the check interval has passed
@@ -243,10 +251,10 @@ func (c *ServerCertificate) GetCertificate(*tls.ClientHelloInfo) (*tls.Certifica
 	return c.r.get(), nil
 }
 
-// CAPool is a pool of root CA certificates read from a PEM bundle and reloaded when the
-// bundle changes.
+// CAPool is a pool of root CA certificates read from one PEM bundle (NewCAPool) or several
+// (NewCAPoolUnion) and reloaded when a bundle changes.
 type CAPool struct {
-	r *reloader[*x509.CertPool]
+	current func() *x509.CertPool
 }
 
 // NewCAPool loads the CERTIFICATE blocks of the PEM bundle in file. It fails when the file
@@ -269,12 +277,124 @@ func NewCAPool(file string, opts Options) (*CAPool, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CAPool{r: r}, nil
+	return &CAPool{current: r.get}, nil
+}
+
+// caBundle is the certificates of one loaded version of a bundle file; a reload that
+// changes the file yields a new one, so two loads are told apart by the pointer.
+type caBundle struct {
+	certs []*x509.Certificate
+}
+
+// caUnion pools the certificates of several bundle files, each reloaded on its own.
+type caUnion struct {
+	bundles []*reloader[*caBundle]
+
+	mu sync.Mutex
+	// loaded is the version of each bundle that pool was built from.
+	loaded []*caBundle
+	pool   *x509.CertPool
+	// failures are the reload errors of the check in progress. A bundle's reloader hands
+	// them over while get holds mu, and get reports them once it has let go of it.
+	failures []error
+	onError  func(error)
+}
+
+// NewCAPoolUnion loads the PEM bundles in files, each under the rules of NewCAPool, into
+// one pool holding the certificates of all of them. A path listed twice is read once. Each
+// file is checked and reloaded on its own: when one changes into something that does not
+// load, opts.OnReloadError is called for it and its last good certificates stay in the
+// pool, while a change to another file is still picked up. OnReloadError runs with none
+// of the pool's locks held, so it may call Pool; one that panics loses the other failures
+// collected in that check. It fails when files is empty, names an
+// empty path, or any file does not load.
+func NewCAPoolUnion(files []string, opts Options) (*CAPool, error) {
+	if len(files) == 0 {
+		return nil, errors.New("certreload: at least one CA bundle file is required")
+	}
+	u := &caUnion{onError: opts.OnReloadError}
+	if u.onError == nil {
+		u.onError = logReloadError
+	}
+	// Each bundle's reloader calls this under its own lock and under mu, from get.
+	opts.OnReloadError = func(err error) { u.failures = append(u.failures, err) }
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file == "" {
+			return nil, errors.New("certreload: a CA bundle file is required")
+		}
+		if _, dup := seen[file]; dup {
+			continue
+		}
+		seen[file] = struct{}{}
+		parse := func(raw [][]byte) (*caBundle, error) {
+			certs, err := parseCACertificates(raw[0])
+			if err != nil {
+				return nil, fmt.Errorf("CA bundle %s: %w", file, err)
+			}
+			return &caBundle{certs: certs}, nil
+		}
+		r, err := newReloader([]string{file}, parse, opts)
+		if err != nil {
+			return nil, err
+		}
+		u.bundles = append(u.bundles, r)
+	}
+	u.loaded = make([]*caBundle, len(u.bundles))
+	return &CAPool{current: u.get}, nil
+}
+
+// get returns the pool of every bundle's current certificates, rebuilt only when a
+// bundle was reloaded since the last call.
+func (u *caUnion) get() *x509.CertPool {
+	pool, failures := u.check()
+	for _, err := range failures {
+		u.onError(err)
+	}
+	return pool
+}
+
+// check reloads the bundles and returns the pool with the reload errors to report.
+func (u *caUnion) check() (*x509.CertPool, []error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	changed := u.pool == nil
+	for i, r := range u.bundles {
+		if bundle := r.get(); bundle != u.loaded[i] {
+			u.loaded[i] = bundle
+			changed = true
+		}
+	}
+	if changed {
+		pool := x509.NewCertPool()
+		for _, bundle := range u.loaded {
+			for _, cert := range bundle.certs {
+				pool.AddCert(cert)
+			}
+		}
+		u.pool = pool
+	}
+	failures := u.failures
+	u.failures = nil
+	return u.pool, failures
 }
 
 func parseCABundle(data []byte) (*x509.CertPool, error) {
+	certs, err := parseCACertificates(data)
+	if err != nil {
+		return nil, err
+	}
 	pool := x509.NewCertPool()
-	count := 0
+	for _, cert := range certs {
+		pool.AddCert(cert)
+	}
+	return pool, nil
+}
+
+// parseCACertificates returns the certificates of the CERTIFICATE blocks in data, under
+// the rules NewCAPool documents.
+func parseCACertificates(data []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
 	rest := data
 	for {
 		// pem.Decode skips anything before a line-start BEGIN marker, a damaged block
@@ -301,13 +421,12 @@ func parseCABundle(data []byte) (*x509.CertPool, error) {
 		if err != nil {
 			return nil, err
 		}
-		pool.AddCert(cert)
-		count++
+		certs = append(certs, cert)
 	}
-	if count == 0 {
+	if len(certs) == 0 {
 		return nil, errors.New("no CERTIFICATE block")
 	}
-	return pool, nil
+	return certs, nil
 }
 
 // afterFirstEndLine returns what follows the line holding the first END marker in data,
@@ -340,7 +459,7 @@ func skipBundleFiller(data []byte) []byte {
 
 // Pool returns the current pool. Do not modify it.
 func (p *CAPool) Pool() *x509.CertPool {
-	return p.r.get()
+	return p.current()
 }
 
 // DialTLSContext returns a dialer for http.Transport.DialTLSContext that verifies each new

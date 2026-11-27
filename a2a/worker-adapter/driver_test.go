@@ -52,10 +52,10 @@ func TestTheClaudeDecoderMapsEachLine(t *testing.T) {
 			`{"type":"tool_result","tool_use_id":"t3"},` +
 			`{"type":"tool_result","tool_use_id":"t4","content":"four"}]}}`,
 			[]Event{
-				{Kind: EventToolResult, ToolResult: json.RawMessage(`"one"`)},
-				{Kind: EventToolResult, ToolResult: json.RawMessage(`["a","b"]`)},
-				{Kind: EventToolResult},
-				{Kind: EventToolResult, ToolResult: json.RawMessage(`"four"`)},
+				{Kind: EventToolResult, CallID: "t1", ToolResult: json.RawMessage(`"one"`)},
+				{Kind: EventToolResult, CallID: "t2", ToolResult: json.RawMessage(`["a","b"]`)},
+				{Kind: EventToolResult, CallID: "t3"},
+				{Kind: EventToolResult, CallID: "t4", ToolResult: json.RawMessage(`"four"`)},
 			}},
 		{"user prompt echo", `{"type":"user","message":{"role":"user","content":"a prompt"}}`, nil},
 		{"one tool result", `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"exit status 77"}]}}`,
@@ -75,7 +75,11 @@ func TestTheClaudeDecoderMapsEachLine(t *testing.T) {
 			`{"type":"tool_result","tool_use_id":"t1","content":"x","is_error":true},` +
 			`{"type":"tool_result","tool_use_id":"t2","content":"x","is_error":false},` +
 			`{"type":"tool_result","tool_use_id":["t3"],"content":"x","is_error":"true"}]}}`,
-			[]Event{{Kind: EventToolResult, CallID: "t1", Failed: true}, {Kind: EventToolResult, CallID: "t2"}, {Kind: EventToolResult}}},
+			[]Event{
+				{Kind: EventToolResult, CallID: "t1", Failed: true, ToolResult: json.RawMessage(`"x"`)},
+				{Kind: EventToolResult, CallID: "t2", ToolResult: json.RawMessage(`"x"`)},
+				{Kind: EventToolResult, ToolResult: json.RawMessage(`"x"`)},
+			}},
 		{"a user line with no tool result", `{"type":"user","message":{"content":[{"type":"text","text":"steer"}]}}`, nil},
 		{"user with no message", `{"type":"user"}`, nil},
 		{"success", `{"type":"result","subtype":"success","result":"done"}`,

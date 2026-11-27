@@ -63,7 +63,7 @@ An admitted row is one with `notified` non-zero or a `delivery_error`. A failed 
 
 Past the fold window, a workload can break again while the fix for its last incident is still a pull request waiting for review. With `INCIDENT_WORKLOAD_DEDUP_SECONDS` above `0`, `inject_message` then looks for that fix before admitting the event (`_open_fix_pull_request`): among the workload's five most recent admitted incidents that have a session (same cluster, namespace, kind and `workload_key`, with the event's reason the incident's own or one folded into it, since another reason is another fault the fix may not touch; a Critical event only among Critical ones), a pull request a card opened for the incident, which the forge still reports open. A card opened one when the board holds a `pr_opened` event on it (`agents/platform/plugins/pr_opened`), and the card belongs to the incident when it was filed in the incident's own session (`tasks.session_id`, which Hermes stamps on the card the front door files with `INCIDENT_TRIAGE_OPEN_PULL_REQUEST`). A human's `apply` (typed, or an option button's text) is filed by the front door in its own session, so the card that opens that fix counts by another route: `incident_context` records each `apply` in the incident's thread (`POST /v1/incidents/apply`, table `incident_applies`), and the first card assigned to `INCIDENT_PR_ASSIGNEE` that carries the thread's subscription (`kanban_notify_subs`) and was created within `INCIDENT_APPLY_CARD_WINDOW_S` (30 min) after one of the thread's five most recent `apply`s (`INCIDENT_APPLIES_SCANNED`) is that incident's fix card. Only a reply found by its own thread is recorded: the first reply in a Google Chat direct message, recovered from its raw payload, is answered at top level, so its card carries no subscription to match. Any other card that only carries the thread's subscription does not count: anything asked for in the thread files one, so its pull request need not be the fix. The A2A gateway does not run `incident_context`, so an `apply` on the platform it holds is not recorded and its fix does not hold. When one is open, the event is written with `duplicate_of` set to that incident and `pull_request` set to its URL, claims no allowance, starts no turn, and is answered `folded`; on an install with a chat platform, the incident's thread is told once per window that the workload is still failing and the fix is waiting (`_remind_fix_pull_request`, rate-limited through `fix_pr_reminded_at` in the incident's `session_metadata`). A merged pull request whose workload breaks again, a closed one, or none, admits the event as a new incident. The lookup is made outside `_WORKLOAD_FOLD_LOCK` and only when no fold applies, and it fails open: an unreadable board or a forge that does not answer within `FIX_PR_LOOKUP_TIMEOUT_S` (8 s for the whole search) announces the event as before. The ledger read uses the partial index `idx_intercepted_events_workload_incident` on `workload_key`, which holds only the rows that can answer (`workload_key != '' AND duplicate_of IS NULL AND session_id != '' AND (notified != 0 OR delivery_error != '')`, `WORKLOAD_INCIDENT_INDEX_TERM`; the admission term is there for the same reason as in the anchor index, since a refused sighting is written with the inject's session and would otherwise sit in this index too), and the folded-reason test is a correlated `EXISTS` on `idx_intercepted_events_duplicate_reason` (`(duplicate_of, reason) WHERE duplicate_of > 0`), so a hit stops at the first index row and a miss walks none of the refused or folded rows the workload wrote. The forge calls go through `_FixPullRequestLookupPool`: `FIX_PR_LOOKUP_WORKERS` (4) daemon threads on a queue of at most `FIX_PR_LOOKUP_QUEUE_MAX` waiting lookups, with each pull request's state reused for `FIX_PR_STATE_CACHE_TTL_S` (60 s) and callers that arrive while a read is in flight waiting on that read. A caller waits only its own share of the search budget, and the worker's forge call is bounded by the same `FIX_PR_LOOKUP_TIMEOUT_S` (passed to `forge.call`, which shortens the sandbox hop and skips the retry once the budget is spent), so a forge that hangs holds a worker for 8 s rather than for the hop's 90 s; a read that outlives its caller still lands in the cache. Only a state the forge gave is cached, and a full queue answers "unknown", so a forge outage announces events rather than holding them. `workload_key` is what `_incident_branch_workload` reads, and unlike `fold_key` nothing clears it, so the search reaches back past a restart.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A record that is carded instead — a late `kubectl` write, a late or `crd` row of a principal with fewer than three in the digest, or a live `release` write to kube-agents' own objects with no Helm upgrade under way — bills `GitOpsDrift` as a live record does. Such a `release` write that the ceiling refuses stays in the digest, which names it on a `Review:` line. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -76,8 +76,8 @@ Three of the four are severities and the fourth is not; `GitOpsDrift` is what dr
 whatever they display as.
 
 The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
-each object, because the detector does not combine live records (late ones are digested and bill
-nothing; see the drift bullets below). `install.sh` and `upgrade.sh` enable the
+each object, because the detector does not combine live records (late ones, and an upgrade's writes to
+kube-agents' own objects, are digested and bill nothing; see the drift bullets below). `install.sh` and `upgrade.sh` enable the
 detector by default, so this value applies to the installs that these scripts manage. Only changes by
 people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
 object still sends a card with less detail, unless its cluster is outside the install's scope. That
@@ -140,13 +140,26 @@ What the drift branch does differently:
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
   row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (filed as one board card,
   on an install with no chat platform enabled: unassigned and blocked, so no agent turn files or
-  reads it, and it stays in view until a person acts). A
-  principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
+  reads it, and it stays in view until a person acts). The late
+  rows of a principal with fewer than three rows in the digest are not digested: each gets a session, a quota
   claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
   `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
-  carded from its own columns (summary and cluster). The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
-  route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
-  marks a record late and what it costs.
+  carded from its own columns (summary and cluster). The detector also sends here a live write to
+  kube-agents' own objects, with `own_release` on the payload: `crd` for one of the product's
+  CRDs, which follows the rule of three, and `release` for the rest. A live `release` row is
+  digested only when its change was made inside a Helm upgrade of its own principal: from a row
+  carrying `own_release_revision` (the create of Helm's release record Secret) to the first later
+  row carrying `own_release_revision_end` for that revision (Helm's update of it when the upgrade
+  ends; Helm updates it again when the next upgrade supersedes it, and that one is not the end),
+  by each payload's `timestamp`, or for 15 minutes when no end has been seen. The two rows are
+  read from the same digest or from the ledger, and the digest names that upgrade. Outside one,
+  each live `release` row is carded whatever the count, and a late one follows the rule of three.
+  A payload over the stored size is stored without its `owners`, and one still over it keeps only
+  the keys this decision reads. The post holds a lease row in `drift_backlog_lease` but no
+  database lock. The daemon advertises the route as `drift-backlog` in `features` on `/healthz`,
+  and that it reads the `own_release` marks as `drift-own-release`; the detector marks nothing
+  for a daemon without the second. The detector's README has the rule that marks a record late
+  and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
   the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
   `callerSuppliedUserAgent` is whatever the client declared. Both are rendered inside a block the
@@ -640,7 +653,7 @@ CREATE TABLE intercepted_events(
   dispatched_at TEXT,                      -- when the dispatcher created the turn's gateway session (sub-second); a drift-backlog row is stamped at carding; NULL = admitted and not yet dispatched
   backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat platform), 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
-  payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
+  payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to decide its digest and to card it from
   triage_state TEXT NOT NULL DEFAULT '',   -- pending when the triage start is queued, then started or aborted; '' when no start was queued (filtered, suppressed, or written before this column)
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
   fold_key    TEXT NOT NULL DEFAULT '',    -- what the row folds on: a pod's owning workload (context.controller_ref; a Deployment's as its bare name, others as <Kind>/<name>) or, without one, the workload of a pod named like a Deployment's; a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
