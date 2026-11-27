@@ -769,10 +769,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 63, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 64, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 63, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 64, "drifted": 0, "absent": 0, "not_ready": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -840,7 +840,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 125, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 127, "drifted": 1, "absent": 0, "not_ready": 0, "not_checked": 0})
 
 
     def test_a_young_orphan_snapshot_is_not_ready_with_its_clock_not_drifted(self):
@@ -859,7 +859,7 @@ class Drift(ScanHarness):
         self.assertEqual(len(detail), 1, detail)
         self.assertIn("ready_after_hours 2184", detail[0])
         self.assertIn(f"ready at {(taken + timedelta(hours=2184)).isoformat()}", detail[0])
-        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 62, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
+        self.assertEqual(doc["projects"][PROJECT]["summary"], {"healthy": 63, "drifted": 0, "absent": 0, "not_ready": 1, "not_checked": 0})
         self.assertEqual(doc["summary"]["not_ready"], 1)
         self.assertEqual(doc["summary"]["drifted_projects"], 0)
         self.assertEqual(fixture_state.drift_map(doc), {})
