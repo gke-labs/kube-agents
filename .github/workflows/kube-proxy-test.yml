@@ -1,0 +1,94 @@
+name: kube-proxy Tests
+
+# gofmt, go vet, gosec and go test -race for the kube-proxy/ Go module: the
+# kube-proxy image's binary, which is k8s-api-proxy/ plus the task credential
+# gate. No cluster and no credentials.
+#
+# kube-proxy/go.mod replaces k8s-api-proxy and a2a with the directories beside
+# it, so their sources are inputs of this check: the module's own tree, all of
+# k8s-api-proxy/, and of a2a/ the two packages the gate imports (lib and
+# taskcred, whose testdata holds the fixtures the gate's tests read) and its
+# go.mod and go.sum.
+#
+# Not a required check, so the `paths:` filters on the triggers decide whether
+# it runs, as in ghes-proxy-test.yml, whose header says what making it required
+# takes. The gosec step builds the scanner from k8s-operator/go.mod's pin (this
+# module declares none), so that module's go.mod and go.sum are inputs too.
+on:
+  pull_request:
+    branches: [main, "release/**"]
+    paths:
+      - "kube-proxy/**"
+      - "k8s-api-proxy/**"
+      - "a2a/go.mod"
+      - "a2a/go.sum"
+      - "a2a/lib/**"
+      - "a2a/taskcred/**"
+      - "k8s-operator/go.mod"
+      - "k8s-operator/go.sum"
+      - ".github/workflows/kube-proxy-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "kube-proxy/**"
+      - "k8s-api-proxy/**"
+      - "a2a/go.mod"
+      - "a2a/go.sum"
+      - "a2a/lib/**"
+      - "a2a/taskcred/**"
+      - "k8s-operator/go.mod"
+      - "k8s-operator/go.sum"
+      - ".github/workflows/kube-proxy-test.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
+jobs:
+  test:
+    name: Run kube-proxy Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: kube-proxy
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "kube-proxy/go.mod"
+          # Both modules: the gosec step below builds from the operator's.
+          cache-dependency-path: |
+            kube-proxy/go.sum
+            k8s-operator/go.sum
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - name: Vet
+        run: go vet ./...
+
+      # No exclusions: the G703/G706 reasoning in k8s-operator-test.yml is
+      # about the operator's argv, not this module's.
+      - name: Run gosec
+        run: |
+          go -C ../k8s-operator build -o "$RUNNER_TEMP/gosec" github.com/securego/gosec/v2/cmd/gosec
+          "$RUNNER_TEMP/gosec" ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...

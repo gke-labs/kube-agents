@@ -205,6 +205,9 @@ SURFACED_PATH = "/v1/findings/{id}/surfaced"
 JSON_HEADERS = {"Content-Type": "application/json"}
 AUTH_HEADER = "Authorization"
 BEARER_PREFIX = "Bearer "
+# A proxy from the environment must not get a request to the pod's loopback
+# and its bearer token, and urllib does not leave out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # The paced publisher this report marks as (findings_queue.PACED_PUBLISHERS).
 PUBLISHER = "first_report"
 # One run id per delivery, so the rows of one item are one addition.
@@ -1156,7 +1159,7 @@ def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
     request = urllib.request.Request(
         f"{endpoint}{path}", data=json.dumps(body).encode("utf-8"), headers=_session_kv_headers(), method="POST"
     )
-    with urllib.request.urlopen(request, timeout=MARK_TIMEOUT_SECONDS) as response:
+    with _SESSION_KV_OPENER.open(request, timeout=MARK_TIMEOUT_SECONDS) as response:
         response.read()
 
 
@@ -1694,7 +1697,7 @@ def _post_cron_report(audit: str, title: str) -> RelayAnswer:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=RESEND_TIMEOUT_SECONDS) as response:
+        with _SESSION_KV_OPENER.open(request, timeout=RESEND_TIMEOUT_SECONDS) as response:
             answer = json.loads(response.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:RELAY_ANSWER_MAX_CHARS]

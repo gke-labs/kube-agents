@@ -104,7 +104,9 @@ var (
 		"LANG", "LANGUAGE", "TERM", "TZ",
 		"KUBECONFIG",
 		// a session pod's kubectl through its kube-proxy (session-kubectl.sh,
-		// kubectl-context-registered, credential_proxy_client.py)
+		// kubectl-context-registered, credential_proxy_client.py). A profile
+		// worker with a kube-proxy gets the adapter's loopback as the URL, the
+		// task's target as the host context and no CA file (kubeproxy.go).
 		"KUBE_PROXY_URL", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT", "KUBE_PROXY_MODE",
 		// kubectl admission (kubectl-admit)
 		"KUBEAGENTS_KUBECTL_COST_TIER", "KUBECTL_ADMIT_ON_BUSY", "KUBECTL_ADMIT_GUARD_PATH", "KUBECTL_ADMIT_RUN_DIR",

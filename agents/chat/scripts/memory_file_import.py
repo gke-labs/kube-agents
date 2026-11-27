@@ -124,6 +124,10 @@ MAX_RECOVERABLE_UNDERSCORES = 6
 
 PAGE_SIZE = 200
 
+# Hindsight is an in-cluster Service: a proxy from the environment must not get
+# the memory text, and urllib does not leave out a cluster host by itself.
+_HINDSIGHT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def log(message: str) -> None:
     """Report on stderr, which is where the entrypoint's output goes."""
@@ -169,7 +173,7 @@ class Hindsight:
         for attempt in range(retries):
             request = urllib.request.Request(url, data=data, method=method, headers=self._headers)
             try:
-                return json.loads(urllib.request.urlopen(request, timeout=timeout).read() or "{}")
+                return json.loads(_HINDSIGHT_OPENER.open(request, timeout=timeout).read() or "{}")
             except urllib.error.HTTPError as e:
                 retryable = e.code in (429, 500, 502, 503, 504)
                 if not retryable or attempt == retries - 1:
