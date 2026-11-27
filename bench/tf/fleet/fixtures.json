@@ -1897,6 +1897,32 @@
         },
         {
           "subject": "firewall/hc-shadow-allow-*",
+          "path": "direction",
+          "op": "any_eq",
+          "value": "INGRESS",
+          "why": "the check reads INGRESS rules only; an EGRESS allow admits no probe"
+        },
+        {
+          "subject": "firewall/hc-shadow-allow-*",
+          "path": "destinationRanges[*]",
+          "op": "absent",
+          "why": "an allow with destination ranges admits probes to those addresses only"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "direction",
+          "op": "any_eq",
+          "value": "INGRESS",
+          "why": "the check reads INGRESS rules only; an EGRESS DENY blocks no probe"
+        },
+        {
+          "subject": "firewall/hc-shadow-deny-*",
+          "path": "destinationRanges[*]",
+          "op": "absent",
+          "why": "the check skips a DENY with destination ranges, as GKE's per-load-balancer deny rules carry them; with one there is no finding"
+        },
+        {
+          "subject": "firewall/hc-shadow-allow-*",
           "path": "allowed[*].IPProtocol",
           "op": "any_eq",
           "value": "tcp",

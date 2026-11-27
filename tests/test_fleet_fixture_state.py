@@ -808,8 +808,8 @@ def _healthy_world() -> dict:
             "firewall-rules": [
                 {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
                 {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["22", "3389"]}]},
-                {"name": "hc-shadow-allow-seeded", "disabled": False, "priority": 1000, "sourceRanges": ["35.191.0.0/16", "130.211.0.0/22"], "allowed": [{"IPProtocol": "tcp", "ports": ["80"]}]},
-                {"name": "hc-shadow-deny-seeded", "disabled": False, "priority": 900, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["80"]}]},
+                {"name": "hc-shadow-allow-seeded", "disabled": False, "direction": "INGRESS", "priority": 1000, "sourceRanges": ["35.191.0.0/16", "130.211.0.0/22"], "allowed": [{"IPProtocol": "tcp", "ports": ["80"]}]},
+                {"name": "hc-shadow-deny-seeded", "disabled": False, "direction": "INGRESS", "priority": 900, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["80"]}]},
             ],
             # The peered pair as `networks list` prints it: `default` on GCP's
             # 1460 default, which the listing omits, and the jumbo-frame VPC.
@@ -2300,6 +2300,23 @@ class ProjectScopedRoleTest(_Harness):
         world["compute"]["instances"][1]["networkInterfaces"] = [{"accessConfigs": []}]
         self.run_script(world)
         assert set(self.drift_files()) == {"world-open-ingress"}
+
+    def test_a_health_check_rule_out_of_shape_is_drift(self):
+        """Each change that makes the check stop firing reads as drift, so a red
+        case is not blamed on the agent."""
+        for name, change in (
+            ("hc-shadow-deny-seeded", {"priority": 1000}),
+            ("hc-shadow-deny-seeded", {"destinationRanges": ["203.0.113.7/32"]}),
+            ("hc-shadow-deny-seeded", {"direction": "EGRESS"}),
+            ("hc-shadow-allow-seeded", {"allowed": [{"IPProtocol": "udp", "ports": ["80"]}]}),
+            ("hc-shadow-allow-seeded", {"priority": 800}),
+        ):
+            with self.subTest(name=name, change=change):
+                world = _healthy_world()
+                rule = next(r for r in world["compute"]["firewall-rules"] if r["name"] == name)
+                rule.update(change)
+                self.run_script(world)
+                assert set(self.drift_files()) == {"health-check-shadowed"}
 
     def test_a_deleted_object_is_drift_not_weather(self):
         world = _healthy_world()

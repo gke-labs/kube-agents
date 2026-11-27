@@ -5050,8 +5050,9 @@ unit_cost_hint() {
     # kustomize case runs in the second phase (writes_alone), so its hint
     # orders it only among that phase's units.
     gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 900 ;;
-    # The networking audit over the health-check-shadowed role, registered
-    # 2026-11-26 unmeasured: the same full audit as networking-world-open-ingress.
+    # The networking audit over the health-check-shadowed role, parked in
+    # FIXTURE_NOT_READY until its fixture is on the pool, and unmeasured: the
+    # same full audit as networking-world-open-ingress.
     networking-health-check-shadowed) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10

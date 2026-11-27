@@ -3019,6 +3019,29 @@ class HealthCheckShadowedTest(unittest.TestCase):
         self.assertIn("2 instance(s)", hits[0]["excerpt"])
         self.assertIn("web in us-central1-a, web in us-central1-b", hits[0]["excerpt"])
 
+    def test_an_allow_on_another_tag_every_backend_carries_clears_it(self):
+        """GCP picks the highest-priority rule that matches each instance, so a
+        fix allow on a different tag clears the backends that carry that tag."""
+        both = {"items": ["gke-node", "web"]}
+        backends = [backend(name="web-1", tags=both), backend(name="web-2", tags=both)]
+        allow = hc_allow(targetTags=["gke-node"])
+        fix = hc_allow(name="fix", priority=800, targetTags=["web"])
+        self.assertEqual(shadowed([allow, blanket_deny(), fix], backends), ([], []))
+        # A backend without the fix's tag is still blocked, and only it is named.
+        lone = backend(name="web-3", tags={"items": ["gke-node"]})
+        hits, _ = shadowed([allow, blanket_deny(), fix], [*backends, lone])
+        self.assertIn("1 instance(s)", hits[0]["excerpt"])
+        self.assertIn("web-3", hits[0]["excerpt"])
+        self.assertNotIn("web-1", hits[0]["excerpt"])
+        # Admitted backends settle an untargeted allow even where hidden
+        # Autopilot nodes would otherwise leave it undecided.
+        network = na._network_key(NETWORK, "p1")
+        untargeted_fix = hc_allow(name="fix", priority=800, targetTags=["web"])
+        self.assertEqual(
+            shadowed([hc_allow(), blanket_deny(), untargeted_fix], backends, autopilot_networks={network: {"ap-1"}}),
+            ([], []),
+        )
+
     def test_port_zero_reads_as_the_whole_tcp_space(self):
         """GCP accepts `0-65535` for every port; it and a block with no `ports`
         key must cover each other, on the shadowing side and the remediation side."""

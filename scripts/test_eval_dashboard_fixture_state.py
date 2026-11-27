@@ -403,8 +403,8 @@ def healthy_world(*projects):
         "firewall-rules": [
             {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
             {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"]},
-            {"name": "hc-shadow-allow-seeded", "disabled": False, "priority": 1000, "sourceRanges": ["35.191.0.0/16", "130.211.0.0/22"], "allowed": [{"IPProtocol": "tcp", "ports": ["80"]}]},
-            {"name": "hc-shadow-deny-seeded", "disabled": False, "priority": 900, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["80"]}]},
+            {"name": "hc-shadow-allow-seeded", "disabled": False, "direction": "INGRESS", "priority": 1000, "sourceRanges": ["35.191.0.0/16", "130.211.0.0/22"], "allowed": [{"IPProtocol": "tcp", "ports": ["80"]}]},
+            {"name": "hc-shadow-deny-seeded", "disabled": False, "direction": "INGRESS", "priority": 900, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["80"]}]},
         ],
         # The declared-mtu-peering role's pair as `networks list` prints it:
         # `default` on GCP's 1460 default, which the listing omits.

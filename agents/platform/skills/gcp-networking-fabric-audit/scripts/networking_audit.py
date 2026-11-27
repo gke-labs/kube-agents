@@ -241,13 +241,16 @@ TCP_PORT_MAX = 65535
 # How many shadowed health-check allows an excerpt names before it summarises
 # the rest.
 MAX_NAMED_SHADOWED_ALLOWS = 3
-# What the health-check check cannot see: an allow in a hierarchical or network
-# firewall policy is evaluated before the VPC rules and can admit the probes,
+# What the health-check check cannot see: no load balancer is read, so an
+# instance in the allow's target counts whether or not one sends to it; an
+# allow in a hierarchical firewall policy is evaluated before the VPC rules and
+# can admit the probes,
 # and an Envoy-based load balancer's probes to hybrid or regional internet NEGs
 # come from the proxy-only subnet, not from these ranges. The probe's port is not read,
 # so a DENY that covers only some of an allow's ports is not reported.
 HC_SHADOW_BLIND_SPOT = (
-    "firewall policies were not read, and an allow in one can admit the probes first; "
+    "no load balancer was read, so these instances may not be backends of one; "
+    "firewall policies were not read, and an allow in a hierarchical one can admit the probes first; "
     "Envoy-based load balancers probe hybrid or regional internet NEGs from the proxy-only subnet, not these ranges; "
     "the probe's port is not read, so a DENY covering only some of the allow's ports is not reported"
 )
@@ -1924,14 +1927,19 @@ def _shadows_health_check(deny: dict, allow: dict, project: str) -> bool:
     return _ranges_cover(_tcp_port_ranges(deny.get("denied") or []), _tcp_port_ranges(allow.get("allowed") or []))
 
 
-def _admitted_first(deny: dict, allow: dict, firewalls: list, project: str) -> bool:
+def _admitted_first(deny: dict, allow: dict, firewalls: list, project: str, inst: dict | None = None) -> bool:
     """Whether the other enabled INGRESS allows on the same network, at a
     higher priority than `deny` (a lower number: the DENY wins a tie), with no
-    destination ranges and targets covering the allow's, already admit every
-    probe `allow` admits: for each health-check range the allow names, the
-    allows whose sources contain it open, between them, every TCP port the
-    allow opens. That is the remediation §2.8 names, so the DENY then blocks
-    no probe."""
+    destination ranges, already admit every probe `allow` admits: for each
+    health-check range the allow names, the allows whose sources contain it
+    open, between them, every TCP port the allow opens. That is the
+    remediation §2.8 names, so the DENY then blocks no probe.
+
+    With `inst`, the question is asked for that instance: the earlier allows
+    are those whose target holds it, the way GCP picks the highest-priority
+    rule that matches each instance. Without it, they are those whose targets
+    cover the whole of the allow's, which answers for every instance the allow
+    reaches, seen or not."""
     deny_priority = deny.get("priority", DEFAULT_FIREWALL_PRIORITY)
     network = _network_key(allow.get("network", ""), project)
     earlier = [
@@ -1944,7 +1952,7 @@ def _admitted_first(deny: dict, allow: dict, firewalls: list, project: str) -> b
         and not rule.get("destinationRanges")
         and _network_key(rule.get("network", ""), project) == network
         and rule.get("priority", DEFAULT_FIREWALL_PRIORITY) < deny_priority
-        and _covers_targets(rule, allow)
+        and (_in_target(rule, inst, project) if inst is not None else _covers_targets(rule, allow))
     ]
     if not earlier:
         return False
@@ -2007,12 +2015,17 @@ def health_check_shadowed(
         reaching: list[dict] = []
         unsure: list[str] = []
         for allow in shadowed:
-            live = [
+            in_target = [
                 inst for inst in instances or []
                 if isinstance(inst, dict)
                 and inst.get("status", INSTANCE_RUNNING) in LIVE_INSTANCE_STATUSES
                 and _in_target(allow, inst, project)
             ]
+            live = [inst for inst in in_target if not _admitted_first(deny, allow, firewalls, project, inst)]
+            if in_target and not live:
+                # Every live instance the allow reaches is admitted first by
+                # another allow that matches it: the DENY blocks none of them.
+                continue
             for inst in live:
                 origin = inst.get(ORIGIN_PROJECT_KEY, project)
                 name = str(inst.get("name", ""))
