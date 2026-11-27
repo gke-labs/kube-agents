@@ -26,11 +26,13 @@
 // a certificate carrying more than one value of the chosen field is refused, since which
 // one names the peer would be a guess. Names are compared exactly, with no case folding
 // or pattern. A URI name is the certificate's own text with the scheme in lower case and
-// nothing else changed: a URI that net/url would write back differently (a space it would
-// escape, for example), or that has userinfo, a query, a fragment, even an empty one, or
-// a "." or ".." path segment, plain or percent-encoded, is refused. X.509 name constraints do not apply
-// to the subject common name: with SourceCN, a name-constrained CA in the bundle can
-// still issue any name.
+// nothing else changed, and it must have one spelling only: a scheme, no userinfo, query
+// or fragment (not even an empty one), no percent-encoding, no "." or ".." path segment,
+// and the form net/url writes it back in (so no space, which it would escape). A
+// certificate whose URI is anything else is refused, and so is a configuration entry
+// (AllowedIdentities, AllowedNames, RequiredURIPrefix) that is, at construction. X.509
+// name constraints do not apply to the subject common name: with SourceCN, a
+// name-constrained CA in the bundle can still issue any name.
 //
 // # Errors
 //
@@ -103,6 +105,8 @@ const (
 	// uriDelimiters start a query or a fragment, which a URI used as a name cannot have,
 	// even an empty one (the SPIFFE ID rule).
 	uriDelimiters = "?#"
+	// uriEscape starts a percent-encoding, which a URI used as a name cannot have.
+	uriEscape = "%"
 	// uriSchemeEnd ends a URI's scheme, the one part net/url writes back in lower case.
 	uriSchemeEnd     = ":"
 	uriPathSeparator = "/"
@@ -126,8 +130,6 @@ var (
 	errTooManyCertificates = errors.New("the peer presented more certificates than are verified")
 	errURINotPlain         = errors.New("the client certificate's URI is not written in the form a name is read from")
 
-	// dots writes a percent-encoded dot as the dot a path segment is compared with.
-	dots            = strings.NewReplacer("%2e", ".", "%2E", ".")
 	errNotVerified  = errors.New("the client certificate does not verify against the configured CA bundle")
 	errNoName       = errors.New("the client certificate has no value in the configured field")
 	errSeveralNames = errors.New("the client certificate has more than one value in the configured field")
@@ -241,29 +243,52 @@ func plainURI(cert *x509.Certificate, name string) bool {
 	return written == name && uriNameProblem(written) == ""
 }
 
-// uriNameProblem says why raw cannot be a URI name, or "" when it can. A name is a URI
-// that net/url writes back exactly as it was written, so that two spellings never stand
-// for one name, and that has no userinfo, query, fragment (not even an empty one) or dot
-// segment in its path.
+// uriNameProblem says why raw cannot be a URI name, or "" when it can. A name has
+// exactly one spelling: a scheme, no userinfo, query or fragment (not even an empty one),
+// no percent-encoding anywhere, no "." or ".." path segment, and the form net/url writes
+// it back in. The same rule holds for a certificate's URI and for the configuration
+// entries it is compared with.
 func uriNameProblem(raw string) string {
 	uri, err := url.Parse(raw)
 	switch {
 	case err != nil:
 		return "is not a URI"
-	case uri.String() != raw:
-		return fmt.Sprintf("is not in the form it is compared in, %q", uri.String())
+	case uri.Scheme == "":
+		return "has no scheme"
+	// An escape gives a name a second spelling ("%73" for "s", "%c3" for "%C3") and can
+	// hide a separator ("..%2f"), so none is allowed and the path below is read as written.
+	case strings.Contains(raw, uriEscape):
+		return "has a percent-encoding"
 	case uri.User != nil:
 		return "has userinfo"
 	case strings.ContainsAny(raw, uriDelimiters):
 		return "has a query or a fragment"
 	}
-	for _, segment := range strings.Split(uri.EscapedPath(), uriPathSeparator) {
-		switch dots.Replace(segment) {
-		case uriDotSegment, uriParentSegment:
+	for _, segment := range strings.Split(uri.Path, uriPathSeparator) {
+		if segment == uriDotSegment || segment == uriParentSegment {
 			return "has a dot segment in its path"
 		}
 	}
+	if written := uri.String(); written != raw {
+		return fmt.Sprintf("is not in the form it is compared in, %q", written)
+	}
 	return ""
+}
+
+// newNameAllowlist is newAllowlist for a list of peer names read from source: with
+// SourceURI every entry must be a name a certificate could carry, since one that is not
+// would silently match nobody.
+func newNameAllowlist(field string, list []string, source IdentitySource) (map[string]struct{}, error) {
+	set, err := newAllowlist(field, list)
+	if err != nil || source != SourceURI {
+		return set, err
+	}
+	for name := range set {
+		if problem := uriNameProblem(name); problem != "" {
+			return nil, fmt.Errorf("mtlsauth: %s entry %q %s, so no certificate could match it", field, name, problem)
+		}
+	}
+	return set, nil
 }
 
 // rawURINames returns the URI subject alternative names of cert as they are encoded; ok

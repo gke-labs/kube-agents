@@ -110,16 +110,18 @@ The peer's name comes from the one certificate field the configuration names (`u
 `cn`). No other field is tried when it is missing, and a certificate with two values there (two
 URI SANs, two DNS SANs, two common names) is refused. Names are compared exactly, with no case
 folding or pattern. A URI name is the certificate's own text with the scheme in lower case and
-nothing else changed: a URI that Go's `net/url` would write back differently (a space it would
-escape, for example), or that has userinfo, a query, a fragment, even an empty one, or a `.` or
-`..` path segment, plain or percent-encoded, is refused. X.509
+nothing else changed, and it must have one spelling only: a scheme, no userinfo, query or
+fragment (not even an empty one), no percent-encoding, no `.` or `..` path segment, and the form
+Go's `net/url` writes it back in (so no space, which it would escape). A certificate whose URI
+is anything else is refused, and a configuration entry that is (`AllowedIdentities`,
+`AllowedNames`, `RequiredURIPrefix`) is a constructor error. X.509
 name constraints do not apply to the subject common name, so with `cn` a name-constrained CA in
 the bundle can still issue any name.
 `ClientCertAuthenticator` uses the name as `CallerIdentity.Username` and fills nothing else;
 `AllowedIdentities` admits only the listed names and `RequiredURIPrefix` (with `uri` only) only
 names that start with it; the prefix must be a URI with a scheme and a host, written as a name
 is, and end in `/`, so that it cannot match a longer trust domain or path segment or every trust
-domain. With `uri`, an `AllowedIdentities` entry that no name could equal is an error too. Without either, every client certificate
+domain. Without either, every client certificate
 the CA issues is a caller.
 
 `FrontProxyAuthenticator` requires the peer's name in `AllowedNames` and then believes the

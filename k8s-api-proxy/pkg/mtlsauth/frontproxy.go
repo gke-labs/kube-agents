@@ -43,7 +43,8 @@ type FrontProxyConfig struct {
 	NameSource IdentitySource
 	// AllowedNames lists the front proxies whose headers are believed, compared exactly
 	// with the certificate's name. Entries are trimmed and empty ones dropped; at
-	// least one is required. Every peer named here can act as any caller.
+	// least one is required. With SourceURI an entry that is not a URI name as the
+	// package documentation defines one is an error: no certificate could match it. Every peer named here can act as any caller.
 	AllowedNames []string
 	// UsernameHeaders names, in order of preference, the headers holding the caller's
 	// username; the first one present in a request is read. At least one is required, and
@@ -93,7 +94,7 @@ type FrontProxyAuthenticator struct {
 // cfg is incomplete, names a header k8sapiproxy.ValidateCallerHeaderNames refuses, names
 // one header twice, or ClientCAFile does not load.
 func NewFrontProxyAuthenticator(cfg FrontProxyConfig) (*FrontProxyAuthenticator, error) {
-	allowedNames, err := newAllowlist(allowedNamesName, cfg.AllowedNames)
+	allowedNames, err := newNameAllowlist(allowedNamesName, cfg.AllowedNames, cfg.NameSource)
 	if err != nil {
 		return nil, err
 	}

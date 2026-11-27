@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -393,7 +394,15 @@ func TestClientCertReadsOneConfiguredField(t *testing.T) {
 		{name: "uri with a fragment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI + "#a"}}, wantErr: errURINotPlain},
 		{name: "uri with an empty fragment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{testWorkloadURI + "#"}}, wantErr: errURINotPlain},
 		{name: "uri with a space net/url would escape", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/sa/a b"}}, wantErr: errURINotPlain},
-		{name: "uri with the space escaped", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/sa/a%20b"}}, username: "spiffe://example.test/ns/agents/sa/a%20b"},
+		// Neither spelling is a name: the space is not how net/url writes it, and the escape is an escape.
+		{name: "uri with the space escaped", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/sa/a%20b"}}, wantErr: errURINotPlain},
+		{name: "uri with a parent segment before an encoded slash", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/..%2fadmin"}}, wantErr: errURINotPlain},
+		{name: "uri with an encoded parent segment and slash", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/%2e%2e%2fadmin"}}, wantErr: errURINotPlain},
+		{name: "uri with an encoded letter", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/sa/%73andbox"}}, wantErr: errURINotPlain},
+		{name: "uri with lower-case escapes", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/sa/caf%c3%a9"}}, wantErr: errURINotPlain},
+		{name: "uri with upper-case escapes", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/sa/caf%C3%A9"}}, wantErr: errURINotPlain},
+		{name: "uri without a scheme", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"sandbox"}}, wantErr: errURINotPlain},
+		{name: "uri of a bare path", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"/ns/agents/sa/sandbox"}}, wantErr: errURINotPlain},
 		{name: "uri with a parent segment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/../admin"}}, wantErr: errURINotPlain},
 		{name: "uri with a dot segment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/./agents"}}, wantErr: errURINotPlain},
 		{name: "uri ending in a parent segment", source: SourceURI, spec: certSpec{cn: testWorkloadCN, rawURIs: []string{"spiffe://example.test/ns/agents/.."}}, wantErr: errURINotPlain},
@@ -712,7 +721,25 @@ func TestNewClientCertAuthenticatorRefusesAnIncompleteConfig(t *testing.T) {
 		"allowed URI with a query":      func(c *ClientCertConfig) { c.AllowedIdentities = []string{testWorkloadURI + "?a=b"} },
 		"allowed URI with a fragment":   func(c *ClientCertConfig) { c.AllowedIdentities = []string{testWorkloadURI + "#"} },
 		"allowed URI with dot segment":  func(c *ClientCertConfig) { c.AllowedIdentities = []string{"spiffe://example.test/ns/%2e%2e/x"} },
-		"allowlist of empty entries":    func(c *ClientCertConfig) { c.AllowedIdentities = []string{"", "  "} },
+		"allowed URI plain dot segment": func(c *ClientCertConfig) { c.AllowedIdentities = []string{"spiffe://example.test/ns/../x"} },
+		"allowed URI dots, encoded slash": func(c *ClientCertConfig) {
+			c.AllowedIdentities = []string{"spiffe://example.test/ns/agents/..%2fadmin"}
+		},
+		"allowed URI all encoded": func(c *ClientCertConfig) {
+			c.AllowedIdentities = []string{"spiffe://example.test/ns/agents/%2e%2e%2fadmin"}
+		},
+		"allowed URI encoded letter": func(c *ClientCertConfig) {
+			c.AllowedIdentities = []string{"spiffe://example.test/ns/agents/sa/%73andbox"}
+		},
+		"allowed URI lower-case escape":  func(c *ClientCertConfig) { c.AllowedIdentities = []string{"spiffe://example.test/sa/caf%c3%a9"} },
+		"allowed URI upper-case escape":  func(c *ClientCertConfig) { c.AllowedIdentities = []string{"spiffe://example.test/sa/caf%C3%A9"} },
+		"allowed URI escaped space":      func(c *ClientCertConfig) { c.AllowedIdentities = []string{"spiffe://example.test/sa/a%20b"} },
+		"allowed URI without a scheme":   func(c *ClientCertConfig) { c.AllowedIdentities = []string{"sandbox"} },
+		"allowed URI of a bare path":     func(c *ClientCertConfig) { c.AllowedIdentities = []string{"/ns/agents/sa/sandbox"} },
+		"URI prefix dots, encoded slash": func(c *ClientCertConfig) { c.RequiredURIPrefix = "spiffe://example.test/ns/..%2fadmin/" },
+		"URI prefix encoded letter":      func(c *ClientCertConfig) { c.RequiredURIPrefix = "spiffe://example.test/n%73/" },
+		"URI prefix upper-case escape":   func(c *ClientCertConfig) { c.RequiredURIPrefix = "spiffe://example.test/caf%C3%A9/" },
+		"allowlist of empty entries":     func(c *ClientCertConfig) { c.AllowedIdentities = []string{"", "  "} },
 	}
 	for name, edit := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -832,23 +859,11 @@ func TestFrontProxyReadsTheCallerFromHeaders(t *testing.T) {
 				t.Fatalf("AuthenticateRequest: %v", err)
 			}
 			if caller.Username != tc.want.Username || caller.UID != tc.want.UID || caller.Partition != tc.want.Partition ||
-				!equalStrings(caller.Groups, tc.want.Groups) || caller.Extra != nil || caller.Authenticator != "" {
+				!slices.Equal(caller.Groups, tc.want.Groups) || caller.Extra != nil || caller.Authenticator != "" {
 				t.Errorf("caller = %+v, want %+v", *caller, *tc.want)
 			}
 		})
 	}
-}
-
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // A peer that is not an allowed front proxy is not believed whatever headers it sends, and
@@ -946,12 +961,27 @@ func TestFrontProxyNameSources(t *testing.T) {
 func TestNewFrontProxyAuthenticatorRefusesAnIncompleteConfig(t *testing.T) {
 	f := newFixture(t)
 	tests := map[string]func(*FrontProxyConfig){
-		"no CA file":                        func(c *FrontProxyConfig) { c.ClientCAFile = "" },
-		"CA file missing":                   func(c *FrontProxyConfig) { c.ClientCAFile = filepath.Join(t.TempDir(), "absent.crt") },
-		"no name source":                    func(c *FrontProxyConfig) { c.NameSource = "" },
-		"unknown name source":               func(c *FrontProxyConfig) { c.NameSource = "ip" },
-		"no allowed names":                  func(c *FrontProxyConfig) { c.AllowedNames = nil },
-		"allowed names of empty entries":    func(c *FrontProxyConfig) { c.AllowedNames = []string{"", " "} },
+		"no CA file":                     func(c *FrontProxyConfig) { c.ClientCAFile = "" },
+		"CA file missing":                func(c *FrontProxyConfig) { c.ClientCAFile = filepath.Join(t.TempDir(), "absent.crt") },
+		"no name source":                 func(c *FrontProxyConfig) { c.NameSource = "" },
+		"unknown name source":            func(c *FrontProxyConfig) { c.NameSource = "ip" },
+		"no allowed names":               func(c *FrontProxyConfig) { c.AllowedNames = nil },
+		"allowed names of empty entries": func(c *FrontProxyConfig) { c.AllowedNames = []string{"", " "} },
+		"allowed URI upper-case scheme": func(c *FrontProxyConfig) {
+			c.AllowedNames = []string{testProxyURI, "SPIFFE://example.test/ns/gateways/sa/egress"}
+		},
+		"allowed URI with a query":        func(c *FrontProxyConfig) { c.AllowedNames = []string{testProxyURI + "?a=b"} },
+		"allowed URI with an empty query": func(c *FrontProxyConfig) { c.AllowedNames = []string{testProxyURI + "?"} },
+		"allowed URI with a fragment":     func(c *FrontProxyConfig) { c.AllowedNames = []string{testProxyURI + "#"} },
+		"allowed URI with userinfo": func(c *FrontProxyConfig) {
+			c.AllowedNames = []string{"spiffe://user@example.test/ns/gateways/sa/egress"}
+		},
+		"allowed URI with an escape":        func(c *FrontProxyConfig) { c.AllowedNames = []string{"spiffe://example.test/ns/gateways/sa/%65gress"} },
+		"allowed URI with a space":          func(c *FrontProxyConfig) { c.AllowedNames = []string{"spiffe://example.test/ns/gateways/sa/e gress"} },
+		"allowed URI with a dot segment":    func(c *FrontProxyConfig) { c.AllowedNames = []string{"spiffe://example.test/ns/gateways/../sa/egress"} },
+		"allowed URI dots, encoded slash":   func(c *FrontProxyConfig) { c.AllowedNames = []string{"spiffe://example.test/ns/gateways/..%2fegress"} },
+		"allowed URI without a scheme":      func(c *FrontProxyConfig) { c.AllowedNames = []string{"egress"} },
+		"allowed URI of a bare path":        func(c *FrontProxyConfig) { c.AllowedNames = []string{"/ns/gateways/sa/egress"} },
 		"no username headers":               func(c *FrontProxyConfig) { c.UsernameHeaders = nil },
 		"empty username header name":        func(c *FrontProxyConfig) { c.UsernameHeaders = []string{""} },
 		"username header name with a space": func(c *FrontProxyConfig) { c.UsernameHeaders = []string{"X Caller"} },
@@ -989,7 +1019,7 @@ func TestFrontProxyHeaderNames(t *testing.T) {
 		c.PartitionHeaders = []string{testTenantHeader}
 	})
 	want := []string{testUserHeader, testUserHeader2, testUIDHeader, testGroupHeader, testTenantHeader}
-	if got := authn.HeaderNames(); !equalStrings(got, want) {
+	if got := authn.HeaderNames(); !slices.Equal(got, want) {
 		t.Errorf("HeaderNames() = %q, want %q", got, want)
 	}
 }

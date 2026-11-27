@@ -39,8 +39,9 @@ type ClientCertConfig struct {
 	IdentitySource IdentitySource
 	// AllowedIdentities, when not empty, lists the identities admitted, compared exactly.
 	// Entries are trimmed and empty ones dropped; a list left with none is an error. With
-	// SourceURI an entry no certificate's name could equal (an upper-case scheme, text
-	// net/url would re-escape, a query) is an error too.
+	// SourceURI an entry that is not a URI name as the package documentation defines one
+	// (an upper-case scheme, a percent-encoding, a query) is an error too: no
+	// certificate could match it.
 	AllowedIdentities []string
 	// RequiredURIPrefix, when set, refuses a certificate whose URI does not start with it.
 	// It is valid only with SourceURI and must end in "/" ("spiffe://example.org/", not
@@ -78,16 +79,9 @@ func NewClientCertAuthenticator(cfg ClientCertConfig) (*ClientCertAuthenticator,
 			return nil, fmt.Errorf("mtlsauth: %s.RequiredURIPrefix %q %s", clientCertConfigName, prefix, problem)
 		}
 	}
-	allowed, err := newAllowlist(allowedIdentitiesName, cfg.AllowedIdentities)
+	allowed, err := newNameAllowlist(allowedIdentitiesName, cfg.AllowedIdentities, cfg.IdentitySource)
 	if err != nil {
 		return nil, err
-	}
-	if cfg.IdentitySource == SourceURI {
-		for identity := range allowed {
-			if problem := uriNameProblem(identity); problem != "" {
-				return nil, fmt.Errorf("mtlsauth: %s entry %q %s, so no certificate could match it", allowedIdentitiesName, identity, problem)
-			}
-		}
 	}
 	peer, err := newPeerVerifier(clientCertConfigName, identitySourceField, cfg.ClientCAFile, cfg.IdentitySource, cfg.Reload, cfg.Now)
 	if err != nil {
