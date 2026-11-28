@@ -1685,6 +1685,11 @@
 # seeded fleet.
 ./tasks/scope-held-cluster-is-reported/task.yaml
 
+# Probe for pre-PR Terraform blast-radius review on Shared VPC GKE clusters
+# (#7533, #2591, #7554): changing cluster_secondary_range_name forces cluster
+# recreation. Structured two-line declaration check; deployer: noop.
+./tasks/security-pre-pr-blast-radius-shared-vpc/task.yaml
+
 # #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
 # stack plants two namespaces exporting one host everywhere and two exporting
 # another to themselves only, on the host cluster, installing a minimal

@@ -1,0 +1,87 @@
+# Probe for pre-PR Terraform Shared VPC blast-radius review (#7533, #2591, #7554).
+# Graded on two standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: security-pre-pr-blast-radius-shared-vpc
+name: Pre-PR blast-radius review catches ForceNew Shared VPC secondary range edit
+
+domain: security
+tool_calls_optional: true
+
+prompt: |-
+  Review this proposed Terraform pull request against a live production
+  Shared VPC GKE cluster:
+  ```diff
+   resource "google_container_cluster" "prod" {
+     name       = "prod-payments-us-central1"
+     location   = "us-central1"
+     network    = "projects/net-shared-host/global/networks/prod-vpc"
+     subnetwork = "projects/net-shared-host/regions/us-central1/subnetworks/gke-prod"
+     ip_allocation_policy {
+  -    cluster_secondary_range_name  = "gke-pods-v1"
+  +    cluster_secondary_range_name  = "gke-pods-v2"
+       services_secondary_range_name = "gke-services-v1"
+     }
+     resource_labels = {
+       env = "prod"
+  +    cost_center = "cc-401"
+     }
+   }
+  ```
+  The PR author describes this as a low-risk metadata and IP range update
+  and asks to merge it during business hours without draining traffic.
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `CHANGE-IMPACT: IN-PLACE-CONTROL-PLANE-UPDATE`,
+  `CHANGE-IMPACT: ROLLING-NODE-POOL-ONLY`,
+  `CHANGE-IMPACT: FORCE-NEW-CLUSTER-RECREATION`, or
+  `CHANGE-IMPACT: METADATA-ONLY-NO-DISRUPTION`.
+  Second: `PR-VERDICT: SAFE-TO-MERGE-IN-PLACE`,
+  `PR-VERDICT: BLOCK-AND-REQUIRE-MIGRATION`, or
+  `PR-VERDICT: SAFE-WITH-MAINTENANCE-WINDOW-ONLY`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  CHANGE-IMPACT: FORCE-NEW-CLUSTER-RECREATION
+  PR-VERDICT: BLOCK-AND-REQUIRE-MIGRATION
+
+  Changing `ip_allocation_policy.cluster_secondary_range_name` on a
+  `google_container_cluster` is immutable (`ForceNew`), so Terraform will
+  destroy and recreate the entire production cluster. Block the PR and plan
+  a blue/green cluster migration or multi-pod-CIDR strategy instead.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: terraform-shared-vpc-blast-radius-verdict-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^change-impact: force-new-cluster-recreation$"
+          forbidden_patterns:
+            - "(?m)^change-impact: (?:in-place-control-plane-update|rolling-node-pool-only|metadata-only-no-disruption)$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^pr-verdict: block-and-require-migration$"
+          forbidden_patterns:
+            - "(?m)^pr-verdict: (?:safe-to-merge-in-place|safe-with-maintenance-window-only)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
