@@ -17030,6 +17030,37 @@ class TestWiGsaIamBindingMissing(unittest.TestCase):
         )
 
 
+class ConfigSyncSystemNamespacesTest(unittest.TestCase):
+    """Config Sync's own namespaces are S1: its controllers are GKE-managed
+    infrastructure, and a cluster running it would otherwise file findings on
+    pods its owner cannot edit (resource-group-controller in
+    resource-group-system, the reconcilers and their monitoring under
+    config-management-*)."""
+
+    def test_config_syncs_namespaces_are_system_namespaces(self):
+        for ns in ("resource-group-system", "config-management-system", "config-management-monitoring"):
+            self.assertTrue(collect._is_system_namespace(ns), ns)
+
+    def test_a_workload_namespace_is_not(self):
+        for ns in ("resource-group", "resource-group-system-x", "seeded-post-merge"):
+            self.assertFalse(collect._is_system_namespace(ns), ns)
+
+    def test_every_copy_of_the_set_is_the_collectors(self):
+        # The stockout and waste streams and the upgrade readiness rules copy
+        # S1 rather than import it; a copy that drifts reads Config Sync's
+        # controller in one stream and not another.
+        import importlib.util
+
+        import fleet_stockout
+        import fleet_waste
+
+        tables = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts" / "upgrade_shape_tables.py"
+        spec = importlib.util.spec_from_file_location("upgrade_shape_tables_for_parity", tables)
+        upgrade = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(upgrade)
+        for copy in (fleet_stockout, fleet_waste, upgrade):
+            self.assertEqual(copy.SYSTEM_NAMESPACES, collect.SYSTEM_NAMESPACES, copy.__name__)
+
 
 class TestOnlyCluster(unittest.TestCase):
     """`--cluster <location>/<name>` (#5623): one cluster of --project, the rest

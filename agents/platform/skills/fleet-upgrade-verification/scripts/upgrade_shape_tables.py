@@ -47,6 +47,8 @@ SYSTEM_NAMESPACES = frozenset(
         "anthos-identity-service",
         "gatekeeper-system",
         "composer-system",
+        # Config Sync's ResourceGroup controller; the prefix below covers the rest of Config Sync.
+        "resource-group-system",
     }
 )
 SYSTEM_NAMESPACE_PREFIXES = ("gke-", "config-management-")

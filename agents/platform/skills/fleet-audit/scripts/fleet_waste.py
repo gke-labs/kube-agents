@@ -651,6 +651,8 @@ SYSTEM_NAMESPACES = frozenset(
         "kube-system", "kube-public", "kube-node-lease", "gmp-system", "gmp-public", "gke-gmp-system",
         "cnrm-system", "configconnector-operator-system", "krmapihosting-system", "istio-system",
         "asm-system", "anthos-identity-service", "gatekeeper-system", "composer-system",
+        # Config Sync's ResourceGroup controller (config-management-* covers the rest).
+        "resource-group-system",
     }
 )
 
