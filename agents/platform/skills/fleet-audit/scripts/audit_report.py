@@ -422,6 +422,7 @@ AUDITS: dict[str, AuditSpec] = {
             "dangling-compute-class",
             "ccc-unbacked-manual-fallback",
             "capacity-buffer-not-ready",
+            "gpu-pool-missing-taint",
         ),
         # §4's manifest note: the `project/<id>` entry carries the two
         # project-scoped checks. `reservation-mismatch-risk` sits under both
@@ -444,6 +445,7 @@ AUDITS: dict[str, AuditSpec] = {
                     "dangling-compute-class",
                     "ccc-unbacked-manual-fallback",
                     "capacity-buffer-not-ready",
+                    "gpu-pool-missing-taint",
                 ),
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
@@ -456,7 +458,7 @@ AUDITS: dict[str, AuditSpec] = {
         # finding; the join tells the arms apart by the collector's excerpt
         # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
         # validator cannot, and the SOP's step carries that distinction. The
-        # other thirteen are capacity faults no
+        # other fourteen are capacity faults no
         # declaration excuses: a quota near its limit, a ComputeClass with no
         # fallback, a Spot shape that gets preempted, an autoscaler that
         # already failed to add a node.
@@ -1384,6 +1386,7 @@ CHECK_PHRASES = {
     "dangling-compute-class": "{object} has a compute class problem that can leave pods unscheduled",
     "ccc-unbacked-manual-fallback": "ComputeClass `{object}` lists machine options that it cannot use",
     "capacity-buffer-not-ready": "{object} capacity buffer cannot provision warm headroom",
+    "gpu-pool-missing-taint": "Node pool `{object}` lets workloads without a GPU take its GPU machines",
     # GCP Networking Fabric & VPC IPAM Audit
     "subnet-ip-exhaustion": "subnet is running out of IP addresses",
     "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
@@ -2173,6 +2176,8 @@ ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
 # it holds both `hpa-cannot-scale` shapes: it errs toward holding a finding
 # back, the join toward not silencing one.
 ZONE_ARM_CHECK = "single-zone-nodepool"
+# A stockout check filed on `NodePool/<pool>`: a pool is its own object, in no namespace.
+GPU_POOL_TAINT_CHECK = "gpu-pool-missing-taint"
 ZONE_LOCKED_ARM_MARK = "single-zone ("
 CEILING_ARM_MARK = "at its autoscaling ceiling:"
 # A roll-up names the scope it covers, not an object: the cost SOP's §5
@@ -2263,12 +2268,14 @@ COST_DECLARED_MINOR = "minor"
 # stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
 # its collector files `NodePool/<pool>` with no namespace, and a worker's
 # namespace on the finding would give the pool an identity no declaration and
-# no candidate matches. So does the compute snapshot check
+# no candidate matches. The stockout GPU pool check (`GPU_POOL_TAINT_CHECK`)
+# joins them too: its excerpt names workloads by namespace, which invites
+# one. So does the compute snapshot check
 # (`ORPHANED_SNAPSHOT_CHECK`), filed on a `project/<id>` target with no
 # namespace, and so does the networking peering check (`MTU_PEERING_CHECK`),
 # filed the same way. Every slug here belongs to one stream, so no stream
 # test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, ORPHANED_SNAPSHOT_CHECK, MTU_PEERING_CHECK})
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK, GPU_POOL_TAINT_CHECK, ORPHANED_SNAPSHOT_CHECK, MTU_PEERING_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
