@@ -1574,6 +1574,11 @@
 # projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
 ./tasks/networking-world-open-ingress/task.yaml
 
+# Probe for Konnectivity agent saturation / control-plane-to-node tunnel
+# exhaustion (#2596, #2581, #7556). Structured two-line declaration check;
+# deployer: noop, read-only.
+./tasks/observability-konnectivity-agent-saturation/task.yaml
+
 # Observability DNS scaling probe (#5736, #7095): a pure Q&A diagnosis of
 # kube-dns saturation during a rapid GKE Standard node-pool scale-up from 15
 # to 180 nodes, graded on the KUBE-DNS-UNDERSCALED verdict line and
