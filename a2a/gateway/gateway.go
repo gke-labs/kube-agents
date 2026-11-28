@@ -740,6 +740,12 @@ func New(o Options) (*Gateway, error) {
 		relayDurable:     o.RelayDurable,
 		relayPrecreated:  o.Config.RelayPrecreated && o.RelayDurable == relayDurable,
 	}
+	// The relay's reports are also stored in the session-state bucket, so a
+	// reply under one outlives a restart (reports.go, reportstore.go).
+	g.reports.log = log
+	if o.Client != nil {
+		g.reports.durable = gatewayReports{g: g}
+	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
 			g.handleInbound(msg)
@@ -1059,6 +1065,9 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	g.startProfileDirectory(ctx)
 	g.startTriggerIngress(ctx)
 	go g.reapLoop(ctx)
+	if g.reports.durable != nil {
+		go g.reportPruneLoop(ctx)
+	}
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
 		go g.capQueueLoop(ctx)
@@ -3627,6 +3636,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// dispatcher reads taskParameters alone (dispatch/admission.go).
 	// A chat thread's kept reports are forgotten once this turn is on the
 	// bus (below), not here: a publish that fails leaves them for the retry.
+	// A session-routed thread's are not forgotten at all (relayedReport
+	// returns no number): every opening turn there carries the newest.
 	var threadReportRead uint64
 	if ts.Role == "" {
 		if report, seq, ok := g.relayedReport(rec, ts.ReplyTo); ok {
@@ -4003,7 +4014,9 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 	// thread's kept reports are forgotten, so they do not ride a later,
 	// unrelated opening turn (pushedReports). A report kept since that task
 	// opened is not carried either; the executor's own lookup serves it.
-	if lib.ThreadKeyedConversation(rec.Key) {
+	// A session-routed thread keeps them: its every opening turn carries
+	// the newest, and the pod frames one it was already shown only once.
+	if lib.ThreadKeyedConversation(rec.Key) && !rec.SessionRouted {
 		g.reports.forget(rec.Key)
 	}
 	// The steer is on the stream, and what happens next is the route's

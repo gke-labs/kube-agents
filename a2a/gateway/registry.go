@@ -1323,28 +1323,37 @@ func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error
 // Callers at term 0 don't call it: term 0 writes exactly as an unfenced
 // registry did (unfenced).
 func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string, mine uint64) (uint64, error) {
+	_, rev, err := r.fencedKey(ctx, kv, kvKey(sessionKey), "session "+sessionKey, mine)
+	return rev, err
+}
+
+// fencedKey is fencedRecord for any key in the bucket whose value carries
+// the writer's term as "epoch": the stored entry (nil when absent), its
+// revision, and ErrFenced as fencedRecord says. label names the key in an
+// error. The report rows (reportstore.go) are fenced through it too.
+func (r *Registry) fencedKey(ctx context.Context, kv jetstream.KeyValue, key, label string, mine uint64) (jetstream.KeyValueEntry, uint64, error) {
 	term, _, err := readTerm(ctx, kv)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	if term > mine {
-		return 0, r.fenced(fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", sessionKey, termKey, term, mine, ErrFenced))
+		return nil, 0, r.fenced(fmt.Errorf("%s: term counter %s at %d is past this gateway's term %d: %w", label, termKey, term, mine, ErrFenced))
 	}
 	if r.afterTermRead != nil {
 		r.afterTermRead()
 	}
-	entry, err := kv.Get(ctx, kvKey(sessionKey))
+	entry, err := kv.Get(ctx, key)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return 0, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("session %s: %w", sessionKey, err)
+		return nil, 0, fmt.Errorf("%s: %w", label, err)
 	}
 	var stored struct {
 		Epoch uint64 `json:"epoch"`
 	}
 	if err := json.Unmarshal(entry.Value(), &stored); err != nil {
-		return entry.Revision(), nil
+		return entry, entry.Revision(), nil
 	}
 	if stored.Epoch > mine {
 		if stored.Epoch > term {
@@ -1356,20 +1365,20 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 			if rerr != nil {
 				// Unsettled: a new term or a reset. Not a step-down, since a
 				// reset would hand the same refusal to the next replica.
-				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s read a moment ago at %d, and reading the counter again failed (%v): %w",
-					sessionKey, stored.Epoch, termKey, term, rerr, ErrFenced)
+				return nil, 0, fmt.Errorf("%s carries term %d, above the term counter %s read a moment ago at %d, and reading the counter again failed (%v): %w",
+					label, stored.Epoch, termKey, term, rerr, ErrFenced)
 			}
 			if stored.Epoch > now {
 				// Not a newer term, so not a step-down: every replica would
 				// start a term under this record, be refused, and step down
 				// in turn. The write fails, naming the counter to fix.
-				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
-					sessionKey, stored.Epoch, termKey, now, ErrFenced)
+				return nil, 0, fmt.Errorf("%s carries term %d, above the term counter %s at %d (the counter was reset): %w",
+					label, stored.Epoch, termKey, now, ErrFenced)
 			}
 		}
-		return 0, r.fenced(fmt.Errorf("session %s: %w", sessionKey, ErrFenced))
+		return nil, 0, r.fenced(fmt.Errorf("%s: %w", label, ErrFenced))
 	}
-	return entry.Revision(), nil
+	return entry, entry.Revision(), nil
 }
 
 // NewRegistry binds a registry to the client's session-state bucket.

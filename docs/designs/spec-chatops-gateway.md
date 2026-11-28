@@ -2280,8 +2280,17 @@ or the alert the thread hangs under, as about this one; the bridge's own lookup 
 before); a turn naming none anywhere else carries nothing. The turn's submission gets it as a
 `pushedReport` part (`spec-a2a-payloads.md`), which the hermes-bridge frames ahead of the words on
 the platform route, the install's default; the a2a-worker, which runs session pods and profile
-tasks, reads text parts only and does not frame it yet. Process memory: a restart forgets every report, and a reply then falls back to the
-executor's own lookup (`a2a/docs/hermes-bridge.md`).
+tasks, reads text parts only and does not frame it yet. Memory is the first read; each report is also
+stored in the gateway's `session-state` bucket under `report.<sha256 of chat id and thread id>`
+(`lib.ReportRecord`, at the addresses `lib.ReportAddresses` gives, which are the hermes-bridge's
+incident addresses): a thread's newest report at the thread's address, a console report at
+`(key, key#root)`. A read memory has nothing for falls back to the bucket, so a reply after a restart
+or a failover still carries its report, and the first opening turn in a thread after one carries the
+thread's newest report once (memory's note of what it forgot does not survive the process). Writes
+are fenced by the gateway term as session records are and replace only the relay's own rows; the
+active gateway prunes rows past 14 days (session-kv's incident retention) and the oldest past
+4096 rows or 32 MiB. A bucket error leaves the turn on memory alone, and a reply memory and the
+bucket miss falls back to the executor's own lookup (`a2a/docs/hermes-bridge.md`).
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
