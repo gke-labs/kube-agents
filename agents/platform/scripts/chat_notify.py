@@ -75,6 +75,10 @@ SLACK_PLATFORM = "slack"
 #: thread's own conversation, or nothing).
 TEAMS_PLATFORM = "teams"
 TEAMS_ID_SEGMENTS = 2
+# What a Teams thread's id carries after its conversation: the post that opened
+# it. A personal or group chat has no threads, and the gateway names the chat
+# itself as where a post there landed.
+TEAMS_THREAD_TOKEN = ";messageid="
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
 # bus URL and an identity, A2A_BUS_USER or the older NATS_USER.
 BUS_URL_ENV = "NATS_URL"
@@ -393,6 +397,18 @@ def route_unavailable(returncode: int) -> bool:
 def kept(returncode: int) -> bool:
     """Whether a failed send was kept by the gateway for its digest (nothing posted now; do not re-send)."""
     return returncode == NOTIFY_KEPT
+
+
+def names_thread(platform: str, thread_id: str) -> bool:
+    """Whether ``thread_id`` names a thread a later post can reply into.
+
+    False for an empty id, and for a Teams id with no thread in it: a personal
+    or group chat, where a post "on that thread" is a post of its own in the
+    chat.
+    """
+    if not thread_id:
+        return False
+    return platform != TEAMS_PLATFORM or TEAMS_THREAD_TOKEN in thread_id
 
 
 def thread_from_response(platform: str, response: dict) -> str:

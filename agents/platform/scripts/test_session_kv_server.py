@@ -1290,6 +1290,14 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
             self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         session_kv_server._record_alert_title.assert_called_once()
 
+    def test_under_next_a_microsoft_teams_thread_gets_the_title(self):
+        # The gateway lays the plan out on Teams too, when it holds Teams.
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "teams"}), \
+             patch.object(session_kv_server, "enabled_chat_platforms", return_value=["teams"]):
+            alert = self._run(lambda _platform, _msg, _session: "19:h@thread.tacv2;messageid=1")
+        self.assertEqual([c.args for c in alert.call_args_list], [("teams", "alert", "s1")])
+        session_kv_server._record_alert_title.assert_called_once()
+
     def test_the_alert_goes_to_one_platform_when_both_are_routed(self):
         # both routed: _trigger_agent_troubleshooter posts the initial alert to google_chat only (CHAT_PLATFORMS order),
         # registers one session route, and logs the "will not receive it" warning naming slack.
@@ -4884,6 +4892,31 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
         self.assertEqual(send.call_args_list[1].args[2:], ("spaces/AAA", "spaces/AAA/threads/T1"))
 
+    def test_second_report_same_day_in_a_teams_chat_is_a_post_of_its_own(self):
+        # A Teams personal chat has no threads: the gateway names the chat as
+        # where the first report landed, and a second one sent "on that thread"
+        # would be drawn as a reply, with no rating controls.
+        chat = "a:1UxxASmI_WSV5PQj3K0Nd3K292l62BfKLXmPpH6cQlZN7Ogxu7L"
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "teams"}), \
+             patch.object(session_kv_server, "enabled_chat_platforms", return_value=["teams"]), \
+             patch.object(session_kv_server, "_send_to_chat", return_value=chat) as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "j2t", "report": "first"})
+            self.client.post("/v1/cron-reports", json={"job_id": "j2t", "report": "second"})
+
+        self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
+        self.assertEqual(send.call_args_list[1].args[2:], ("", ""))
+
+    def test_second_report_same_day_in_a_teams_channel_replies_into_the_first_thread(self):
+        thread = "19:11fb65f1e6c941b382a410dd0e383724@thread.tacv2;messageid=1794603936403"
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "teams"}), \
+             patch.object(session_kv_server, "enabled_chat_platforms", return_value=["teams"]), \
+             patch.object(session_kv_server, "_send_to_chat", return_value=thread) as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "j2c", "report": "first"})
+            self.client.post("/v1/cron-reports", json={"job_id": "j2c", "report": "second"})
+
+        self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
+        self.assertEqual(send.call_args_list[1].args[3], thread)
+
     def test_a_delivered_report_reads_as_relayed_ok(self):
         """`relay` and `relay_detail` stay in the answer for the callers that read them."""
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
@@ -6657,6 +6690,21 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
         self.assertEqual(text, self.REPORT)
 
+    def test_under_next_the_card_goes_to_the_gateway_on_microsoft_teams_too(self):
+        # The gateway draws each row's Retry and Drop on Teams, under the row.
+        os.environ["A2A_NOTIFY_PLATFORM"] = "teams"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("19:h@thread.tacv2;messageid=1")
+        ) as via:
+            response, calls = self._post(platforms=("teams",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "teams")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["rows"][0]["tasks"], ["t_1"])
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
     def test_under_next_the_card_goes_to_the_gateway_with_its_rows_actions(self):
         os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
         with patch.object(
@@ -7282,6 +7330,22 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
         self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["schema"], "kube-agents.chat/v1")
+        self.assertTrue(text)
+
+    def test_under_next_the_headline_card_goes_to_the_gateway_on_microsoft_teams(self):
+        # The gateway lays the card out on Teams, as on Google Chat, and posts
+        # into its home conversation itself.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "teams"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("19:h@thread.tacv2;messageid=1")
+        ) as via:
+            response, calls = self._post(platforms=("teams",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "teams")
         chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["schema"], "kube-agents.chat/v1")
         self.assertTrue(text)

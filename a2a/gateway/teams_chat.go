@@ -19,8 +19,8 @@ import (
 // it draws a choice as an Action.Submit whose data carries the reply the
 // press stands for (teams_clicks.go) and a link as an Action.OpenUrl. The
 // fold is drawn open: a card's own show-and-hide is one more control, and
-// Google Chat draws it open too. A row's Retry and Drop are not drawn; the
-// board card is not served on Teams.
+// Google Chat draws it open too. A row's Retry and Drop go under the row
+// (teams_board.go).
 //
 // A card that would not fit one activity is refused (ErrLayoutRefused), so
 // the gateway posts the text: the fitting Post falls back to would send it
@@ -82,12 +82,14 @@ var (
 	errTeamsChatEmpty    = errors.New("the chat message lays nothing out")
 )
 
-// teamsChatLayout is a rendered chat message: the card's text, and its
-// choice and link buttons in the schema's order.
+// teamsChatLayout is a rendered chat message: the card's text, its choice
+// and link buttons in the schema's order, and the buttons of the rows that
+// ask for them (teams_board.go).
 type teamsChatLayout struct {
 	Text    string
 	Choices []map[string]any
 	Links   []map[string]any
+	Rows    []map[string]any
 }
 
 // renderTeamsChat lays m out, or says it lays nothing out.
@@ -100,6 +102,7 @@ func renderTeamsChat(m *chatmsg.Message) (teamsChatLayout, error) {
 	}
 	add(teamsChatHead(m))
 	add(teamsChatFlat(m.Detail))
+	beforeRows := strings.Join(sections, teamsChatSectionGap)
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(teamsChatPlan(m.Plan))
 	} else {
@@ -113,6 +116,9 @@ func renderTeamsChat(m *chatmsg.Message) (teamsChatLayout, error) {
 		Text:    strings.Join(sections, teamsChatSectionGap),
 		Choices: teamsChoiceActions(m.Choices),
 		Links:   teamsLinkActions(m.Links),
+	}
+	if m.Plan == nil || len(m.Plan.Items) == 0 {
+		layout.Rows = teamsBoardRowSets(m.Rows, beforeRows)
 	}
 	if layout.Text == "" && len(layout.Choices) == 0 && len(layout.Links) == 0 {
 		return teamsChatLayout{}, errTeamsChatEmpty
@@ -189,21 +195,28 @@ func teamsChatFlat(text string) string {
 func teamsChatRows(rows []chatmsg.Row) string {
 	var lines []string
 	for _, r := range rows {
-		text := strings.TrimPrefix(gchatOneLine(r.Text), teamsChatRowBullet)
-		if text == "" && r.Severity == "" {
-			continue
+		if line, ok := teamsChatRowLine(r); ok {
+			lines = append(lines, line)
 		}
-		line := teamsChatRowBullet
-		if r.Severity != "" {
-			line += teamsBoldLine(r.Severity) + " "
-		}
-		line += text
-		if detail := gchatOneLine(r.Detail); detail != "" {
-			line += teamsChatRowDetailSep + detail
-		}
-		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// teamsChatRowLine is a row's bullet, or false for a row that draws nothing.
+func teamsChatRowLine(r chatmsg.Row) (string, bool) {
+	text := strings.TrimPrefix(gchatOneLine(r.Text), teamsChatRowBullet)
+	if text == "" && r.Severity == "" {
+		return "", false
+	}
+	line := teamsChatRowBullet
+	if r.Severity != "" {
+		line += teamsBoldLine(r.Severity) + " "
+	}
+	line += text
+	if detail := gchatOneLine(r.Detail); detail != "" {
+		line += teamsChatRowDetailSep + detail
+	}
+	return line, true
 }
 
 // teamsChatAfter is the lines that follow the rows.
@@ -331,8 +344,8 @@ func teamsLinkActions(links []chatmsg.Link) []map[string]any {
 }
 
 // teamsChatCard is what one laid-out message shows: its text, its choice
-// buttons, and the buttons a rewrite keeps (links, Stop, the rating
-// controls).
+// buttons, and the buttons a rewrite keeps (links, a board row's Retry and
+// Drop, Stop, the rating controls).
 type teamsChatCard struct {
 	text    string
 	choices []map[string]any
@@ -358,7 +371,7 @@ func (a *TeamsAdapter) chatCard(messageID string, m OutMessage) (teamsChatCard, 
 	if err != nil {
 		return teamsChatCard{}, fmt.Errorf("%w: %w", ErrLayoutRefused, err)
 	}
-	card := teamsChatCard{text: layout.Text, choices: layout.Choices, rest: layout.Links}
+	card := teamsChatCard{text: layout.Text, choices: layout.Choices, rest: append(layout.Links, layout.Rows...)}
 	if len(layout.Choices) == 0 {
 		card.text = a.withAnsweredLine(messageID, card.text)
 	}

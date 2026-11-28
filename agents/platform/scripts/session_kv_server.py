@@ -1366,9 +1366,9 @@ DRIFT_UNKNOWN_FIELD = "unknown"
 # misstate it. The title is stored on the session's routing row, where
 # gateway/slack_ux_incident.py reads it; Slack's rename refuses `·`, so " in ".
 SLACK_PLATFORM = "slack"
-# The platforms a cron report's card goes to: Slack, and Google Chat where the gateway
-# routes it and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
-CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM)
+# The platforms a cron report's card goes to: Slack, and Google Chat and Microsoft Teams
+# where the gateway routes it and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
+CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM, chat_notify.TEAMS_PLATFORM)
 CRASHLOOP_REASON = "CrashLoopBackOff"
 BACKOFF_REASON = "BackOff"
 IMAGE_PULL_MARKER = "pulling image"
@@ -5361,7 +5361,7 @@ def trigger_agent_troubleshooter(
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
-    Chat through the gateway, with ``alert_kind`` beside it.
+    Chat or Microsoft Teams through the gateway, with ``alert_kind`` beside it.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
@@ -5918,8 +5918,8 @@ class AuditHeadline(NamedTuple):
 def _card_platform(platform: str, chat_id: str) -> bool:
     """Whether a cron report's card goes to ``platform``: with ``KAGE_SLACK_UX`` on, Slack
     (Block Kit through the relay, or a chat message through the gateway when
-    it holds Slack), or Google Chat when the gateway routes it, where the gateway
-    lays the chat message out; and a destination, the thread's chat or the home
+    it holds Slack), or Google Chat or Microsoft Teams when the gateway routes it, where
+    the gateway lays the chat message out; and a destination, the thread's chat or the home
     channel, which the gateway holds itself for the platform it routes."""
     routed = chat_notify.routes(platform)
     if not slack_presenter.enabled() or platform not in CARD_PLATFORMS or not (platform == SLACK_PLATFORM or routed):
@@ -5931,7 +5931,7 @@ def _slack_audit_headline(
     platform: str, message: str, chat_id: str, profile: str, job_id: str, deadline: float
 ) -> AuditHeadline | None:
     """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with on a
-    card platform: Slack, or Google Chat through the gateway.
+    card platform: Slack, or Google Chat or Microsoft Teams through the gateway.
 
     None, and the leg posts `message` as it always has, unless every condition
     holds: the flag is on, the leg is a card platform with a channel known
@@ -6289,11 +6289,11 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
 def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) -> dict | None:
     """With ``KAGE_SLACK_UX`` on, the board-health card the report was said with (:mod:`board_health_card`).
 
-    None, and the leg posts the report as written, unless the leg is Slack, the
-    flag is on, a channel is known (the leg's chat id or the Slack home
-    channel), the job is ``kanban-board-health``, and its card file was written
-    for this very report. Never raises: a card that cannot be read posts as
-    text.
+    None, and the leg posts the report as written, unless the leg is a card
+    platform (:func:`_card_platform`), the flag is on, a channel is known (the
+    leg's chat id or the home channel), the job is ``kanban-board-health``, and
+    its card file was written for this very report. Never raises: a card that
+    cannot be read posts as text.
     """
     if job_id != kanban_board_health.JOB_ID or not _card_platform(platform, chat_id):
         return None
@@ -6839,6 +6839,12 @@ def relay_cron_report(
     nudge = None if truncation_notice else _load_findings_nudge_card(report, job_id)
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
+        if leg_thread_id and not chat_notify.names_thread(platform, leg_thread_id):
+            # The day's earlier report landed in a home with no threads (a
+            # Teams personal or group chat). This one is a post of its own
+            # there, so it goes out as the first did and the gateway draws
+            # it as a report, rating controls included, not as a reply.
+            leg_chat_id, leg_thread_id = "", ""
         try:
             headline = _slack_audit_headline(
                 platform, report, leg_chat_id, profile, job_id, posts_deadline

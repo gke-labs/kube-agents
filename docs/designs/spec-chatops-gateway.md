@@ -3290,13 +3290,27 @@ the plan with a status mark per item and a tick or an open mark per step, or the
 bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
 the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
 carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
-line's Stop button and the rating controls. A row's Retry and Drop are not drawn. A home post
+line's Stop button and the rating controls. A home post
 goes through `PostNotifyMessage`, laid out the same way. A card that fits one activity only
 without the rating controls is posted without them. A
 layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
 (`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
 `ErrTextOnly` as before. The shared cases lay out as the golden files in
 `a2a/gateway/testdata/teams-chat/` say (`TestTeamsChatGolden`).
+
+A row that carries `tasks` and `actions` (the board-health card's; "The board-health card's
+buttons" under the Slack adapter) gets its Retry and Drop under the row itself, as an
+`ActionSet` in the card's body (`teams_board.go`), so the rows are not numbered. A press is
+never a turn: the adapter admits the presser by the inbound allowlist (`BoardAdmits`), sends the
+action over the board route off the pull loop, and redraws the row from the card it remembers:
+the buttons give way to Google Chat's settled line, with who pressed and the time in UTC, and a
+press that did not land keeps the buttons under a line saying so. One press per row at a time,
+and a press on a row the remembered card has settled acts on nothing.
+A press carries no card content, so on a card the adapter no longer remembers, one posted before a
+restart included, the press still acts and its line is posted in the conversation as a new
+message that opens with the row's text, which the buttons carry. The session-kv relay hands its cron cards to the gateway for Teams as for Google Chat
+(`CARD_PLATFORMS`): the board-health card, the fleet-audit cards and the alert title that heads
+the plan.
 
 A press of a choice (`teams_clicks.go`) arrives as the Stop press does and becomes the turn its
 reply spells, marked a click, from the presser, so the allowlist decides as for a typed
