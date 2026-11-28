@@ -965,6 +965,11 @@
 # the onboarding lock, like bootstrap-inventory-ranking-delivery.
 ./tasks/bootstrap-inventory-posture-scope/task.yaml
 
+# Probe for GPU sharing interaction with multi-GPU ComputeClass fallback
+# rules across G4/L4/T4 pools (#7351, #2900, #7555). Structured two-line
+# declaration check; deployer: noop, read-only.
+./tasks/capacity-gpu-sharing-g4-l4-t4-fallback/task.yaml
+
 # GPU zonal capacity skew and ComputeClass fallback chain (#2900, #3007, #7182):
 # asymmetric zonal GPU splits are fixed with declarative ComputeClass fallback
 # rules and topology spread rather than custom polling scripts. deployer: noop.
