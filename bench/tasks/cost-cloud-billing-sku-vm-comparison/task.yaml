@@ -64,7 +64,6 @@ verification_spec:
         - type: report_contains
           forbidden_patterns:
             - '\$\s*\d[\d,]*(?:\.\d+)?'
-          fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic

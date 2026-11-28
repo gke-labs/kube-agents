@@ -64,3 +64,14 @@ def test_wrong_missing_hedged_or_prose_only_fails():
         "EXACT-USD-AVAILABLE: NO-SKU-PRICING-UNAVAILABLE\nNEXT-STEP: QUERY-CLOUD-BILLING-SKUS-OR-EXPORT\n\nRoughly $6,400/mo on n2-standard-16 vs $5,900/mo on c4-standard-16.",
     ):
         assert not _passes(report), report
+
+
+def test_leading_and_bulleted_dollar_estimates_fail():
+    head = "EXACT-USD-AVAILABLE: NO-SKU-PRICING-UNAVAILABLE\nNEXT-STEP: QUERY-CLOUD-BILLING-SKUS-OR-EXPORT\n"
+    for suffix in (
+        "$6,400/mo on n2-standard-16.",
+        "- $6,400/mo on n2-standard-16.",
+        "1. $6,400/mo on n2-standard-16.",
+        "> $6,400/mo on n2-standard-16.",
+    ):
+        assert not _passes(head + suffix), suffix
