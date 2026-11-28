@@ -40,7 +40,9 @@ pinned by `test_fleet_stockout.py` against captured responses:
   `jsonPayload.resultInfo.results[].errorMsg.{messageId, parameters[]}` is a
   scale-up that was attempted and failed — the live sample carried
   `scale.up.error.out.of.resources` with the affected instance group in
-  `parameters[0]`. `jsonPayload.noDecisionStatus.noScaleUp
+  `parameters[0]`, and an entry that a throwaway cluster (GKE 1.35.8) logged
+  on 2026-11-18 carries `scale.up.error.reservation.not.found` in the same
+  shape. `jsonPayload.noDecisionStatus.noScaleUp
   .unhandledPodGroups[].napFailureReasons[].messageId` is the
   node-auto-provisioning side, which never gets as far as an attempt. Healthy
   ticks carry neither and write `jsonPayload.status` instead.
@@ -134,17 +136,22 @@ DYNAMIC_RWO_MIN_LABEL = ".".join(str(n) for n in DYNAMIC_RWO_MIN_VERSION)
 GKE_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 # §3.11. The three message ids that mean a scale-up failed for want of
-# capacity, quota or pod IPs. Every other id the autoscaler emits is a
-# scheduling decision rather than a stockout -- `scale.up.error.waiting.for
-# .instances.timeout` and the `no.scale.up.in.backoff` family are the common
-# ones -- and matching them would turn an ordinary busy cluster critical.
+# capacity, quota or pod IPs, and the one for a node pool whose named
+# reservation was not found: that pool consumes nothing else, so each of its
+# scale-ups fails until the reservation exists. Every other id the autoscaler
+# emits is a scheduling decision rather than a stockout -- `scale.up.error
+# .waiting.for.instances.timeout` and the `no.scale.up.in.backoff` family are
+# the common ones -- and matching them would turn an ordinary busy cluster
+# critical.
 AUTOSCALER_LOG_ID = "container.googleapis.com/cluster-autoscaler-visibility"
 AUTOSCALER_FRESHNESS_HOURS = 24
 AUTOSCALER_FRESHNESS = f"{AUTOSCALER_FRESHNESS_HOURS}h"
 AUTOSCALER_LOG_LIMIT = 1000
 AUTOSCALER_OUT_OF_RESOURCES = "scale.up.error.out.of.resources"
+AUTOSCALER_RESERVATION_NOT_FOUND = "scale.up.error.reservation.not.found"
 AUTOSCALER_STOCKOUT_MESSAGE_IDS = {
     AUTOSCALER_OUT_OF_RESOURCES,
+    AUTOSCALER_RESERVATION_NOT_FOUND,
     "scale.up.error.quota.exceeded",
     "scale.up.error.ip.space.exhausted",
 }
@@ -644,7 +651,8 @@ MISSING_RESERVATION_IMPACT = (
     "pool's zones, so the pool cannot add a node; with autoscaling on, the autoscaler reports "
     "`scale.up.error.reservation.not.found`."
 )
-# The `needs_triage` marker on a §3.10(d) finding: each fix creates billed
+# The `needs_triage` marker on a §3.10(d) finding, and on a §3.11 finding for
+# `scale.up.error.reservation.not.found`: each fix creates billed
 # capacity or replaces the node pool, so the automatic sweep opens no pull
 # request for it even if the published remediation is a manifest. Read by
 # `triage_markers` in audit_report.py, as `NEW_COMPUTE_CLASS_TRIAGE` is.
@@ -654,6 +662,29 @@ RESERVED_POOL_TRIAGE = "reserved-pool"
 # `{reservation name: zones}`.
 RESERVED_POOLS_KEY = "_reserved_pools"
 RESERVATION_ZONES_KEY = "_reservation_zones"
+# §3.11 for `scale.up.error.reservation.not.found`: the sentence of this id,
+# since the check's own sentence is about supply, quota and pod IPs. It says
+# what the log shows and gives the condition, not a present state: an entry
+# can be 24 hours old, and the owner can have made the reservation since.
+RESERVATION_NOT_FOUND_IMPACT = (
+    "The autoscaler tried to add a node to a node pool that can consume only a named reservation, and that "
+    "reservation was not found. While the reservation is not in one of the pool's zones, or this project cannot "
+    "consume it, the pool cannot add a node."
+)
+# The slug of §3.11.
+AUTOSCALER_CHECK = "autoscaler-out-of-resources"
+# The kind of a §3.11 finding's object, `ScaleUpError/<message id>`.
+SCALE_UP_ERROR_KIND = "ScaleUpError"
+# Entry key that carries the instance groups of that id's entries to
+# `collect_fleet`, which removes it: §3.10(d) files the same fault on the
+# node pool, and one fault is one finding.
+RESERVATION_SIGN_GROUPS_KEY = "_reservation_sign_groups"
+# The key of a reserved pool's instance group names, which `reserved_pool`
+# writes and `file_reserved_pools` reads.
+RESERVED_POOL_GROUPS_KEY = "groups"
+# How many more instance groups the excerpt of that id names after the first;
+# the rest are a count.
+RESERVATION_SIGN_MORE_GROUPS_SHOWN = 5
 # See `fleet_waste.AUDITABLE_STATUSES` for the reasoning, which applies
 # unchanged here: GKE sets `RECONCILING` while work proceeds on a cluster whose
 # API server stays up, it is transient and ordinary, and excluding it dropped
@@ -2166,10 +2197,10 @@ def reservations_argv(project: str) -> list[str]:
 
 
 def reserved_pool(pool: dict, project: str) -> dict | None:
-    """The zones and the `(owner project, name)` reservations of a production
-    node pool that consumes only named reservations (§3.10(d)); None for every
-    other pool. Run inside `collect_cluster`, so a value it cannot read costs
-    that cluster and not the fleet."""
+    """The zones, the `(owner project, name)` reservations and the instance
+    groups of a production node pool that consumes only named reservations
+    (§3.10(d)); None for every other pool. Run inside `collect_cluster`, so a
+    value it cannot read costs that cluster and not the fleet."""
     config = pool.get("config") or {}
     affinity = config.get("reservationAffinity") or {}
     if affinity.get("consumeReservationType") != POOL_SPECIFIC_RESERVATION:
@@ -2180,7 +2211,14 @@ def reserved_pool(pool: dict, project: str) -> dict | None:
     # §3.10 does not flag non-production.
     if is_non_production(pool.get("name", ""), {**(config.get("resourceLabels") or {}), **(config.get("labels") or {})}):
         return None
-    return {"pool": pool.get("name", ""), "zones": sorted(zones), "reservations": sorted(reservation_owner(value, project) for value in values)}
+    return {
+        "pool": pool.get("name", ""),
+        "zones": sorted(zones),
+        "reservations": sorted(reservation_owner(value, project) for value in values),
+        # By name, as the autoscaler's `reservation.not.found` entries are
+        # compared. A value that is no string names no group.
+        RESERVED_POOL_GROUPS_KEY: sorted(url.rsplit("/", 1)[-1] for url in pool.get("instanceGroupUrls") or [] if isinstance(url, str)),
+    }
 
 
 def reservation_owner(value: str, project: str) -> tuple[str, str]:
@@ -2218,10 +2256,15 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
 
     Run by `collect_fleet` after the cluster reads and the project reads, since
     each holds one half. `zones_by_project` has the projects whose reservations
-    were read; `swept` has every project of the run."""
+    were read; `swept` has every project of the run.
+
+    It also removes the entry's §3.11 candidate for
+    `scale.up.error.reservation.not.found` when each instance group that the
+    autoscaler named is of a pool filed here."""
     slug = "reservation-mismatch-risk"
     unread: list[str] = []
     outside: list[str] = []
+    filed_groups: set[str] = set()
     for reserved in entry.pop(RESERVED_POOLS_KEY, []):
         found = [(owner, name, zones_by_project.get(owner, {}).get(name, [])) for owner, name in reserved["reservations"]]
         if any(set(zones) & set(reserved["zones"]) for _, _, zones in found):
@@ -2254,6 +2297,14 @@ def file_reserved_pools(entry: dict, zones_by_project: dict[str, dict[str, list[
                     },
                 )
             )
+            filed_groups.update(reserved.get(RESERVED_POOL_GROUPS_KEY, []))
+    sign_groups = entry.pop(RESERVATION_SIGN_GROUPS_KEY, None)
+    if sign_groups and set(sign_groups) <= filed_groups:
+        # One fault, one finding: each group that the autoscaler named is of a
+        # pool filed above, and that finding's impact names the autoscaler's
+        # id. The log read stays recorded as run.
+        sign = (AUTOSCALER_CHECK, f"{SCALE_UP_ERROR_KIND}/{AUTOSCALER_RESERVATION_NOT_FOUND}")
+        entry["candidates"] = [c for c in entry["candidates"] if (c["check"], c["object"]) != sign]
     limitations: list[str] = []
     if unread:
         # Unevaluated, as a failed read is everywhere else here: the check
@@ -2366,6 +2417,11 @@ def check_autoscaler_out_of_resources(
     them: the fix is then a new class, not an edit to one, and a finding
     naming no group, or one this cannot place, is marked too, since the
     create case is the one the sweep must not open unattended.
+
+    A `reservation.not.found` finding carries its own impact sentence and is
+    marked `RESERVED_POOL_TRIAGE`, class-backed or not. Its excerpt names each
+    instance group and not only the first: the id can cover two node pools,
+    and §3.10(d) can file one of them and leave this finding for the other.
     """
     hits = []
     for message_id in sorted(message_ids):
@@ -2384,12 +2440,19 @@ def check_autoscaler_out_of_resources(
             if seen["first_seen"]
             else ""
         )
+        also = ""
+        if message_id == AUTOSCALER_RESERVATION_NOT_FOUND:
+            more = sorted({param.rsplit("/", 1)[-1] for param in seen["parameters"][1:]} - {where})
+            shown = more[:RESERVATION_SIGN_MORE_GROUPS_SHOWN]
+            if shown:
+                rest = len(more) - len(shown)
+                also = f"; also affected: {', '.join(shown)}{f' and {rest} more' if rest else ''}"
         hit = {
-            "object": f"ScaleUpError/{message_id}",
+            "object": f"{SCALE_UP_ERROR_KIND}/{message_id}",
             "excerpt": (
                 f"{message_id}, {seen['count']} occurrence"
                 f"{'' if seen['count'] == 1 else 's'} in the autoscaler "
-                f"visibility log{window}; first affected: {where}"
+                f"visibility log{window}; first affected: {where}{also}"
             ),
         }
         class_backed = bool(seen["parameters"]) and all(
@@ -2397,6 +2460,11 @@ def check_autoscaler_out_of_resources(
         )
         if message_id == AUTOSCALER_OUT_OF_RESOURCES and not class_backed:
             hit["needs_triage"] = NEW_COMPUTE_CLASS_TRIAGE
+        if message_id == AUTOSCALER_RESERVATION_NOT_FOUND:
+            # As §3.10(d): each fix creates billed capacity or replaces the
+            # node pool, so the sweep opens no pull request for it.
+            hit["impact"] = RESERVATION_NOT_FOUND_IMPACT
+            hit["needs_triage"] = RESERVED_POOL_TRIAGE
         hits.append(hit)
     return hits
 
@@ -3346,6 +3414,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # stderr and keeps the child's exit code, and the busiest cluster's window
     # is the one that reaches the cap.
     logs_unreadable = logging_result.rc == 0 and bool(logging_result.stdout.strip()) and object_list(entries) is None
+    # The instance groups of the `reservation.not.found` entries; None when the
+    # read has no such entry.
+    reservation_sign_groups: list[str] | None = None
     if logging_result.rc == 0 and not logs_unreadable:
         commands["autoscaler-out-of-resources"] = _record(shlex.join(logging_argv), logging_result)
         # The instance groups of pools a ComputeClass the cluster has put
@@ -3357,8 +3428,11 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             if ((pool.get("config") or {}).get("labels") or {}).get(COMPUTE_CLASS_LABEL) in compute_classes_by_name
             for url in pool.get("instanceGroupUrls") or []
         )
+        message_ids = autoscaler_message_ids(entries)
+        if AUTOSCALER_RESERVATION_NOT_FOUND in message_ids:
+            reservation_sign_groups = [param.rsplit("/", 1)[-1] for param in message_ids[AUTOSCALER_RESERVATION_NOT_FOUND]["parameters"]]
         # Stamped: a full page pops this slug's record below.
-        for hit in check_autoscaler_out_of_resources(autoscaler_message_ids(entries), class_backed_groups):
+        for hit in check_autoscaler_out_of_resources(message_ids, class_backed_groups):
             candidates.append(_emit("autoscaler-out-of-resources", {**hit, "command": shlex.join(logging_argv)}))
         if isinstance(entries, list) and len(entries) >= AUTOSCALER_LOG_LIMIT:
             # gcloud returns newest first, so a full page drops the oldest
@@ -3594,6 +3668,8 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     reserved_pools = [{**reserved, "command": pools_record["command"]} for pool in node_pools for reserved in [reserved_pool(pool, project)] if reserved]
     if reserved_pools:
         entry[RESERVED_POOLS_KEY] = reserved_pools
+    if reservation_sign_groups is not None:
+        entry[RESERVATION_SIGN_GROUPS_KEY] = reservation_sign_groups
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
     if unevaluated:

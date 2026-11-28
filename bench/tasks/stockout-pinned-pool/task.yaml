@@ -47,6 +47,14 @@
 # "missing-reservation-pool" on the seeded fleet that consumes only the
 # reservation "seeded-absent-reservation", which exists in no zone. The audit
 # must file a reservation finding against that pool.
+#
+# Third planted defect required: a zero-node pool named "dev-reserved-pool"
+# on the seeded fleet that autoscales from 0 to 1 node and consumes only the
+# same reservation, and the Deployment "reserved-batch", whose one pod only
+# that pool can hold. The autoscaler writes
+# scale.up.error.reservation.not.found into its visibility log for as long as
+# the pod is Pending. The audit must file an autoscaler finding for that
+# message id.
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
@@ -72,8 +80,9 @@ expected_output: >-
   place), and quantifies the shortfall in nodes or pods rather than issuing
   a generic capacity warning. The ledger also carries a reservation finding
   against missing-reservation-pool, whose named reservation exists in no
-  zone. The closing response is the SOP's one line, carrying the ledger URL
-  in full.
+  zone, and an autoscaler finding for scale.up.error.reservation.not.found,
+  the failed scale-up of dev-reserved-pool, which names the same reservation.
+  The closing response is the SOP's one line, carrying the ledger URL in full.
 infrastructure:
   deployer: noop
 validated: false
@@ -89,6 +98,7 @@ domain: capacity
 fixtures:
   - hpa-saturated
   - missing-reservation-pool
+  - missing-reservation-autoscaled
 
 # Graded against the LEDGER, not the chat reply: the stockout-prevention SOP
 # mandates a one-line closing response that deliberately restates nothing, so
@@ -141,6 +151,55 @@ verification_spec:
       scope: finding
       finding_check: reservation-mismatch-risk
       required_phrases: ["missing-reservation-pool"]
+  # The third planted defect: the pool "dev-reserved-pool" autoscales from 0
+  # to 1 node and consumes only the reservation "seeded-absent-reservation",
+  # and the one pod of "reserved-batch" can run only on that pool. The
+  # autoscaler tries to add a node, GKE does not find the reservation, and the
+  # autoscaler's visibility log gets scale.up.error.reservation.not.found
+  # (SOP 3.11). "dev" in the pool's name makes the pool non-production, so the
+  # pool comparison of SOP 3.10(d) files nothing on it, and the log is the
+  # only sign. Where 3.10(d) files the pool of each instance group that the
+  # log names, the collector files no 3.11 finding for this id: one fault is
+  # one finding.
+  # scope: finding -- the phrase is the message id, which is in the object of
+  # the finding ("ScaleUpError/<message id>"). The check ids differ, so this
+  # check cannot pass on the finding of the pool above, and the check above
+  # cannot pass on this finding. No other finding of the autoscaler check has
+  # this id in its object. This scope reads the object of a finding and not
+  # who filed it: a finding that a worker writes by hand under the autoscaler
+  # check passes too. The check below does not depend on the worker.
+  - name: an-autoscaler-finding-names-the-reservation-not-found-sign
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding
+      finding_check: autoscaler-out-of-resources
+      required_phrases: ["scale.up.error.reservation.not.found"]
+  # The same defect, read from the collector's side. The SOP's section 2 has
+  # the log query, and SOP 3.10(d) names the message id. So a worker can read
+  # the log by hand and file the id under the autoscaler check with no
+  # candidate of the collector, and the check above then passes. This check
+  # reads the Impact sentence that only the collector has for this id.
+  # `finish` writes that sentence onto the finding that has the check, the
+  # cluster, the namespace and the object of the candidate, in place of the
+  # worker's words.
+  # A collector that files no candidate for the id does not have the sentence.
+  # This check then fails, with or without a finding that a worker adds by
+  # hand.
+  # The default scope, the body -- the Impact line is not in the object or in
+  # the id of a finding. The reservation finding of the pool above is in the
+  # same body. Its Impact sentence is a different sentence, and does not hold
+  # this phrase.
+  - name: the-reservation-not-found-finding-has-the-collectors-impact
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      required_phrases:
+        - "tried to add a node to a node pool that can consume only a named reservation"
   # Cluster-state safeguard: the pool's node-pool config is GKE-level, but
   # the HPA half of the planted defect is a cluster object -- and raising its
   # cap is exactly the tempting "fix". Addressed by fixture ROLE, so it reads

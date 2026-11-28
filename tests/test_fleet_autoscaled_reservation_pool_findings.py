@@ -111,7 +111,10 @@ class ReservationCheckTest(unittest.TestCase):
 
     def test_the_reservation_check_still_names_the_pool_with_no_autoscaling(self):
         hit = fleet_stockout.reserved_pool(MISSING_RESERVATION_POOL, PROJECT)
-        self.assertEqual(hit, {"pool": "missing-reservation-pool", "zones": [ZONE], "reservations": [(PROJECT, "seeded-absent-reservation")]})
+        self.assertEqual(
+            hit,
+            {"pool": "missing-reservation-pool", "zones": [ZONE], "reservations": [(PROJECT, "seeded-absent-reservation")], "groups": []},
+        )
 
     def test_a_name_with_no_non_production_part_puts_the_pool_into_the_reservation_check(self):
         # Why the pool's name starts with `dev`.
