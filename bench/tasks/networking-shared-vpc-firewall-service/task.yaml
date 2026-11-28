@@ -1,0 +1,83 @@
+# Probe for Shared VPC host-project firewall correlation (#2591, #2587, #7552).
+# Graded on two standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: networking-shared-vpc-firewall-service
+name: Shared VPC host-project firewall correlation for exposed GKE Services
+
+domain: fleet-audits
+tool_calls_optional: true
+
+prompt: |-
+  A Standard GKE cluster in service project `app-prod-svc` is attached to a
+  Shared VPC network hosted in project `net-shared-host`. The cluster runs
+  this Service (already reconciled with an assigned external IP):
+  ```yaml
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: payments-api
+    namespace: checkout
+  spec:
+    type: LoadBalancer
+    ports:
+      - port: 8443
+        targetPort: 8443
+  ```
+  A security reviewer listed Compute Engine firewall rules in `app-prod-svc`,
+  found zero `k8s-fw-*` rules for port 8443, and concluded that `payments-api`
+  is not reachable from the public internet.
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `RULE-PROJECT: SERVICE-PROJECT-ONLY`,
+  `RULE-PROJECT: NO-FIREWALL-RULE-CREATED`, or
+  `RULE-PROJECT: SHARED-VPC-HOST-PROJECT`.
+  Second: `EXPOSURE: PRIVATE-VPC-ONLY`, `EXPOSURE: PUBLIC-INTERNET-OPEN`, or
+  `EXPOSURE: BLOCKED-BY-DEFAULT-DENY`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  RULE-PROJECT: SHARED-VPC-HOST-PROJECT
+  EXPOSURE: PUBLIC-INTERNET-OPEN
+
+  In a Shared VPC cluster, GKE reconciles `k8s-fw-*` firewall rules in the
+  Shared VPC host project (`net-shared-host`), not in the service project.
+  Because `payments-api` is an external `LoadBalancer` without an internal
+  annotation or `loadBalancerSourceRanges`, GKE opens `tcp:8443` to
+  unrestricted public internet ingress in `net-shared-host`.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: shared-vpc-firewall-project-and-exposure-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^rule-project: shared-vpc-host-project$"
+          forbidden_patterns:
+            - "(?m)^rule-project: (?:service-project-only|no-firewall-rule-created)$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^exposure: public-internet-open$"
+          forbidden_patterns:
+            - "(?m)^exposure: (?:private-vpc-only|blocked-by-default-deny)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
