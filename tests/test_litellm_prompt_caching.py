@@ -4,10 +4,12 @@ LiteLLM turns `cache_control_injection_points` into Anthropic cache markers on
 a Claude route, which is what they are for. On a Gemini route it turns the same
 markers into Vertex explicit context caching: a cachedContents list before
 every call and a create whenever the cached prefix is new, and a create Vertex holds past its request
-credential's life fails the turn. So the chart renders the breakpoints under
-the same Claude test as `additional_drop_params`, and the kustomize base keeps
-them in an anthropic overlay that the anthropic provider selects. The render
-cases need `helm` and skip without it.
+credential's life fails the turn. So the chart renders the breakpoints for a
+Claude model only: `anthropic`, `vertex_ai` with a `claude-` model name, and
+`openrouter` with an `anthropic/claude-` one, which OpenRouter bills in full on
+every call without them. The kustomize base keeps them in an anthropic overlay
+that the anthropic provider selects. The render cases need `helm` and skip
+without it.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ _BREAKPOINTS = [
     {"location": "message", "index": -3},
     {"location": "message", "index": -1},
 ]
+# OpenRouter's name for a Claude model: <vendor>/<model>.
+_OPENROUTER_CLAUDE = "anthropic/claude-opus-5"
 _HELM_BASE_ARGS = [
     "helm",
     "template",
@@ -61,7 +65,11 @@ class TestChartRender(unittest.TestCase):
         return yaml.safe_load(configmap["data"]["config.yaml"])
 
     def test_claude_gets_the_breakpoints(self) -> None:
-        for args in (_model_args("anthropic"), _model_args("vertex_ai", "claude-opus-5")):
+        for args in (
+            _model_args("anthropic"),
+            _model_args("vertex_ai", "claude-opus-5"),
+            _model_args("openrouter", _OPENROUTER_CLAUDE),
+        ):
             with self.subTest(args=args):
                 points = self._config(args)["router_settings"]["default_litellm_params"]["cache_control_injection_points"]
                 self.assertEqual(points, _BREAKPOINTS)
@@ -73,9 +81,40 @@ class TestChartRender(unittest.TestCase):
             _model_args("vertex_ai"),
             _model_args("vertex_ai", "gemini-3.1-pro-preview"),
             _model_args("openai"),
+            _model_args("openrouter", "google/gemini-3.8-flash"),
+            _model_args("openrouter", "openai/gpt-5.4"),
+            # The test is a prefix of the whole OpenRouter name: the vendor and
+            # the model family both, at the start.
+            _model_args("openrouter", "example/anthropic/claude-opus-5"),
+            _model_args("openrouter", "anthropic/not-claude"),
+            # Another router's Claude names are not OpenRouter's.
+            _model_args("azure", _OPENROUTER_CLAUDE),
         ):
             with self.subTest(args=args):
                 self.assertNotIn("router_settings", self._config(args))
+
+    def test_claude_behind_openrouter_is_cached_and_keeps_its_sampling_keys(self) -> None:
+        # The caching gate is wider than the drop's: OpenRouter answers
+        # temperature, top_p and top_k for a Claude model, so this render gets
+        # the breakpoints without additional_drop_params.
+        config = self._config(_model_args("openrouter", _OPENROUTER_CLAUDE))
+        points = config["router_settings"]["default_litellm_params"]["cache_control_injection_points"]
+        self.assertEqual(points, _BREAKPOINTS)
+        self.assertEqual(len(config["model_list"]), 3)
+        for entry in config["model_list"]:
+            self.assertEqual(entry["litellm_params"]["model"], f"openrouter/{_OPENROUTER_CLAUDE}", entry["model_name"])
+            self.assertNotIn("additional_drop_params", entry["litellm_params"], entry["model_name"])
+
+    def test_the_breakpoints_sit_beside_a_fallback_and_a_budget(self) -> None:
+        # router_settings is one block with four other tenants; the caching
+        # gate must add to it, not replace it, on the openrouter route too.
+        router = self._config(
+            _model_args("openrouter", _OPENROUTER_CLAUDE)
+            + ["--set-string", "litellm.fallback.reasoningEffort=low", "--set", "litellm.budget.usd=5"]
+        )["router_settings"]
+        self.assertEqual(router["default_litellm_params"]["cache_control_injection_points"], _BREAKPOINTS)
+        self.assertIn("fallbacks", router)
+        self.assertIn("openrouter", router["provider_budget_config"])
 
 
 class TestKustomize(unittest.TestCase):

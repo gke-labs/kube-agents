@@ -57,7 +57,7 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
-For a Claude model (`anthropic`, `vertex_ai` with a `claude-` model name, or `sap` with an `anthropic--` model name) the chart adds `additional_drop_params: ["temperature", "top_p", "top_k"]` under every alias. Claude Opus 5 refuses all three with a `400`, and a caller can send them without knowing which model sits behind `model-default`, so the gateway removes them from every request before it reaches the provider. A caller therefore cannot set sampling on any Claude model through the gateway. The kustomize dev copy does not render the key.
+For a Claude model (`anthropic`, `vertex_ai` with a `claude-` model name, or `sap` with an `anthropic--` model name) the chart adds `additional_drop_params: ["temperature", "top_p", "top_k"]` under every alias. Claude Opus 5 refuses all three with a `400`, and a caller can send them without knowing which model sits behind `model-default`, so the gateway removes them from every request before it reaches the provider. A caller therefore cannot set sampling on a Claude model behind any of these three providers. The kustomize dev copy does not render the key.
 
 To change the default on an installed system, re-run the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) and use the model-provider entry followed by **Save & Apply** — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
 
@@ -211,7 +211,7 @@ The chart is the only path that renders it. The kustomize dev copy carries no `r
 
 ### Prompt caching
 
-Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request. So when the default model is an Anthropic-family one (`MODEL_PROVIDER=anthropic`, or `vertex_ai` with a `claude-` model), the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in its `config.yaml`:
+Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request. So when the default model is an Anthropic-family one (`MODEL_PROVIDER=anthropic`, `vertex_ai` with a `claude-` model, or the `openrouter` provider slug with an `anthropic/claude-` model), the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in its `config.yaml`:
 
 ```yaml
 router_settings:
@@ -236,7 +236,7 @@ The system prompt takes the 1h tier because it is the largest static span, every
 
 Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into Vertex explicit context caching: before every model call it lists the project's cached contents, and it creates a new cache whenever the cached prefix is new. A create that Vertex is slow to finish fails the whole turn: in one case it surfaced as a 401 after a stall of more than ten minutes. Gemini's implicit caching needs no markers and still serves a repeated prefix from cache.
 
-The chart reads the same provider and model name as the sampling-key drop above, with one difference: a Claude model behind `sap` gets the drop and no breakpoints. Switching `MODEL_PROVIDER` re-renders both. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
+The chart reads the same provider and model name as the sampling-key drop above, with two differences: a Claude model behind `sap` gets the drop and no breakpoints, and a Claude model behind `openrouter` gets the breakpoints and no drop, because OpenRouter accepts the sampling keys. Switching `MODEL_PROVIDER` re-renders both. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model and `openrouter` with an `anthropic/claude-` one get them only through the chart.
 
 A caller can also bring its own markers. Claude Code marks its prompt-cache breakpoints itself, and the A2A worker adapter points it at the gateway without telling it which model is behind `model-default`. On a Gemini model LiteLLM would turn those markers into the same explicit-caching create, and `gemini-4-argon`, which has no explicit caching, answers every such request 400. The chart loads a pre-call hook that removes a caller's `cache_control` markers from a request bound for a Gemini model and leaves a request to any other model as sent. The gateway log records each request it changed, as `kube_agents.litellm_cache_control_strip INFO cache markers: dropped N cache_control marker(s) bound for a Gemini model`. The kustomize dev copy does not load it.
 
@@ -466,6 +466,8 @@ Model names follow SAP's `<publisher>--<model>` form; the default is `anthropic-
 ### Other LiteLLM providers
 
 Any other [LiteLLM provider](https://docs.litellm.ai/docs/providers) works the same way. Set `MODEL_PROVIDER` to the provider's slug (`azure`, `bedrock`, `databricks`, ...; lowercase letters, digits and underscores) and `MODEL_DEFAULT_NAME` to the model, which is required because the install has no default for it. Put the variables that driver reads from the environment in the Secret. Nothing else is derived: the gateway's NetworkPolicy reaches public endpoints on 443 and nothing private, the provider's own cost table applies, and the installer offers the entry as the sixth choice of its provider menu.
+
+[OpenRouter](https://openrouter.ai/docs) is one such slug: `MODEL_PROVIDER=openrouter`, `MODEL_DEFAULT_NAME` set to OpenRouter's `<vendor>/<model>` name, and `OPENROUTER_API_KEY` in the Secret. It is the one slug the chart derives anything for: a model whose name starts with `anthropic/claude-` gets the [prompt-caching](#prompt-caching) breakpoints.
 
 ## OpenAI-compatible endpoints (self-hosted or private)
 
