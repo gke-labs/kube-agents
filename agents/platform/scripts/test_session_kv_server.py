@@ -4892,6 +4892,31 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
         self.assertEqual(send.call_args_list[1].args[2:], ("spaces/AAA", "spaces/AAA/threads/T1"))
 
+    def test_second_report_same_day_in_a_teams_chat_is_a_post_of_its_own(self):
+        # A Teams personal chat has no threads: the gateway names the chat as
+        # where the first report landed, and a second one sent "on that thread"
+        # would be drawn as a reply, with no rating controls.
+        chat = "a:1UxxASmI_WSV5PQj3K0Nd3K292l62BfKLXmPpH6cQlZN7Ogxu7L"
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "teams"}), \
+             patch.object(session_kv_server, "enabled_chat_platforms", return_value=["teams"]), \
+             patch.object(session_kv_server, "_send_to_chat", return_value=chat) as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "j2t", "report": "first"})
+            self.client.post("/v1/cron-reports", json={"job_id": "j2t", "report": "second"})
+
+        self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
+        self.assertEqual(send.call_args_list[1].args[2:], ("", ""))
+
+    def test_second_report_same_day_in_a_teams_channel_replies_into_the_first_thread(self):
+        thread = "19:11fb65f1e6c941b382a410dd0e383724@thread.tacv2;messageid=1794603936403"
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "teams"}), \
+             patch.object(session_kv_server, "enabled_chat_platforms", return_value=["teams"]), \
+             patch.object(session_kv_server, "_send_to_chat", return_value=thread) as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "j2c", "report": "first"})
+            self.client.post("/v1/cron-reports", json={"job_id": "j2c", "report": "second"})
+
+        self.assertEqual(send.call_args_list[0].args[2:], ("", ""))
+        self.assertEqual(send.call_args_list[1].args[3], thread)
+
     def test_a_delivered_report_reads_as_relayed_ok(self):
         """`relay` and `relay_detail` stay in the answer for the callers that read them."""
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \

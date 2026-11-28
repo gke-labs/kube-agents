@@ -527,6 +527,14 @@ the one that would have to be answered before the flag could graduate, and the
 fix is not in the relay: it is to keep ticking the profiles the gateway no
 longer homes to.
 
+## A second report the same day, where the home has no threads
+
+A job's later report on the same UTC day replies into the thread its first report opened. A
+Microsoft Teams personal or group chat has no threads: the gateway names the chat itself as where
+the first report landed (`chat_notify.names_thread`). The relay sends the later report there as it
+sent the first, with no thread, so the gateway draws it as a report of its own, rating controls
+included, rather than as a reply.
+
 ## When the follow-up arrives outside the thread
 
 Context comes from the thread, so a follow-up that does not carry the thread gets

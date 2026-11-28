@@ -6839,6 +6839,12 @@ def relay_cron_report(
     nudge = None if truncation_notice else _load_findings_nudge_card(report, job_id)
     for platform in platforms:
         leg_chat_id, leg_thread_id = known_threads.get(platform, ("", ""))
+        if leg_thread_id and not chat_notify.names_thread(platform, leg_thread_id):
+            # The day's earlier report landed in a home with no threads (a
+            # Teams personal or group chat). This one is a post of its own
+            # there, so it goes out as the first did and the gateway draws
+            # it as a report, rating controls included, not as a reply.
+            leg_chat_id, leg_thread_id = "", ""
         try:
             headline = _slack_audit_headline(
                 platform, report, leg_chat_id, profile, job_id, posts_deadline
