@@ -686,13 +686,6 @@ FIXTURE_NOT_READY = {
         "read fails for a reason that is not the case's, and the blocked path is "
         "graded by the rule's unit tests on a recorded list"
     ),
-    # Needs the two orphaned-snapshot roles past their age gate: the GCE
-    # compute audit's 2.5 flags a snapshot only when
-    # (now - creationTimestamp).days > 90, and the timestamp is server-set,
-    # so the pool's snapshots of 2026-11-18 are invisible to the check until
-    # 2027-02-17. The entry goes in the pull request that moves the case to
-    # the nightly file on that date, once the fixture-state scan reads both
-    # roles ready on every pool project.
     # Needs a Deployment with a name of 47 characters or more whose live pod is
     # idle and whose replaced pod, inside the seven-day window, was busy. No
     # planted Deployment with a long name has a replaced pod.
@@ -700,6 +693,13 @@ FIXTURE_NOT_READY = {
         "#7048: needs the long-name-replaced-pod role, a long-named Deployment with an idle live pod "
         "and a busy pod replaced inside the audit's seven-day window; no pool project carries one"
     ),
+    # Needs the two orphaned-snapshot roles past their age gate: the GCE
+    # compute audit's 2.5 flags a snapshot only when
+    # (now - creationTimestamp).days > 90, and the timestamp is server-set,
+    # so the pool's snapshots of 2026-11-18 are invisible to the check until
+    # 2027-02-17. The entry goes in the pull request that moves the case to
+    # the nightly file on that date, once the fixture-state scan reads both
+    # roles ready on every pool project.
     "compute-declared-intent-no-finding": (
         "#1408: needs the declared-orphan-snapshot and orphan-snapshot roles past their "
         "91-day age gate (bench/tf/fleet/fixtures.json ready_after_hours); the pool's "
