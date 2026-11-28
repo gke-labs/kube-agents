@@ -1264,6 +1264,13 @@
 # windows and GPU duty-cycle metrics delivered via GitOps PR. deployer: noop.
 ./tasks/cost-p95-burst-gpu-duty-cycle-rightsizing/task.yaml
 
+# Standard-to-Autopilot workload migration readiness probe (#7094, ahead of
+# #5734): pure Q&A check that the agent reports VERDICT: MIGRATION-BLOCKED and
+# names both the privileged hostPath log-collector DaemonSet and the
+# hostNetwork batch Job as Autopilot migration blockers. deployer: noop,
+# transcript-only, no fixture.
+./tasks/cost-standard-to-autopilot-readiness/task.yaml
+
 # gke-labs#2610: a request to propose a fix, delegated to a platform card, is
 # answered in the card's result with the PodDisruptionBudget manifest, and no
 # worker runs submit_suggestion.py, during its run or after kanban_complete.
