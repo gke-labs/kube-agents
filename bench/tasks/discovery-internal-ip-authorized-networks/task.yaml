@@ -1,0 +1,73 @@
+# Regression probe for #2584 (#2591, #7559): internal IP vs. Authorized Networks.
+# Graded on two standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: discovery-internal-ip-authorized-networks
+name: Diagnose Master Authorized Networks block and select internal IP endpoint
+
+domain: fleet-audits
+tool_calls_optional: true
+
+prompt: |-
+  A discovery job runs on a GCE VM in VPC subnet `192.0.2.0/24` whose
+  outbound internet traffic egresses via Cloud NAT (`203.0.113.9`). It
+  connects to a GKE cluster in the same VPC with:
+  - `masterAuthorizedNetworksConfig.cidrBlocks`: `["192.0.2.0/24"]`
+  - Public control-plane endpoint: `198.51.100.5`
+  - Private internal control-plane endpoint: `192.0.2.10`
+  The job ran `gcloud container clusters get-credentials prod-cluster --region us-central1`
+  (with default flags), and subsequent `kubectl get nodes` calls fail with
+  `dial tcp 198.51.100.5:443: i/o timeout`.
+  An engineer proposes adding an unrestricted wildcard CIDR to
+  `masterAuthorizedNetworksConfig`.
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `CAUSE: CLUSTER-CONTROL-PLANE-DOWN`, `CAUSE: PUBLIC-ENDPOINT-BLOCKED-BY-AUTHORIZED-NETWORKS`, `CAUSE: RBAC-FORBIDDEN`, or `CAUSE: EXPIRED-CLIENT-CERTIFICATE`.
+  Second: `REMEDIATION: ALLOW-WILDCARD-CIDR`, `REMEDIATION: DISABLE-AUTHORIZED-NETWORKS`, or `REMEDIATION: USE-INTERNAL-IP-ENDPOINT`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  CAUSE: PUBLIC-ENDPOINT-BLOCKED-BY-AUTHORIZED-NETWORKS
+  REMEDIATION: USE-INTERNAL-IP-ENDPOINT
+
+  Default `get-credentials` writes the public endpoint (`198.51.100.5`),
+  so traffic leaves via Cloud NAT (`203.0.113.9`), which is outside the
+  `192.0.2.0/24` authorized networks CIDR and is dropped. Pass `--internal-ip`
+  to target `192.0.2.10` directly from `192.0.2.0/24` instead of opening the
+  control plane to a wildcard CIDR.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: authorized-networks-timeout-and-internal-ip-fix-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^cause: public-endpoint-blocked-by-authorized-networks$"
+          forbidden_patterns:
+            - "(?m)^cause: (?:cluster-control-plane-down|rbac-forbidden|expired-client-certificate)$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^remediation: use-internal-ip-endpoint$"
+          forbidden_patterns:
+            - "(?m)^remediation: (?:allow-wildcard-cidr|disable-authorized-networks)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
