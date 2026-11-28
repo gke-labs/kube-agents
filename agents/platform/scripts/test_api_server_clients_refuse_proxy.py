@@ -66,6 +66,7 @@ class _ApiServer:
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert), str(key))
         server.socket = context.wrap_socket(server.socket, server_side=True)
         test.addCleanup(server.server_close)
