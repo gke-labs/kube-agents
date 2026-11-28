@@ -332,12 +332,23 @@ func TestAppendMissingSubjectsOnARealServer(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	updates := 0
-	sub, err := nc.Subscribe("$JS.API.STREAM.UPDATE.>", func(*nats.Msg) { updates++ })
+	// Capture the pre-upgrade snapshot before AppendMissingSubjects mutates
+	// TOPICS-STATE so the restore checks below do not delete and recreate
+	// TOPICS-STATE on the same embedded server.
+	var snap bytes.Buffer
+	meta, err := Snapshot(ctx, nc, "TOPICS-STATE", &snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub, err := nc.SubscribeSync("$JS.API.STREAM.UPDATE.>")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sub.Unsubscribe()
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
 
 	added, err := AppendMissingSubjects(ctx, nc, policy)
 	if err != nil {
@@ -346,8 +357,14 @@ func TestAppendMissingSubjectsOnARealServer(t *testing.T) {
 	if !slices.Equal(added, []string{skewSubject}) {
 		t.Errorf("added = %v, want [%s]", added, skewSubject)
 	}
-	if updates != 1 {
-		t.Errorf("STREAM.UPDATE count = %d, want 1", updates)
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sub.NextMsg(2 * time.Second); err != nil {
+		t.Errorf("expected 1 STREAM.UPDATE, got error: %v", err)
+	}
+	if extra, _, err := sub.Pending(); err != nil || extra != 0 {
+		t.Errorf("extra STREAM.UPDATE messages = %d (err=%v), want 0", extra, err)
 	}
 	info, err := js.StreamInfo("TOPICS-STATE")
 	if err != nil {
@@ -369,46 +386,54 @@ func TestAppendMissingSubjectsOnARealServer(t *testing.T) {
 	if err != nil || len(addedAgain) != 0 {
 		t.Errorf("second AppendMissingSubjects: added=%v, err=%v", addedAgain, err)
 	}
-	if updates != 1 {
-		t.Errorf("STREAM.UPDATE count after no-op pass = %d, want 1", updates)
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if extra, _, err := sub.Pending(); err != nil || extra != 0 {
+		t.Errorf("STREAM.UPDATE messages after no-op pass = %d (err=%v), want 0", extra, err)
 	}
 
 	// Forward restore of a pre-upgrade TOPICS-STATE snapshot also appends the
 	// missing subject, while rollback restores the snapshot's own subject list.
-	if err := js.DeleteStream("TOPICS-STATE"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := js.AddStream(&preUpgrade); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := js.Publish("a2a.topics.shared.blueprint", []byte("starter")); err != nil {
-		t.Fatal(err)
-	}
-	var snap bytes.Buffer
-	meta, err := Snapshot(ctx, nc, "TOPICS-STATE", &snap)
+	// Each restore targets a fresh embedded server so js.DeleteStream's
+	// asynchronous filestore removal never races stream recreation.
+	forwardSrv := startServer(t, "a2a-nats-forward", t.TempDir(), 0)
+	defer shutdown(forwardSrv)
+	forwardNC, err := nats.Connect(forwardSrv.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := js.DeleteStream("TOPICS-STATE"); err != nil {
+	defer forwardNC.Close()
+	forwardJS, err := forwardNC.JetStream()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, opener(snap.Bytes()), Digest(snap.Bytes()), policy); err != nil {
+	if err := RestoreVerified(ctx, forwardNC, meta.Config, meta.State, meta.TakenAt, opener(snap.Bytes()), Digest(snap.Bytes()), policy); err != nil {
 		t.Fatalf("RestoreVerified on pre-upgrade TOPICS-STATE: %v", err)
 	}
-	restoredInfo, err := js.StreamInfo("TOPICS-STATE")
+	restoredInfo, err := forwardJS.StreamInfo("TOPICS-STATE")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(restoredInfo.Config.Subjects, wantSubjects) {
 		t.Errorf("forward-restored subjects = %v, want %v", restoredInfo.Config.Subjects, wantSubjects)
 	}
-	if err := js.DeleteStream("TOPICS-STATE"); err != nil {
+
+	rollbackSrv := startServer(t, "a2a-nats-rollback", t.TempDir(), 0)
+	defer shutdown(rollbackSrv)
+	rollbackNC, err := nats.Connect(rollbackSrv.ClientURL())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := RestoreAsItWas(ctx, nc, meta.Config, meta.State, opener(snap.Bytes()), Digest(snap.Bytes()), policy); err != nil {
+	defer rollbackNC.Close()
+	rollbackJS, err := rollbackNC.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreAsItWas(ctx, rollbackNC, meta.Config, meta.State, opener(snap.Bytes()), Digest(snap.Bytes()), policy); err != nil {
 		t.Fatalf("RestoreAsItWas on pre-upgrade TOPICS-STATE: %v", err)
 	}
-	rollbackInfo, err := js.StreamInfo("TOPICS-STATE")
+	rollbackInfo, err := rollbackJS.StreamInfo("TOPICS-STATE")
 	if err != nil {
 		t.Fatal(err)
 	}
