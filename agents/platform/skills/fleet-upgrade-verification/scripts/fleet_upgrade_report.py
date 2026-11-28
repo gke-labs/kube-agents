@@ -1289,7 +1289,14 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
     autopilot = bool((cluster.get("autopilot") or {}).get("enabled"))
     items, read_error, webhook_items = read["items"], read["error"], read.get("webhook_items")
     pdbs = None if items is None else readiness.grade_pdbs(*readiness.split_items(items))
-    webhooks = None if webhook_items is None else readiness.grade_webhooks(*readiness.split_webhook_items(webhook_items))
+    webhooks = (
+        None
+        if webhook_items is None
+        else readiness.grade_webhooks(
+            *readiness.split_webhook_items(webhook_items),
+            system_crd_applies=readiness.gke_system_crd_applies(master, target),
+        )
+    )
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
     addons = known_issues_matrix.inventory(read)  # once per member: the rule reads it from the context, the JSON carries it
@@ -1587,7 +1594,7 @@ def _pdb_cell(r: dict) -> str:
 
 
 def _webhook_cell(r: dict) -> str:
-    """Blocking findings first (the upgrade's path, or the bootstrap-policy writes a dead webhook reaching `kube-system` or `kube-public` would refuse); unreachable-backend webhooks outside both after them,
+    """Blocking findings first (the upgrade's path, the bootstrap-policy writes a dead webhook reaching `kube-system` or `kube-public` would refuse, or non-add-on system CRD writes on clusters running or upgrading to GKE >= 1.35); unreachable-backend webhooks outside all three after them,
     since they are an outage now even though they do not grade the member."""
     webhooks = r["webhooks"]
     if webhooks is None:
@@ -1944,7 +1951,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Path to write the report as JSON.")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
-    parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own; three gcloud list reads per project (backend services, instances, operations) and the server config per location feed them, one `clusters describe` and one `operations list` for the cluster confirm a member listed not RUNNING with no RUNNING operation, and the add-on inventory follows the readiness table.")
+    parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path, able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), or (on clusters running or upgrading to GKE >= 1.35) intercepting non-add-on system CRD writes, maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own; three gcloud list reads per project (backend services, instances, operations) and the server config per location feed them, one `clusters describe` and one `operations list` for the cluster confirm a member listed not RUNNING with no RUNNING operation, and the add-on inventory follows the readiness table.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
     parser.add_argument(READINESS_EXCLUDED_FLAG, default=None, help="project/location/cluster entries, space- or comma-separated, whose versions are graded but whose in-cluster readiness reads are skipped: the clusters spec.scope.exclude.clusters keeps the agents out of. Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")

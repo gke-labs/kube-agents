@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors, and answers whether one cluster is current for its channel (--cluster); run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, node-pool version skew, and what the per-entry rules of the upgrade-failure catalogue find, each a blocker or a risk that does not block (a zonal control plane is one). Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, plus the audit log through gcloud logging read when a registered rule reads it, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors, and answers whether one cluster is current for its channel (--cluster); run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks with an unreachable backend on upgrade-path, bootstrap RBAC (ClusterRoles/ClusterRoleBindings; Roles/RoleBindings in kube-system or kube-public), or GKE 1.35+ system CRD writes, maintenance exclusions and windows, node-pool version skew, and per-entry upgrade-failure catalogue rules, each a blocker or risk (a zonal control plane is one). Scans linked GitOps repositories for apiVersions the target removes, with replacements. Read-only against GCP, clusters and Git, from gcloud container, kubectl get, repository reads, and gcloud logging read when a rule needs it, keeping only its own run record and per-member kubeconfigs; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -13,10 +13,10 @@ fleet is from a release-channel default, whether one cluster's control plane is 
 channel (`--cluster <location>/<name>`), or whether the repositories are ready for a target
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs" and `references/track-a-rollout.md`).
-With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
-that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the
-upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and
-ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), a maintenance
+With `--readiness` it also says, per member, what would stop the upgrade: a drain-blocking
+PodDisruptionBudget, a fail-closed admission webhook with an unreachable backend on upgrade-path,
+bootstrap RBAC (ClusterRoles/ClusterRoleBindings; Roles/RoleBindings in kube-system or kube-public),
+or GKE 1.35+ non-add-on system CRD writes (when running or targeting `>= 1.35`), a maintenance
 exclusion or window, node pools too far below the target, or a blocker one of the per-entry rules
 of the upgrade-failure catalogue files, and, as risks that do not block, what those rules name to
 watch, a zonal control plane among them (see "Check upgrade readiness"). For upgrade plans,
@@ -249,13 +249,15 @@ backend, GKE's own URL-backed ones included, as a blocker.
   `namespaceSelector` admits `kube-system` or `kube-public` (absent or empty admits every
   namespace; a requirement the reader cannot evaluate counts as admitting; the two namespaces
   are judged on the labels the read returns for them, so an exemption label an operator put on
-  them reads as admission reads it; `CONTROL_PLANE_KUBE_SYSTEM_WRITES`). Its cell names the write and, for the namespaced rows, the
-  namespaces admitted. A ConfigMap gate is
+  them reads as admission reads it; `CONTROL_PLANE_KUBE_SYSTEM_WRITES`). On clusters running or
+  upgrading to GKE `>= 1.35`, non-add-on system CRD writes also block (`system_crd_write_matches`; see
+  `references/webhook-rule-classes.md`). Bootstrap RBAC cells name the write and admitted
+  namespaces. A ConfigMap gate is
   not on that list: the start-up ConfigMap write the Jetstack outage deadlocked on left the
   start-up path in Kubernetes 1.17, and its successor retries. The cell names the
   configuration, the webhook, the reason and what it matches (an outage cell lists the webhook's
   own rules, with their `apiVersions` when a rule pins any); each JSON finding carries
-  `reason`, `upgrade_path` and `rules`, split into `blocking` and `outage`; a fail-closed webhook whose backend answered is named under `answered`, by its identity keys alone. A fail-closed webhook with a URL backend is counted in the
+  `reason`, `upgrade_path`, `system_crd_matches` and `rules`, split into `blocking` and `outage`; a fail-closed webhook whose backend answered is named under `answered`, by its identity keys alone. A fail-closed webhook with a URL backend is counted in the
   JSON (`url_backends`) and never graded, because nothing read here says whether the URL answers;
   GKE installs two on every cluster. Fail-open webhooks are counted in the JSON (`fail_open`), and so is a fail-closed webhook with no `rules` (`no_rules`): it matches no request, so the server never calls it and a dead backend behind it fails nothing now.
 - **Maintenance** (`security_patch_orchestrator_sop.md` §3.7 and §3.8), evaluated at `--at`, an

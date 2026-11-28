@@ -388,7 +388,7 @@ class PagedReadTest(unittest.TestCase):
         """The collectors' kind lists are constants; a misspelt one fails here,
         not inside a sweep."""
         lists = []
-        for name in ("collect", "fleet_waste", "fleet_stockout", "upgrade_retrospective"):
+        for name in ("collect", "fleet_waste", "fleet_stockout", "upgrade_retrospective", "patch_readiness"):
             mod = load_collector(name)
             if name == "collect":
                 lists += [mod.DUMP_COMMAND_KINDS, mod.COMPLIANCE_DUMP_KINDS, mod.RBAC_DUMP_KINDS,
@@ -397,6 +397,8 @@ class PagedReadTest(unittest.TestCase):
                 lists.append(mod.CLUSTER_DUMP_KINDS)
             elif name == "fleet_stockout":
                 lists.append(",".join(mod.PAGED_DUMP_KINDS))
+            elif name == "patch_readiness":
+                lists.append(",".join(mod.SYSTEM_CRD_WEBHOOK_KINDS))
             else:
                 lists += [kinds for _, kinds, _ in mod.KUBECTL_READS]
         report = load_collector("fleet_upgrade_report")
