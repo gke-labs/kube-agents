@@ -68,14 +68,18 @@ verification_spec:
       # Under fold_decoration=true, ReportContainsVerifier folds inner
       # underscores to hyphens (get_k8s_resource -> get-k8s-resource) and
       # strips double-underscore runs (mcp__gke__get_k8s_resource ->
-      # mcpgkeget-k8s-resource).
+      # mcpgkeget-k8s-resource). Each pattern matches only an unnegated tool
+      # mention in its clause (resets on ')', ';', sentence-ending '. ', or
+      # 'but', ignoring 'e.g.'/'i.e.' and dotted prefixes like 'gke.') so
+      # negated read-tool listings fail while negated write-tool disclaimers
+      # (e.g. "(not mutating tools like patch_k8s_resource)") still pass.
       required_patterns:
-        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])get-k8s-resource\\b"
-        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])describe-k8s-resource\\b"
-        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])get-k8s-logs\\b"
-        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])list-k8s-events\\b"
+        - "(?m)^step-1-to-4-tools:(?:[^\\n]*(?:[);]|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b))?(?:(?!\\b(?:not|no|never|neither|nor|none|without|omits?|omitting|excludes?|excluding|lacks?|lacking|avoids?|avoiding|forbids?|forbidding|prohibits?|prohibiting|absent|missing|rather\\s+than|instead\\s+of|doesn't|don't|cannot|can't|won't|shouldn't)\\b|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b)[^);\\n])*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])get-k8s-resource\\b(?!\\s*(?:(?:,\\s*(?:and|or)|,|and|or)\\s*(?:mcp-gke-|gke[-:.]\\s*|mcpgke)?(?:get-k8s-resource|describe-k8s-resource|get-k8s-logs|list-k8s-events|apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b\\s*)*\\b(?:are|is)\\s+(?:not|never|absent|missing|omitted|excluded)\\b)"
+        - "(?m)^step-1-to-4-tools:(?:[^\\n]*(?:[);]|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b))?(?:(?!\\b(?:not|no|never|neither|nor|none|without|omits?|omitting|excludes?|excluding|lacks?|lacking|avoids?|avoiding|forbids?|forbidding|prohibits?|prohibiting|absent|missing|rather\\s+than|instead\\s+of|doesn't|don't|cannot|can't|won't|shouldn't)\\b|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b)[^);\\n])*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])describe-k8s-resource\\b(?!\\s*(?:(?:,\\s*(?:and|or)|,|and|or)\\s*(?:mcp-gke-|gke[-:.]\\s*|mcpgke)?(?:get-k8s-resource|describe-k8s-resource|get-k8s-logs|list-k8s-events|apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b\\s*)*\\b(?:are|is)\\s+(?:not|never|absent|missing|omitted|excluded)\\b)"
+        - "(?m)^step-1-to-4-tools:(?:[^\\n]*(?:[);]|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b))?(?:(?!\\b(?:not|no|never|neither|nor|none|without|omits?|omitting|excludes?|excluding|lacks?|lacking|avoids?|avoiding|forbids?|forbidding|prohibits?|prohibiting|absent|missing|rather\\s+than|instead\\s+of|doesn't|don't|cannot|can't|won't|shouldn't)\\b|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b)[^);\\n])*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])get-k8s-logs\\b(?!\\s*(?:(?:,\\s*(?:and|or)|,|and|or)\\s*(?:mcp-gke-|gke[-:.]\\s*|mcpgke)?(?:get-k8s-resource|describe-k8s-resource|get-k8s-logs|list-k8s-events|apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b\\s*)*\\b(?:are|is)\\s+(?:not|never|absent|missing|omitted|excluded)\\b)"
+        - "(?m)^step-1-to-4-tools:(?:[^\\n]*(?:[);]|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b))?(?:(?!\\b(?:not|no|never|neither|nor|none|without|omits?|omitting|excludes?|excluding|lacks?|lacking|avoids?|avoiding|forbids?|forbidding|prohibits?|prohibiting|absent|missing|rather\\s+than|instead\\s+of|doesn't|don't|cannot|can't|won't|shouldn't)\\b|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b)[^);\\n])*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])list-k8s-events\\b(?!\\s*(?:(?:,\\s*(?:and|or)|,|and|or)\\s*(?:mcp-gke-|gke[-:.]\\s*|mcpgke)?(?:get-k8s-resource|describe-k8s-resource|get-k8s-logs|list-k8s-events|apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b\\s*)*\\b(?:are|is)\\s+(?:not|never|absent|missing|omitted|excluded)\\b)"
       forbidden_patterns:
-        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])(?:apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b"
+        - "(?m)^step-1-to-4-tools:(?:[^\\n]*(?:[);]|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b))?(?:(?!\\b(?:not|no|never|neither|nor|none|without|omits?|omitting|excludes?|excluding|lacks?|lacking|avoids?|avoiding|forbids?|forbidding|prohibits?|prohibiting|absent|missing|rather\\s+than|instead\\s+of|doesn't|don't|cannot|can't|won't|shouldn't)\\b|(?<!\\be\\.g)(?<!\\bi\\.e)\\.\\s+|\\bbut\\b)[^);\\n])*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])(?:apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b(?!\\s*(?:(?:,\\s*(?:and|or)|,|and|or)\\s*(?:mcp-gke-|gke[-:.]\\s*|mcpgke)?(?:get-k8s-resource|describe-k8s-resource|get-k8s-logs|list-k8s-events|apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b\\s*)*\\b(?:are|is)\\s+(?:not|never|absent|missing|omitted|excluded)\\b)"
       fold_decoration: true
   - name: skill-prescribes-parallel-mcp-and-batched-cli
     role: objective
@@ -86,8 +90,8 @@ verification_spec:
         - "(?m)^call-pattern:.*\\b(?:parallel|same turn|single turn|one turn)\\b"
         - "(?m)^call-pattern:.*\\b(?:batch(?:ed|ing)?|compound|single\\s+(?:compound\\s+)?(?:shell|terminal)|one\\s+(?:compound\\s+)?(?:shell|terminal))\\b"
       forbidden_patterns:
-        - "(?m)^call-pattern:.*\\b(?:not|no|never|neither|nor|does\\s+not|doesn't|do\\s+not|don't|cannot|can't)\\b(?:(?!\\bbut\\b)[^,.;()—–\\n]){0,50}\\b(?:parallel|batch(?:ed|ing)?|compound)\\b"
-        - "(?m)^call-pattern:.*\\b(?:without\\s+(?:any\\s+|using\\s+|running\\s+)?|(?:rather\\s+than|instead\\s+of)\\s+(?:in\\s+)?)(?:parallel|batch(?:ed|ing)?|compound)\\b"
+        - "(?m)^call-pattern:.*\\b(?:not|no|never|neither|nor|doesn't|don't|cannot|can't|won't|shouldn't)\\b(?:(?!\\bbut\\b|--| - )[^,.;:()—–\\n]){0,50}\\b(?:parallel|batch(?:ed|ing)?|compound|(?:same|single|one)\\s+turn|(?:single|one)\\s+(?:compound\\s+)?(?:shell|terminal))\\b"
+        - "(?m)^call-pattern:.*\\b(?:without|rather\\s+than|instead\\s+of)\\b(?:(?!\\b(?:but|and)\\b|--| - )[^,.;:()—–\\n]){0,50}\\b(?:parallel|batch(?:ed|ing)?|compound|(?:same|single|one)\\s+turn|(?:single|one)\\s+(?:compound\\s+)?(?:shell|terminal))\\b"
       fold_decoration: true
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

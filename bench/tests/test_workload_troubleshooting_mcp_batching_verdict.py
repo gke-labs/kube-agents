@@ -49,6 +49,15 @@ def test_tools_check_accepts_all_four_mcp_tools_across_spellings():
         "STEP-1-TO-4-TOOLS: gke.get_k8s_resource, gke.describe_k8s_resource, gke.get_k8s_logs, gke.list_k8s_events",
         "- STEP-1-TO-4-TOOLS: mcp__gke__get_k8s_resource, mcp__gke__describe_k8s_resource, mcp__gke__get_k8s_logs, mcp__gke__list_k8s_events",
         "STEP-1-TO-4-TOOLS: mcp_gke_get_k8s_resource, mcp_gke_describe_k8s_resource, mcp_gke_get_k8s_logs, mcp_gke_list_k8s_events",
+        # Negated write-tool disclaimers must not false-fail.
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events, kubectl, gcloud (not mutating tools like patch_k8s_resource)",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events, kubectl, gcloud (no apply_k8s_manifest, patch_k8s_resource, or delete_k8s_resource)",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events; excludes patch_k8s_resource and delete_k8s_resource",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events (not mutating tools, e.g. gke.patch_k8s_resource)",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events (not mutating tools (patch_k8s_resource, delete_k8s_resource))",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events (patch_k8s_resource and delete_k8s_resource are not used)",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource (not patch_k8s_resource), describe_k8s_resource, get_k8s_logs, list_k8s_events",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events (no gke:patch_k8s_resource or mcp__gke__apply_k8s_manifest)",
     ):
         assert _passes(TOOLS_CHECK, line), line
 
@@ -63,6 +72,17 @@ def test_tools_check_rejects_cli_only_missing_tool_or_write_tool():
         "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events, create_node_pool",
         "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events, update_node_pool",
         "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events, cancel_operation",
+        # Negated read-tool listings must fail even when all four names appear on the line.
+        "STEP-1-TO-4-TOOLS: kubectl, gcloud (does not mention get_k8s_resource, describe_k8s_resource, get_k8s_logs, or list_k8s_events)",
+        "STEP-1-TO-4-TOOLS: kubectl, gcloud (no get_k8s_resource, describe_k8s_resource, get_k8s_logs, or list_k8s_events)",
+        "STEP-1-TO-4-TOOLS: kubectl, gcloud; omits get_k8s_resource, describe_k8s_resource, get_k8s_logs, and list_k8s_events",
+        "STEP-1-TO-4-TOOLS: kubectl, gcloud -- does not name gke:get_k8s_resource, gke:describe_k8s_resource, gke:get_k8s_logs, or gke:list_k8s_events",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, kubectl (does not mention list_k8s_events)",
+        "STEP-1-TO-4-TOOLS: kubectl, gcloud (get_k8s_resource, describe_k8s_resource, get_k8s_logs, and list_k8s_events are not mentioned)",
+        # Positive write tool alongside a separate negated parenthetical must still fail.
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events, patch_k8s_resource (not delete_k8s_resource)",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events (no get-credentials), patch_k8s_resource",
+        "STEP-1-TO-4-TOOLS: get_k8s_resource, describe_k8s_resource, get_k8s_logs, list_k8s_events (not delete_k8s_resource); patch_k8s_resource",
         # Tools mentioned only in prose below, not on the STEP-1-TO-4-TOOLS line.
         "STEP-1-TO-4-TOOLS: kubectl, gcloud\n\nget_k8s_resource describe_k8s_resource get_k8s_logs list_k8s_events",
         "",
@@ -76,10 +96,17 @@ def test_call_pattern_accepts_parallel_mcp_and_batched_cli():
         "**CALL-PATTERN:** Run independent MCP tools in parallel and batch read-only kubectl commands into a single shell call.",
         "- CALL-PATTERN: Execute independent reads in one turn via parallel MCP calls or a compound terminal call instead of sequential turns.",
         "CALL-PATTERN: Without running get-credentials, emit gke MCP reads in parallel and batch CLI fallback commands into one compound terminal call.",
+        "CALL-PATTERN: Emit gke MCP reads in parallel without running get-credentials and batch CLI fallback commands into one compound terminal call.",
         "CALL-PATTERN: Run gke MCP reads in parallel (no get-credentials needed) and batch CLI fallback reads into one compound terminal call.",
         "CALL-PATTERN: Invoke independent reads as parallel MCP tool calls (not sequential turns) or batch CLI fallback commands into one compound terminal call.",
         "CALL-PATTERN: Run independent reads not one-by-one but in parallel MCP calls or batched into a single compound terminal call.",
         "CALL-PATTERN: Do not run sequentially — emit parallel MCP reads and batch CLI fallback commands into one compound terminal call.",
+        "CALL-PATTERN: Do not run sequentially -- emit parallel MCP reads and batch CLI fallback commands into one compound terminal call.",
+        "CALL-PATTERN: Do not run sequentially: emit parallel MCP reads and batch CLI fallback commands into one compound terminal call.",
+        "CALL-PATTERN: Do not run sequentially - emit parallel MCP reads and batch CLI fallback commands into one compound terminal call.",
+        "CALL-PATTERN: Do not: emit parallel MCP reads and batch CLI fallback commands into one compound terminal call.",
+        # Negation window must not cross a newline into the following line.
+        "CALL-PATTERN: Emit parallel MCP reads and batch CLI fallback commands into one compound terminal call (do not\nrun parallel writes).",
     ):
         assert _passes(PATTERN_CHECK, line), line
 
@@ -96,6 +123,13 @@ def test_call_pattern_rejects_sequential_only_or_negated_claims():
         "CALL-PATTERN: The skill does not prescribe invoking independent reads in parallel or in a single compound shell call.",
         "CALL-PATTERN: No batching is specified; emit independent reads in parallel.",
         "CALL-PATTERN: Run reads without parallel tool calls or batching.",
+        # Negations targeting only the accepted turn/shell synonyms must also fail.
+        "CALL-PATTERN: The skill does not invoke independent reads in a single turn or in one shell call.",
+        "CALL-PATTERN: Run commands sequentially rather than in the same turn or in a single terminal call.",
+        "CALL-PATTERN: Run commands sequentially instead of in one turn or in a single shell call.",
+        "CALL-PATTERN: Run commands sequentially without a single turn or one compound terminal call.",
+        "CALL-PATTERN: The skill never runs independent reads in the same turn or in one terminal call.",
+        "CALL-PATTERN: The skill runs independent reads in a single turn, but does not group CLI commands in one shell call.",
         "CALL-PATTERN: Run commands in parallel only.",
         "CALL-PATTERN: Batch kubectl commands together.",
         "",
