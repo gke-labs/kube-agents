@@ -857,14 +857,17 @@ refused it or nothing started, gets a `message` on its `…in` carrying `{"deleg
 its per-entry ends instead, and a stopped or ended parent gets nothing. `round` beside `text` is the 1-based
 delegation round the refused request would have been, absent for round one. A parent ends its wait only on a
 refusal for the round it waits on; one for a lower round is stale, and one for a higher round ends nothing.
-Every request the gateway handles for a task uses a round, minted or refused, so a request made once the task
+Every request the gateway handles for a task uses a round, minted or refused, except a busy refusal (below), so a request made once the task
 has used its rounds (`roundsMax`, one by default) is refused with the next round, which is `2` today: the
 earlier request's children, if it minted any, are still the task's to wait for, and a waiting parent keeps
 waiting on them. The gateway mints nothing for that request, records nothing, and posts nothing to the room.
 With rounds left (`roundsMax` above one, which this gateway doesn't take yet), a task's next request waits
 for its current round to settle: every child ended and no child still running (a batch child that asked is
 cancelled, and counts until that lands), every end sent to the task, and for a single child, the task
-holding the conversation again. A request before that is ignored as busy. The next round's children carry its
+holding the conversation again. A request before that is refused as busy (`delegation.busy`, #7547): a refusal
+for the round the request would have started, with `"busy": true`, which ends the parent's wait for that round.
+The gateway mints nothing, records nothing and uses no round for it, so a parent counting its rounds doesn't
+count it either. `busy` is a JSON boolean, absent on every other refusal. The next round's children carry its
 number, their entries start again at 1, and the earlier rounds' children stay on the record for a stop to
 reach.
 `round` is a JSON number from 0 to 16 (`lib.DelegateRoundsCeiling`); a part whose `round` is another type or

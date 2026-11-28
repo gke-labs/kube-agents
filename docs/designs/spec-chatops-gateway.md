@@ -928,7 +928,8 @@ trigger. A child below a scheduled run, at any depth, goes only to a profile who
 child's record entry carries down the chain, not the parent's tier, since every child below the run runs at `read`. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, and a refusal as a
 `delegationRefused` one (#4860), which the parent reads while it waits open. Every request the gateway handles
-for a profile task uses one of its delegation rounds, minted or refused, and a request once the task has used
+for a profile task uses one of its delegation rounds, minted or refused, except a busy refusal: with rounds left, a
+request before the current round settles is refused (`delegation.busy`) with `busy: true` and uses no round. A request once the task has used
 them is refused (`delegation.rounds`), with a notice that says how many it used, on its `.in` with `round` set
 to the round it would have been. It mints nothing, records nothing, and ends none of the wait on the earlier
 request's children. The rounds are `A2A_DELEGATION_ROUNDS_MAX`, 1 by default and 1 at most for now: the

@@ -944,9 +944,17 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 // so the children of the earlier request are still the task's to wait for.
 // Any other JSON type there, or a round out of bounds, makes the part no
 // refusal at all (DelegationRefusalOf).
+//
+// Busy marks a refusal of a request made, with rounds left, before the
+// current round had settled on the gateway (delegation.busy, #7547): it
+// ends the wait for its Round like any refusal, but the gateway used no
+// round for it, so a parent counting its rounds doesn't count it either, or
+// its next request's round and the gateway's would differ. Omitted when
+// false, so a reader that predates it reads the rest unchanged.
 type DelegationRefusal struct {
 	Text  string `json:"text"`
 	Round int    `json:"round,omitempty"`
+	Busy  bool   `json:"busy,omitempty"`
 }
 
 func validDelegationRefusal(r DelegationRefusal) bool {
