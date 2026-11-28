@@ -279,8 +279,23 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			// every child's end recorded (a batch) or the child ended and
 			// the conversation back with the parent (a single child). A
 			// request before that is no new round.
-			if !profileParent || !g.roundSettled(ctx, rec, parent, last) {
+			if !profileParent {
 				ignore(ruleDelegationBusy, "child", last)
+				return
+			}
+			if !g.roundSettled(ctx, rec, parent, last) {
+				// A profile parent with rounds left waits on the round
+				// its request would start (#7547): left unanswered, that
+				// wait hangs until its reserve. It is told, tagged with
+				// that round (lib.DelegationRefusal.Round), which ends
+				// that wait. Nothing is minted or recorded and no round
+				// is used here: starting one would move the unsettled
+				// round's children off the record its heal reads. The
+				// worker counts the refused request as a round, so it
+				// sees no more rounds left than the gateway does.
+				used := roundsUsed(parent)
+				log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationBusy, "roundsUsed", used, "roundsMax", g.cfg.DelegationRoundsMax}, audit...), "child", last)...)
+				g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+noticeDelegationRoundBusy), used+1, true)
 				return
 			}
 		} else {

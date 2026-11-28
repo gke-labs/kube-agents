@@ -121,6 +121,12 @@ const (
 	// noticeDelegationRoundsChildren follows noticeDelegationRounds when
 	// the rounds used minted children: they still report back.
 	noticeDelegationRoundsChildren = "; the tasks it started will still report back"
+	// noticeDelegationRoundBusy refuses a profile parent's request made
+	// with rounds left while its current round hasn't settled on the
+	// gateway (delegation.busy): an end still to send, or a child still
+	// routed. No "still report back" here: the worker has had an end for
+	// every entry by then, and drops a later one (#7547).
+	noticeDelegationRoundBusy = "this task's last round of delegated tasks hasn't finished on the gateway, so another round can't start yet"
 )
 
 // How noticeParamUndeclared and noticeParamMissing spell a profile's
