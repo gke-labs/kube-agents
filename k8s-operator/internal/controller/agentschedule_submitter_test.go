@@ -183,6 +183,9 @@ func submitterRig(t *testing.T, answer func(subject string, data []byte) any) (*
 			t.Fatal(err)
 		}
 	}
+	if err := gateway.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Namespace: "kubeagents-system", Name: "platform-agent"}}
 	reader := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).Build()
 	bus := newNATSCardPublisher(reader)
