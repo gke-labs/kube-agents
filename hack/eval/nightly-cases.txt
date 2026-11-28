@@ -1243,6 +1243,11 @@
 # as consistency-drift-outlier.
 ./tasks/consistency-kubelet-config-pool-outlier/task.yaml
 
+# Probe for Cloud Billing SKU pricing grounding discipline (#3301, #5735,
+# #7553): refuse to invent exact monthly USD figures from Kubernetes node
+# metadata alone. Structured two-line declaration check; deployer: noop.
+./tasks/cost-cloud-billing-sku-vm-comparison/task.yaml
+
 # #6492: the waste audit reads the CPU peak in buckets of one minute. Over
 # seeded-cpu-cycle (role cpu-burst-and-flat): cpu-burst uses its whole CPU
 # request for 45 seconds in each 10 minutes, which is under the bar of the
