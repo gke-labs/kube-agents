@@ -10,6 +10,7 @@ to its target cluster and project.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import http.client
@@ -2515,6 +2516,251 @@ class ProfileVcsRouteTest(unittest.TestCase):
                     self.assertEqual("CLAIM_UNKNOWN", body.get("code"), body)
                     continue
                 self.assert_ran(verb, status, body)
+
+    # -- the broker's line for a write, and no claim token for the profile role ----
+
+    # What each write verb's forge route answers with here: a publish names its
+    # branch, a proposal verb its proposal.
+    WRITE_ANSWERS = {
+        "publish": {"branch": "platform-agent/fix", "revision": "0a1b2c3", "forge": "github", "repo": "acme/infra"},
+        "proposal-create": {"proposal": {"number": 9, "url": "https://github.com/acme/infra/pull/9"}, "repo": "acme/infra"},
+        "proposal-update": {"proposal": {"number": 7, "url": "https://github.com/acme/infra/pull/7"}, "repo": "acme/infra"},
+    }
+    # The fields each line adds to the task, the credential's id and the repository.
+    WRITE_FIELDS = {
+        "publish": {"branch": "platform-agent/fix"},
+        "proposal-create": {"number": 9, "url": "https://github.com/acme/infra/pull/9"},
+        "proposal-update": {"number": 7, "url": "https://github.com/acme/infra/pull/7"},
+    }
+
+    def write_lines(self):
+        """Collect the message and the audit mapping of each write line the broker logs from now on."""
+        lines = []
+
+        class Writes(logging.Handler):
+            def emit(self, record):
+                audit = getattr(record, credential_proxy.AUDIT_EXTRA_KEY, None)
+                if isinstance(audit, dict) and audit.get("event_type") == credential_proxy.PROFILE_VCS_WRITE_EVENT:
+                    lines.append((record.getMessage(), audit))
+
+        handler = Writes()
+        credential_proxy.LOGGER.addHandler(handler)
+        self.addCleanup(credential_proxy.LOGGER.removeHandler, handler)
+        return lines
+
+    def answer_writes(self):
+        for verb, answer in self.WRITE_ANSWERS.items():
+            self.routes[verb].return_value = json.loads(json.dumps(answer))
+
+    def fresh_claim_tokens(self):
+        tokens = credential_proxy.ClaimTokens()
+        patcher = mock.patch.object(CredentialProxyHandler, "claim_tokens", tokens)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return tokens
+
+    def as_the_shell(self):
+        CredentialProxyHandler.authenticator = _StubAuthenticator(
+            credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", role=credential_proxy.CALLER_ROLE_SHELL)
+        )
+
+    def test_each_write_verb_that_succeeds_writes_one_line(self):
+        self.assertEqual(PROFILE_VCS_WRITES, set(self.WRITE_ANSWERS))
+        lines = self.write_lines()
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                self.answer_writes()
+                del lines[:]
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(200, status, body)
+                self.assertEqual(1, len(lines), lines)
+                message, audit = lines[0]
+                self.assertEqual(
+                    {
+                        "event_type": "profile_vcs_write", "verb": verb, "task": TASK_ID,
+                        "jti": _token_jti(PERMIT["token"]), "repository": self.key, **self.WRITE_FIELDS[verb],
+                    },
+                    audit,
+                )
+                self.assertTrue(audit["jti"])
+                self.assertTrue(message.startswith("profile vcs write "), message)
+                for key, value in audit.items():
+                    if key != "event_type":
+                        self.assertIn(f"{key}={value}", message)
+
+    def test_a_write_that_is_refused_writes_no_line(self):
+        lines = self.write_lines()
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb, refusal="no permit"):
+                self.reset()
+                self.answer_writes()
+                status, body = self.vcs_post(verb, VALID["token"])
+                self.assert_permit_refused(verb, status, body)
+                self.assertEqual([], lines)
+            with self.subTest(verb=verb, refusal="a repository the install does not manage"):
+                self.reset()
+                self.answer_writes()
+                self.managed.return_value = False
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(403, status, body)
+                self.assertEqual([], lines)
+                self.managed.return_value = True
+        with self.subTest(verb="proposal-update", refusal="another task's proposal"):
+            self.reset()
+            self.answer_writes()
+            self.forge.proposals[8] = _proposal(8, "platform-agent/incident")
+            self.record.record_proposal("task-2", FAR, self.key, 8)
+            status, body = self.post_with("proposal-update", number=8)
+            self.assert_not_this_tasks("proposal-update", status, body)
+            self.assertEqual([], lines)
+
+    def test_a_write_whose_forge_route_fails_writes_no_line(self):
+        lines = self.write_lines()
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                self.routes[verb].side_effect = PermissionError("declined")
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assertEqual(403, status, body)
+                self.assertEqual([], lines)
+                self.routes[verb].side_effect = None
+
+    def test_a_read_verb_writes_no_line(self):
+        lines = self.write_lines()
+        for verb in sorted(PROFILE_VCS_READS):
+            with self.subTest(verb=verb):
+                self.reset()
+                status, body = self.vcs_post(verb, PERMIT["token"])
+                self.assert_ran(verb, status, body)
+        self.assertEqual([], lines)
+
+    def test_another_roles_write_writes_no_line(self):
+        lines = self.write_lines()
+        self.fresh_claim_tokens()
+        self.as_the_shell()
+        for verb in sorted(PROFILE_VCS_WRITES):
+            with self.subTest(verb=verb):
+                self.reset()
+                self.answer_writes()
+                status, body = self.vcs_post(verb, None)
+                self.assertEqual(200, status, body)
+        self.assertEqual([], lines)
+
+    def test_a_profile_proposal_create_answer_carries_no_claim_token(self):
+        tokens = self.fresh_claim_tokens()
+        self.answer_writes()
+        status, body = self.vcs_post("proposal-create", PERMIT["token"])
+        self.assertEqual(200, status, body)
+        self.assertEqual(self.WRITE_ANSWERS["proposal-create"], body)
+        self.assertNotIn(credential_proxy.CLAIM_TOKEN_FIELD, body)
+        self.assertEqual(0, len(tokens))
+
+    def test_another_roles_proposal_create_answer_carries_the_claim_token(self):
+        tokens = self.fresh_claim_tokens()
+        self.as_the_shell()
+        self.answer_writes()
+        status, body = self.vcs_post("proposal-create", None)
+        self.assertEqual(200, status, body)
+        token = body.pop(credential_proxy.CLAIM_TOKEN_FIELD)
+        self.assertEqual(self.WRITE_ANSWERS["proposal-create"], body)
+        self.assertEqual(1, len(tokens))
+        self.assertIsNotNone(tokens.burn(token))
+
+    def test_the_profile_role_cannot_reach_proposal_claim(self):
+        status, body = self.post_with(credential_proxy.PROPOSAL_CLAIM_VERB, claim="0" * 64)
+        self.assertEqual(403, status, body)
+        self.assertEqual("CALLER_VERB_FORBIDDEN", body["code"])
+        self.assertEqual(credential_proxy.RULE_CALLER_VCS_VERB, body["rule"])
+        self.routes[credential_proxy.PROPOSAL_CLAIM_VERB].assert_not_called()
+
+
+def _token_jti(token):
+    """The jti a fixture credential carries, read from its payload segment."""
+    payload = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))["jti"]
+
+
+class ProfileWriteRecordTest(unittest.TestCase):
+    """The two rules behind the write line and the claim token, with no HTTP."""
+
+    # Every role the broker names, and the socket posture, which has none.
+    ROLES = ("",) + tuple(credential_proxy.CALLER_ROLES)
+
+    @staticmethod
+    def principal(role=credential_proxy.CALLER_ROLE_PROFILE, **task):
+        claims = type("Claims", (), task)() if task else None
+        return type("Caller", (), {"role": role, "task": claims})()
+
+    def test_only_a_proposal_create_answer_to_another_role_gets_a_claim_token(self):
+        for role in self.ROLES:
+            for verb in sorted(vcs_broker.VCS_VERBS):
+                with self.subTest(role=role, verb=verb):
+                    expected = verb == "proposal-create" and role != "profile"
+                    self.assertEqual(expected, credential_proxy.mints_claim_token(role, verb))
+
+    def test_only_the_profile_roles_write_verbs_give_a_record(self):
+        caller = {"task": "task-1", "jti": "JTI1"}
+        for role in self.ROLES:
+            for verb in sorted(vcs_broker.VCS_VERBS):
+                with self.subTest(role=role, verb=verb):
+                    record = credential_proxy.profile_write_record(self.principal(role, **caller), verb, {}, "github:github.com/acme/infra")
+                    if role == "profile" and verb in PROFILE_VCS_WRITES:
+                        self.assertEqual(
+                            {
+                                "event_type": "profile_vcs_write", "verb": verb, "task": "task-1", "jti": "JTI1",
+                                "repository": "github:github.com/acme/infra",
+                            },
+                            record,
+                        )
+                    else:
+                        self.assertIsNone(record)
+
+    def test_a_task_with_no_credential_id_still_gives_a_record(self):
+        record = credential_proxy.profile_write_record(self.principal(task="task-1"), "publish", {"branch": "b"}, "r")
+        self.assertEqual("", record["jti"])
+        self.assertEqual("task-1", record["task"])
+        record = credential_proxy.profile_write_record(self.principal(), "publish", {"branch": "b"}, "r")
+        self.assertEqual(("", ""), (record["task"], record["jti"]))
+
+    def test_an_answer_that_names_nothing_gives_the_task_and_the_verb(self):
+        base = {"event_type": "profile_vcs_write", "task": "task-1", "jti": "JTI1", "repository": "r"}
+        caller = self.principal(task="task-1", jti="JTI1")
+        answers = (None, [], "text", {}, {"branch": ""}, {"branch": 7}, {"proposal": None}, {"proposal": "text"},
+                   {"proposal": {"number": True, "url": ""}}, {"proposal": {"number": "9", "url": 9}})
+        for verb in sorted(PROFILE_VCS_WRITES):
+            for answer in answers:
+                with self.subTest(verb=verb, answer=answer):
+                    self.assertEqual({**base, "verb": verb}, credential_proxy.profile_write_record(caller, verb, answer, "r"))
+
+    def test_a_publish_names_the_branch_and_a_proposal_verb_the_number_and_the_url(self):
+        caller = self.principal(task="task-1", jti="JTI1")
+        answer = {"branch": "platform-agent/fix", "proposal": {"number": 9, "url": "https://forge.example/acme/infra/pull/9"}}
+        publish = credential_proxy.profile_write_record(caller, "publish", answer, "r")
+        self.assertEqual("platform-agent/fix", publish["branch"])
+        self.assertNotIn("number", publish)
+        self.assertNotIn("url", publish)
+        for verb in ("proposal-create", "proposal-update"):
+            with self.subTest(verb=verb):
+                record = credential_proxy.profile_write_record(caller, verb, answer, "r")
+                self.assertEqual((9, "https://forge.example/acme/infra/pull/9"), (record["number"], record["url"]))
+                self.assertNotIn("branch", record)
+
+    def test_a_text_value_is_cleaned_and_capped_for_a_log_line(self):
+        caller = self.principal(task="task-1", jti="JTI1")
+        # A value with a line break or a space could forge a line or add a
+        # `key=value` word to this one's text; neither stays, and no control
+        # or format character does either (an escape, a zero-width space).
+        forged = "platform-agent/fix\nprofile vcs write verb=publish task=other x\ty\x1bz\u200bw"
+        record = credential_proxy.profile_write_record(caller, "publish", {"branch": forged}, "r")
+        self.assertEqual("platform-agent/fixprofilevcswriteverb=publishtask=otherxyzw", record["branch"])
+        long_branch = "platform-agent/" + "a" * 400
+        record = credential_proxy.profile_write_record(caller, "publish", {"branch": long_branch}, "r")
+        self.assertLessEqual(len(record["branch"]), credential_proxy.PROFILE_WRITE_BRANCH_LOG_LENGTH)
+        url = "https://forge.example/" + "a" * 600
+        record = credential_proxy.profile_write_record(caller, "proposal-create", {"proposal": {"number": 1, "url": url}}, "r" * 600)
+        self.assertLessEqual(len(record["url"]), credential_proxy.PROFILE_WRITE_VALUE_LOG_LENGTH)
+        self.assertLessEqual(len(record["repository"]), credential_proxy.PROFILE_WRITE_VALUE_LOG_LENGTH)
 
 
 class ProfileAuthenticatorTest(unittest.TestCase):

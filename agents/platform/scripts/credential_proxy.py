@@ -1440,9 +1440,10 @@ DECISION_MEMORY_VERDICTS = frozenset({
     DECISION_MEMORY_VERDICT_BLOCK,
     DECISION_MEMORY_VERDICT_ERROR,
 })
-# The one-time claim token minted with each `proposal-create` answer, under
-# CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
-# (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
+# The one-time claim token minted with a `proposal-create` answer to each role
+# but the profile role (`mints_claim_token`), under CLAIM_TOKEN_FIELD, and
+# burned by the first `proposal-claim` that presents it (`ClaimTokens`). It
+# lives CLAIM_TOKEN_TTL_SECONDS, the window
 # `vcs_broker.CLAIM_WINDOW_SECONDS` holds the proposal's creation time to, and
 # is CLAIM_TOKEN_BYTES of os.urandom, spelled in hex.
 PROPOSAL_CREATE_VERB = "proposal-create"
@@ -1661,6 +1662,33 @@ API_RELAY_AUDIT_SUBCOMMANDS = {
 }
 FEEDBACK_REASON_FAULT = "the broker could not complete the filing ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
+# The broker's record of a profile task's version-control write: one log line
+# for each write verb of PROFILE_PERMIT_GATED_VCS_VERBS that succeeds, with these
+# fields in its `audit` mapping (`profile_write_record`). It is a log line and
+# no stored state. `publish` names its branch; the two proposal verbs name the
+# proposal's number and url.
+PROFILE_VCS_WRITE_EVENT = "profile_vcs_write"
+PROFILE_VCS_WRITE_MESSAGE = "profile vcs write"
+PROFILE_WRITE_EVENT_FIELD = "event_type"
+PROFILE_WRITE_VERB_FIELD = "verb"
+PROFILE_WRITE_TASK_FIELD = "task"
+PROFILE_WRITE_CREDENTIAL_ID_FIELD = "jti"
+PROFILE_WRITE_REPOSITORY_FIELD = "repository"
+PROFILE_WRITE_BRANCH_FIELD = "branch"
+PROFILE_WRITE_NUMBER_FIELD = "number"
+PROFILE_WRITE_URL_FIELD = "url"
+PROFILE_WRITE_PUBLISH_VERB = "publish"
+# The answer's keys the record reads: a publish answer's branch, and the
+# number and url of the proposal a proposal verb answers with.
+PROFILE_WRITE_ANSWER_BRANCH_KEY = "branch"
+PROFILE_WRITE_ANSWER_PROPOSAL_KEY = "proposal"
+PROFILE_WRITE_ANSWER_NUMBER_KEY = "number"
+PROFILE_WRITE_ANSWER_URL_KEY = "url"
+# The cap on a logged value that the verified credential, the registry or the
+# forge supplies, and the smaller one on the branch, which is the caller's own
+# text: above any branch name the broker's own check admits.
+PROFILE_WRITE_VALUE_LOG_LENGTH = 512
+PROFILE_WRITE_BRANCH_LOG_LENGTH = 256
 # Rule ids for the refusals the exec route decides itself rather than by a
 # policy rule. The response body and the audit record name the same constant,
 # so the two cannot drift apart.
@@ -3055,6 +3083,64 @@ def profile_vcs_refusal(principal: Any, verb: str) -> str | None:
             "published only for a request that asked for one"
         )
     return None
+
+
+def mints_claim_token(role: str, verb: str) -> bool:
+    """Whether a ``POST /v1/vcs/<verb>`` answer to ``role`` gets a claim token.
+
+    Only a ``proposal-create`` answer gets one, and not for the profile role:
+    that role has no ``proposal-claim`` verb to present it to, and the broker
+    writes the record of a profile task's write itself (``profile_write_record``).
+    A caller with no role, the socket posture, keeps the token.
+    """
+    return verb == PROPOSAL_CREATE_VERB and role != CALLER_ROLE_PROFILE
+
+
+def profile_write_record(principal: Any, verb: str, result: Any, repository: str) -> dict[str, Any] | None:
+    """The fields of the log line for a profile task's write that succeeded, or None.
+
+    None for every other role and every verb outside
+    PROFILE_PERMIT_GATED_VCS_VERBS. The task and the credential's id come from
+    the verified task credential, the repository from the registry's resolve,
+    and the branch, number and url from the forge's answer; an answer that
+    names none of them still gives a record of the task and the verb. Every text
+    value is sanitised for a log line here.
+    """
+    if getattr(principal, "role", "") != CALLER_ROLE_PROFILE or verb not in PROFILE_PERMIT_GATED_VCS_VERBS:
+        return None
+    task = getattr(principal, "task", None)
+    record: dict[str, Any] = {
+        PROFILE_WRITE_EVENT_FIELD: PROFILE_VCS_WRITE_EVENT,
+        PROFILE_WRITE_VERB_FIELD: verb,
+        PROFILE_WRITE_TASK_FIELD: _profile_write_text(getattr(task, "task", "")),
+        PROFILE_WRITE_CREDENTIAL_ID_FIELD: _profile_write_text(getattr(task, "jti", "")),
+        PROFILE_WRITE_REPOSITORY_FIELD: _profile_write_text(repository),
+    }
+    answer = result if isinstance(result, dict) else {}
+    if verb == PROFILE_WRITE_PUBLISH_VERB:
+        branch = answer.get(PROFILE_WRITE_ANSWER_BRANCH_KEY)
+        if isinstance(branch, str) and branch:
+            record[PROFILE_WRITE_BRANCH_FIELD] = _profile_write_text(branch, PROFILE_WRITE_BRANCH_LOG_LENGTH)
+        return record
+    proposal = answer.get(PROFILE_WRITE_ANSWER_PROPOSAL_KEY)
+    if isinstance(proposal, dict):
+        number, url = proposal.get(PROFILE_WRITE_ANSWER_NUMBER_KEY), proposal.get(PROFILE_WRITE_ANSWER_URL_KEY)
+        if isinstance(number, int) and not isinstance(number, bool):
+            record[PROFILE_WRITE_NUMBER_FIELD] = number
+        if isinstance(url, str) and url:
+            record[PROFILE_WRITE_URL_FIELD] = _profile_write_text(url)
+    return record
+
+
+def _profile_write_text(value: Any, max_length: int = PROFILE_WRITE_VALUE_LOG_LENGTH) -> str:
+    """One text field of ``profile_write_record``: a string, sanitised and capped; else empty.
+
+    Whitespace is dropped too. None of these values holds any, and the line's
+    text is ``key=value`` words, so a value with a space could add a word.
+    """
+    if not isinstance(value, str):
+        return ""
+    return _sanitize_for_logging("".join(value.split()), max_length=max_length)
 
 
 # What a profile caller's issue-list `query` may not hold, because each can
@@ -20467,6 +20553,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             expires_at = float(getattr(task, "expires", 0) or 0) + PROFILE_TASK_RECORD_MARGIN_SECONDS
             self.profile_task_writes.record_proposal(task_id, expires_at, repository, number)
 
+    def _log_profile_write(self, principal: Any, verb: str, result: Any, repository: str) -> None:
+        """Write the one log line for a profile task's write that succeeded. It stores nothing."""
+        record = profile_write_record(principal, verb, result, repository)
+        if record is None:
+            return
+        fields = " ".join(f"{key}={value}" for key, value in record.items() if key != PROFILE_WRITE_EVENT_FIELD)
+        LOGGER.info("%s %s", PROFILE_VCS_WRITE_MESSAGE, fields, extra={AUDIT_EXTRA_KEY: record})
+
     def _mint_claim(self, result: Any, repository: Any) -> None:
         """Add a one-time claim token to a `proposal-create` answer that names its proposal.
 
@@ -20796,8 +20890,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     raise
                 if role == CALLER_ROLE_PROFILE and verb == PROPOSAL_CREATE_VERB:
                     self._record_task_proposal(principal, result, task_key)
-                if verb == PROPOSAL_CREATE_VERB:
+                if mints_claim_token(role, verb):
                     self._mint_claim(result, payload.get("repository"))
+                self._log_profile_write(principal, verb, result, task_key)
                 if role in REDACTED_VCS_READ_ROLES and verb in REDACTED_VCS_READ_VERBS:
                     # A forge's text (proposal and issue bodies, comments,
                     # diffs, commit messages) is read back as tool output.

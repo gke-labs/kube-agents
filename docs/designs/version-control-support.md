@@ -908,7 +908,8 @@ whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
 `proposal-claim` is the one exception. `proposal-create` mints a one-time claim
-token with each answer that names its proposal, and the broker keeps it, with
+token with each answer that names its proposal, except an answer to the profile
+role, and the broker keeps it, with
 the proposal's url, number and repository, in an in-memory store under its own
 lock. The first `proposal-claim` that presents the token burns it, whatever the
 forge check then answers. A token lives 15 minutes, the window the forge check

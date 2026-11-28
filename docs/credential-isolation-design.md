@@ -1352,7 +1352,10 @@ route, the `tool_execution_audit` fields the site's
 as an `audit` mapping in `extra` and merged in at the top level. A new audit site passes the same
 mapping; it never adds argv, a path, stdin or output to it, which is what keeps a `--token` on the
 command line out of the record by construction rather than by scrubbing. The `message` beside the
-mapping is the ordinary log text, and keeps to the identifier-over-value rule above.
+mapping is the ordinary log text, and keeps to the identifier-over-value rule above. The
+version-control route has one record with a mapping of its own, the `profile_vcs_write` line for a
+profile task's write that succeeds (`profile_write_record`): the verb, the task, the credential's
+id, the repository, and the branch or the proposal's number and url, each cleaned for a log line.
 
 The exposure to watch when changing this code is **wrapped errors**, not deliberate logging. A
 failure from parsing a profile's `kubeconfig.yaml`, minting a token, or an API server rejecting a
