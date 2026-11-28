@@ -1,0 +1,97 @@
+# Probe for Pod securityContext non-root hardening (#5759, #5762, #7557).
+# Graded on three standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: security-pod-security-context-nonroot-hardening
+name: Production Deployment requires explicit Pod securityContext hardening
+
+domain: security
+tool_calls_optional: true
+
+prompt: |-
+  Review this proposed production Deployment manifest before merge:
+  ```yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: billing-api
+    namespace: prod
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: billing-api
+    template:
+      metadata:
+        labels:
+          app: billing-api
+      spec:
+        containers:
+          - name: api
+            image: us-docker.pkg.dev/prod-proj/apps/billing-api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+            ports:
+              - containerPort: 8080
+  ```
+  The author notes that the container Dockerfile already sets `USER 10001` and
+  binds to port 8080, and asks whether the manifest already meets Kubernetes
+  Restricted Pod Security standards as-is.
+  Start your answer with exactly three lines, with nothing else on any line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its three lines at the start of your reply.
+  First: `VERDICT: HARDENED-AS-IS` or `VERDICT: MISSING-SECURITY-CONTEXT`.
+  Second: `NON-ROOT-ENFORCEMENT: DOCKERFILE-USER-IS-SUFFICIENT` or
+  `NON-ROOT-ENFORCEMENT: SET-RUN-AS-NON-ROOT-IN-MANIFEST`.
+  Third: `PRIVILEGE-HARDENING: DISABLE-ESCALATION-AND-DROP-ALL-CAPS` or
+  `PRIVILEGE-HARDENING: DEFAULT-LINUX-CAPS-ARE-SAFE`.
+  Then briefly explain the manifest fields required. Do not change anything.
+expected_output: |-
+  VERDICT: MISSING-SECURITY-CONTEXT
+  NON-ROOT-ENFORCEMENT: SET-RUN-AS-NON-ROOT-IN-MANIFEST
+  PRIVILEGE-HARDENING: DISABLE-ESCALATION-AND-DROP-ALL-CAPS
+
+  Setting `USER 10001` in the Dockerfile does not satisfy Kubernetes Restricted
+  Pod Security admission or prevent image drift. Explicitly set `runAsNonRoot: true`,
+  `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, and
+  `seccompProfile.type: RuntimeDefault` in the Deployment manifest.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: pod-security-context-hardening-verdicts-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^verdict: missing-security-context$"
+          forbidden_patterns:
+            - "(?m)^verdict: hardened-as-is$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^non-root-enforcement: set-run-as-non-root-in-manifest$"
+          forbidden_patterns:
+            - "(?m)^non-root-enforcement: dockerfile-user-is-sufficient$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^privilege-hardening: disable-escalation-and-drop-all-caps$"
+          forbidden_patterns:
+            - "(?m)^privilege-hardening: default-linux-caps-are-safe$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
