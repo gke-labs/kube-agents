@@ -13,6 +13,17 @@ workloads deployed in GKE clusters. This skill operates non-interactively and
 enforces a read-only diagnostics boundary before proposing manifest or config
 corrections.
 
+> **MCP Tools:** `get_k8s_resource`, `describe_k8s_resource`, `get_k8s_logs`,
+> `list_k8s_events`
+>
+> Prefer these `gke` MCP read tools over spawning sequential `kubectl`
+> subshells in `terminal`: they accept
+> `parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}"`
+> without running `gcloud container clusters get-credentials`, and independent
+> reads can run as parallel tool calls in a single turn. When falling back to
+> `kubectl` or `gcloud` via `terminal`, batch independent read-only commands
+> into one compound shell call instead of chaining one command per turn.
+
 ## 🔍 Diagnostic Workflow
 
 ### Step 0: Non-Interactive Context Discovery & Time Window Definition
@@ -30,8 +41,19 @@ corrections.
 
 2.  **Cluster Credentials & Fallback Mode**:
 
-    -   Attempt credential fetch: `gcloud container clusters get-credentials
-        {cluster_name} --region/--zone {cluster_location}`
+    -   When `gke` MCP tools are available, query the cluster directly with
+        `parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}"`
+        — no `gcloud container clusters get-credentials` call is needed.
+    -   For CLI fallback (`kubectl` in `terminal`), pin a per-target
+        `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` before fetching
+        credentials, and export the same `KUBECONFIG` at the top of each
+        compound `terminal` call in Steps 1–4 (each `terminal` call starts a
+        fresh shell):
+
+        ```bash
+        export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"
+        gcloud container clusters get-credentials {cluster_name} --location={cluster_location} --project={project_id}
+        ```
     -   **Fallback / Dry-Run Mode**: If the cluster is unreachable,
         non-existent, or live command execution fails (such as in sandboxed
         evaluations, dry-run mode, or offline analysis):
@@ -60,16 +82,34 @@ corrections.
 
 ### Step 1: Analyze Pod Status and Conditions
 
-Inspect the workload's active pod states and controller status.
+Inspect the workload's active pod states, controller status, and namespace
+events in a single turn.
 
-**Diagnostic Commands:**
+**Preferred (`gke` MCP — emit independent reads in parallel in one turn):**
+
+```text
+describe_k8s_resource(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", resourceType="deployment", name="{workload_name}", namespace="{workload_namespace}")
+get_k8s_resource(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", resourceType="pod", namespace="{workload_namespace}", labelSelector="{selector_labels}", outputFormat="yaml")
+list_k8s_events(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", namespace="{workload_namespace}", limit="50")
+```
+
+Pass `outputFormat="yaml"` on the pod read so `lastState.terminated`, exit
+codes, waiting reasons, and init container states return in the same turn
+(without `outputFormat`, `get_k8s_resource` returns only a summary table). If
+`{selector_labels}` is not yet known, omit `labelSelector` (or call
+`get_k8s_resource` for the deployment first).
+
+**CLI Fallback (batch into one compound `terminal` call):**
 
 ```bash
-# 1. Inspect the deployment's actual selector labels:
-kubectl get deployment {workload_name} -n {workload_namespace} -o jsonpath='{.spec.selector.matchLabels}'
-# 2. Query the pods using the returned labels, for example:
-kubectl get pods -l {selector_labels} -n {workload_namespace}
-kubectl get deploy/{workload_name} -n {workload_namespace} -o yaml
+# Batch controller spec/status, selector-matched pods, waiting/init reasons, and lastState.terminated into one turn:
+export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"
+DEPLOY_JSON=$(kubectl get deploy/{workload_name} -n {workload_namespace} -o json)
+printf '%s\n' "$DEPLOY_JSON" | jq '{metadata: {name: .metadata.name, namespace: .metadata.namespace}, spec: {replicas: .spec.replicas, selector: .spec.selector, containers: [.spec.template.spec.containers[] | {name, image, command, args, resources}]}, status: .status}'
+SELECTOR=$(printf '%s\n' "$DEPLOY_JSON" | jq -r '.spec.selector.matchLabels // {} | to_entries | map("\(.key)=\(.value)") | join(",")')
+if [ -n "$SELECTOR" ]; then
+  kubectl get pods -l "$SELECTOR" -n {workload_namespace} -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,WAITING:.status.containerStatuses[*].state.waiting.reason,TERM:.status.containerStatuses[*].state.terminated.reason,LAST_TERM:.status.containerStatuses[*].lastState.terminated.reason,EXIT:.status.containerStatuses[*].lastState.terminated.exitCode,RESTARTS:.status.containerStatuses[*].restartCount,INIT:.status.initContainerStatuses[*].state.waiting.reason'
+fi
 ```
 
 #### Diagnostic Decision Tree:
@@ -79,10 +119,13 @@ kubectl get deploy/{workload_name} -n {workload_namespace} -o yaml
         Namespace Events)**.
 -   **State: CrashLoopBackOff / Error**:
 
-    -   Container is booting but exiting repeatedly. Check the terminated status
-        using:
+    -   Container is booting but exiting repeatedly. Read
+        `lastState.terminated` from the Step 1 pod output (or call
+        `describe_k8s_resource` / `get_k8s_resource` for `resourceType="pod"`
+        in parallel with Step 3 logs). CLI fallback if not already captured:
 
     ```bash
+    export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"
     kubectl get pod {pod_name} -n {workload_namespace} -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'
     ```
 
@@ -102,11 +145,20 @@ kubectl get deploy/{workload_name} -n {workload_namespace} -o yaml
 
 ### Step 2: Query Namespace Events
 
-Look for infrastructure, volume, image, or scheduling alerts in GKE.
+Look for infrastructure, volume, image, or scheduling alerts in GKE. Reuse the
+events if Step 1 already fetched `list_k8s_events` in parallel.
 
-**Diagnostic Command:**
+**Preferred (`gke` MCP — pair with `describe_k8s_resource` in one turn):**
+
+```text
+list_k8s_events(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", namespace="{workload_namespace}", limit="50")
+describe_k8s_resource(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", resourceType="pod", name="{pod_name}", namespace="{workload_namespace}")
+```
+
+**CLI Fallback (use `gcloud logging read` only for historical events outside Kubernetes event retention, and batch independent reads into one compound `terminal` call):**
 
 ```bash
+export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"
 kubectl get events -n {workload_namespace} --sort-by='.metadata.creationTimestamp'
 # Or query Cloud Logging for historical GKE events within the time window:
 gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/{project_id}/logs/events\" AND jsonPayload.involvedObject.namespace=\"{workload_namespace}\" AND timestamp>=\"{start_time}\" AND timestamp<=\"{end_time}\"" --project="{project_id}"
@@ -143,16 +195,28 @@ gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/{proje
 
 ### Step 3: Inspect Application Logs
 
-Extract exceptions and stack traces from the application runtime.
+Extract exceptions and stack traces from the application runtime. Fetch current
+and previous container logs in parallel in a single turn.
 
-**Diagnostic Commands:**
+**Preferred (`gke` MCP — emit current and previous log reads in parallel):**
+
+```text
+get_k8s_logs(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", name="{pod_name}", namespace="{workload_namespace}", allContainers=true, tail="100")
+get_k8s_logs(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", name="{pod_name}", namespace="{workload_namespace}", container="{container_name}", previous=true, tail="100")
+```
+
+Pass `allContainers=true` on the active logs call so multi-container pods do
+not read only the first container, and target `container="{container_name}"`
+on `previous=true` so a healthy sidecar with no terminated instance does not
+abort the call.
+
+**CLI Fallback (batch both reads in one compound `terminal` call; use `|| true` so a missing previous container does not mask current logs):**
 
 ```bash
-# Check current active log stream (handles multi-container pods)
-kubectl logs {pod_name} -n {workload_namespace} --all-containers --tail=100
-
-# Check logs from previously terminated container instances (handles multi-container pods)
-kubectl logs {pod_name} -n {workload_namespace} --all-containers -p --tail=100
+# Check current active and previously terminated log streams in one turn (handles multi-container pods)
+export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"
+kubectl logs {pod_name} -n {workload_namespace} --all-containers --tail=100 || true
+kubectl logs {pod_name} -n {workload_namespace} --all-containers -p --tail=100 || true
 ```
 
 #### Signature Identifiers:
@@ -177,15 +241,22 @@ kubectl logs {pod_name} -n {workload_namespace} --all-containers -p --tail=100
 
 ### Step 4: Verify Service Connectivity and Network Policies
 
-Troubleshoot connection drops to other services.
+Troubleshoot connection drops to other services. Inspect target endpoints and
+namespace `NetworkPolicy` objects together in a single turn.
 
-**Diagnostic Commands:**
+**Preferred (`gke` MCP — emit both reads in parallel in one turn):**
+
+```text
+get_k8s_resource(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", resourceType="endpoints", name="{target_service_name}", namespace="{target_namespace}")
+get_k8s_resource(parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}", resourceType="networkpolicy", namespace="{workload_namespace}", outputFormat="yaml")
+```
+
+**CLI Fallback (batch both reads into one compound `terminal` call):**
 
 ```bash
-# Verify target endpoint is active
+# Verify target endpoint and query namespace network policies in one turn
+export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"
 kubectl get endpoints {target_service_name} -n {target_namespace}
-
-# Query network policies inside namespace
 kubectl get networkpolicies -n {workload_namespace} -o yaml
 ```
 
@@ -193,7 +264,7 @@ kubectl get networkpolicies -n {workload_namespace} -o yaml
 
 1.  **Live Cluster Mode**:
 
-    -   If `kubectl get endpoints` returns an empty list, the target
+    -   If the endpoints query returns an empty list, the target
         microservice itself is failing to schedule or boot (troubleshoot target
         service).
     -   If endpoints exist but logs show timeouts, analyze `NetworkPolicy`

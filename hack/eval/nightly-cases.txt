@@ -2125,3 +2125,11 @@
 # kanban_complete's verified_claims, #3200). deployer: noop, read-only against
 # the crashloop-workload fixture, three units at the 200s default.
 ./tasks/verified-claims-carry-evidence/task.yaml
+
+# Skill-guidance probe for agents/platform/skills/gke-workload-troubleshooting:
+# Steps 1-4 prefer read-only gke MCP tools (get_k8s_resource,
+# describe_k8s_resource, get_k8s_logs, list_k8s_events) in parallel and batch
+# independent CLI fallback reads into one compound terminal call instead of
+# sequential single-command turns (#3226). deployer: noop, read-only, no
+# fixture.
+./tasks/workload-troubleshooting-mcp-batching-probe/task.yaml
