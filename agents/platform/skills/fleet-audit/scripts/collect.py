@@ -8,7 +8,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
 twenty-eight-check roster (§3.1–§3.28 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s twenty-one-check roster (§2.1–§2.21 of
+`compliance-audit`'s twenty-two-check roster (§2.1–§2.22 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -25,8 +25,10 @@ read for §3.28 that is issued only when a workload is short of available pods
 or mid-rollout, and the reads its declaration fields need; compliance issues
 several distinct `kubectl` and `gcloud` reads per cluster, seven of them
 best-effort cluster reads (five because their CRDs are not installed everywhere, two because
-an identity may not list webhook configurations or EndpointSlices) plus one deduplicated
-best-effort `gcloud projects describe` per unique project §2.21's Workload Identity annotations name; ai-security reads
+an identity may not list webhook configurations or EndpointSlices), one deduplicated
+best-effort `gcloud projects describe` per unique project §2.21's Workload Identity annotations name,
+and a fallback `gcloud container node-pools describe` for §2.22 when a Config Connector
+`ContainerNodePool` targets a cluster outside the swept fleet; ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
 `collect_cluster` is a thin dispatcher over a per-stream *context builder* for
@@ -905,6 +907,36 @@ MAX_KCC_WEDGE_MESSAGE_CHARS = 240
 # How many blocked objects an excerpt names before it stops and counts. Naming
 # all fifteen is not more informative than naming three and saying fifteen.
 MAX_KCC_BLOCKED_NAMED = 3
+# §2.22 `kcc-kubelet-cfs-quota-drift`: declared-versus-effective check for
+# Config Connector `ContainerNodePool` objects whose spec does not disable
+# `cpuCfsQuota` (omits `cpuCfsQuota` under `spec.nodeConfig.kubeletConfig`,
+# omits `kubeletConfig`, or sets `true`) while the target GKE node pool's
+# effective `config.kubeletConfig.cpuCfsQuota` is `false`.
+KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG = "kcc-kubelet-cfs-quota-drift"
+KCC_KUBELET_CFS_QUOTA_SEVERITY = "major"
+KCC_CONTAINER_NODE_POOL_KIND = "ContainerNodePool"
+KCC_CONTAINER_CLUSTER_KIND = "ContainerCluster"
+KCC_DEPENDENCY_NOT_FOUND_REASON = "DependencyNotFound"
+KCC_NODE_POOL_RAW_PATH = (
+    f"/apis/{kcc_health.CONTAINER_GROUP}/v1beta1/containernodepools?limit={kcc_health.KIND_PAGE_LIMIT}"
+)
+KCC_NODE_POOL_REPRODUCER_ARGV = ("kubectl", "get", "--raw", KCC_NODE_POOL_RAW_PATH)
+KCC_CFS_QUOTA_FIELD = "cpuCfsQuota"
+KCC_PROJECT_ANNOTATION = kcc_health.KCC_PROJECT_ANNOTATION
+KCC_CLUSTER_REF_EXTERNAL_RE = re.compile(
+    r"^(?:https://container\.googleapis\.com/v1(?:beta1)?/)?"
+    r"projects/(?P<project>[^/]+)/(?:locations|zones)/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)$"
+)
+KCC_GKE_NOT_FOUND_MARKERS = ("NOT_FOUND", "Not found", "was not found", "does not exist")
+KCC_CFS_QUOTA_COMMAND_JOIN = "; "
+KCC_CFS_QUOTA_MAX_COMMAND_CHARS = 1800
+FLEET_NODE_POOLS_KWARG = "fleet_node_pools"
+_IMPACT_KCC_KUBELET_CFS_QUOTA_DRIFT = (
+    "The live GKE node pool runs with kubeletConfig.cpuCfsQuota=false while its "
+    "Config Connector ContainerNodePool spec does not declare it false, so CPU "
+    "limits on pods scheduled to this pool are not enforced by the kubelet and "
+    "workloads can exceed CPU limits or trigger JVM thread-pool OOMKills."
+)
 # `check_configsync_reconciler_stalled`. The two Config Sync sync kinds, fully
 # qualified so the read cannot land on another group's `rootsyncs`. Read one
 # at a time: a comma-joined `kubectl get` fails wholesale when either kind is
@@ -6125,7 +6157,7 @@ def read_pull_waiting_pods(
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all twenty-one checks of §2.
+# compliance-audit: all twenty-two checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -8887,6 +8919,155 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
     return hits
 
 
+def _kcc_namespace_project_map(namespaces: list[dict]) -> dict[str, str]:
+    """Map namespace name -> GCP project ID (annotation if present, else name)."""
+    mapping: dict[str, str] = {}
+    for ns in namespaces or []:
+        if not isinstance(ns, dict):
+            continue
+        meta = ns.get("metadata") if isinstance(ns.get("metadata"), dict) else {}
+        ns_name = str(meta.get("name") or "")
+        if not ns_name:
+            continue
+        annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+        mapping[ns_name] = str(annotations.get(KCC_PROJECT_ANNOTATION) or "") or ns_name
+    return mapping
+
+
+def _kcc_cluster_index(
+    kcc_objects: list[dict], ns_projects: dict[str, str]
+) -> dict[tuple[str, str], tuple[str, str, str]]:
+    """Index Config Connector `ContainerCluster` objects by `(namespace, name)`
+    to `(project, location, gke_cluster_name)`."""
+    index: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for item in kcc_objects:
+        if not isinstance(item, dict) or item.get("kind") != KCC_CONTAINER_CLUSTER_KIND:
+            continue
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        ns = str(meta.get("namespace") or "")
+        name = str(meta.get("name") or "")
+        if not name:
+            continue
+        annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+        project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "") or ns_projects.get(ns, "")
+        location = str(spec.get("location") or "")
+        gke_name = str(spec.get("resourceID") or "") or name
+        index[(ns, name)] = (project, location, gke_name)
+    return index
+
+
+def _resolve_kcc_node_pool_target(
+    item: dict,
+    kcc_clusters: dict[tuple[str, str], tuple[str, str, str]],
+    ns_projects: dict[str, str],
+) -> tuple[str, str, str, str]:
+    """Resolve `(project, location, cluster_name, pool_name)` for a KCC
+    `ContainerNodePool` object."""
+    meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+    ns = str(meta.get("namespace") or "")
+    name = str(meta.get("name") or "")
+    pool_name = str(spec.get("resourceID") or "") or name
+    annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+    project = str(annotations.get(KCC_PROJECT_ANNOTATION) or "")
+    location = str(spec.get("location") or "")
+    cluster_name = ""
+
+    ref = spec.get("clusterRef") if isinstance(spec.get("clusterRef"), dict) else {}
+    external = str(ref.get("external") or "").strip()
+    if external:
+        match = KCC_CLUSTER_REF_EXTERNAL_RE.match(external.lstrip("/"))
+        if match:
+            project = project or match.group("project")
+            location = location or match.group("location")
+            cluster_name = match.group("cluster")
+        else:
+            cluster_name = external.rstrip("/").rpartition("/")[2]
+    elif ref.get("name"):
+        ref_name = str(ref.get("name") or "")
+        ref_ns = str(ref.get("namespace") or "") or ns
+        resolved = kcc_clusters.get((ref_ns, ref_name))
+        if resolved is not None:
+            ref_project, ref_location, ref_cluster = resolved
+            project = project or ref_project
+            location = location or ref_location
+            cluster_name = ref_cluster
+        else:
+            cluster_name = ref_name
+
+    if not project and ns:
+        project = ns_projects.get(ns, "")
+    return project, location, cluster_name, pool_name
+
+
+def _declared_cfs_quota_state(spec: dict) -> str | None:
+    """Describe why `spec` disagrees with effective `cpuCfsQuota=false`, or
+    return `None` when `spec` explicitly declares `cpuCfsQuota: false`."""
+    node_config = spec.get("nodeConfig") if isinstance(spec.get("nodeConfig"), dict) else {}
+    kubelet = node_config.get("kubeletConfig")
+    if isinstance(kubelet, dict):
+        value = kubelet.get(KCC_CFS_QUOTA_FIELD)
+        if value is False:
+            return None
+        if value is True:
+            return f"spec.nodeConfig.kubeletConfig.{KCC_CFS_QUOTA_FIELD} is true"
+        return f"spec.nodeConfig.kubeletConfig omits {KCC_CFS_QUOTA_FIELD} (GKE default is true)"
+    return f"spec.nodeConfig omits kubeletConfig (GKE default for {KCC_CFS_QUOTA_FIELD} is true)"
+
+
+def check_kcc_kubelet_cfs_quota_drift(context: dict) -> list[dict]:
+    """Cluster-scoped: Config Connector `ContainerNodePool` resources whose
+    declared `spec.nodeConfig.kubeletConfig` does not set `cpuCfsQuota: false`
+    while the target GKE node pool's effective `config.kubeletConfig.cpuCfsQuota`
+    is `false`."""
+    entries = context.get("kcc_node_pool_effective") or []
+    hits: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        item = entry.get("item")
+        gke_pool = entry.get("gke_pool")
+        if not isinstance(item, dict) or not isinstance(gke_pool, dict):
+            continue
+        config = gke_pool.get("config") if isinstance(gke_pool.get("config"), dict) else {}
+        kubelet = config.get("kubeletConfig") if isinstance(config.get("kubeletConfig"), dict) else {}
+        if kubelet.get(KCC_CFS_QUOTA_FIELD) is not False:
+            continue
+        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
+        declared_desc = _declared_cfs_quota_state(spec)
+        if declared_desc is None:
+            continue
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        ns = str(meta.get("namespace") or "")
+        name = str(meta.get("name") or "")
+        if not name:
+            continue
+        target_project = str(entry.get("project") or "")
+        target_location = str(entry.get("location") or "")
+        target_cluster = str(entry.get("cluster") or "")
+        target_pool = str(entry.get("pool") or name)
+        target_ref = target_name(target_project, target_location, target_cluster)
+        hit = {
+            "namespace": ns,
+            "object": f"{KCC_CONTAINER_NODE_POOL_KIND}/{name}",
+            "excerpt": (
+                f"Config Connector {KCC_CONTAINER_NODE_POOL_KIND}/{ns}/{name} targets "
+                f"{target_ref} NodePool/{target_pool}: declared {declared_desc}, "
+                f"while effective GKE config.kubeletConfig.{KCC_CFS_QUOTA_FIELD} is false; "
+                f"set spec.nodeConfig.kubeletConfig.{KCC_CFS_QUOTA_FIELD}: true explicitly "
+                "in the ContainerNodePool spec."
+            ),
+            "reconciler": reconciler_of(meta),
+            "release": release_of(meta),
+        }
+        cmd = str(entry.get("command") or "").strip()
+        if cmd:
+            hit["command"] = cmd
+        hits.append(hit)
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
+
+
 # A tag that moves. `latest` is the one everybody names; the other five are
 # the branch- and channel-shaped tags that move exactly as often and get
 # treated as though they do not. Deliberately not a general "does this tag
@@ -10569,6 +10750,14 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         None,
         _IMPACT_WI_GSA_BINDING_MISSING,
     ),
+    CheckSpec(
+        KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG,
+        "cluster",
+        check_kcc_kubelet_cfs_quota_drift,
+        KCC_KUBELET_CFS_QUOTA_SEVERITY,
+        None,
+        _IMPACT_KCC_KUBELET_CFS_QUOTA_DRIFT,
+    ),
 )
 
 AI_SECURITY_CHECKS: tuple[CheckSpec, ...] = (
@@ -10854,6 +11043,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     SERVICEENTRY_HOST_COLLISION_SLUG: ("serviceentries",),
     WEBHOOK_CA_BUNDLE_EXPIRED_SLUG: ("webhooks",),
     WI_GSA_BINDING_UNVERIFIABLE_SLUG: ("serviceaccounts", "describe", "projects"),
+    KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG: ("kcc", "node_pools"),
 }
 
 # The category Config Connector registers across every CRD it installs.
@@ -11070,6 +11260,176 @@ def _serviceentry_disposition(items: list[dict] | None, result: Run) -> str:
     )
 
 
+def _build_fleet_node_pool_index(
+    clusters: list[dict],
+) -> dict[tuple[str, str, str], tuple[list[dict], str]]:
+    """Index `(project, location, name) -> (node_pools, listing_command)` from
+    the `clusters list` records already collected during fleet enumeration."""
+    index: dict[tuple[str, str, str], tuple[list[dict], str]] = {}
+    for c in clusters:
+        result, _ = listed_node_pools(c)
+        if result is None:
+            continue
+        try:
+            pools = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(pools, list):
+            key = (str(c.get("project") or ""), str(c.get("location") or ""), str(c.get("name") or ""))
+            index[key] = (pools, shlex.join(result.argv))
+    return index
+
+
+def _populate_kcc_cfs_quota_context(
+    context: dict,
+    commands: dict[str, dict],
+    *,
+    cluster: dict,
+    kubeconfig: Path,
+    kcc_read: kcc_health.KccRead,
+    kcc_reason: str,
+    kcc_started: float,
+    fleet_node_pools: dict[tuple[str, str, str], tuple[list[dict], str]] | None,
+    run: RunFn,
+) -> None:
+    """Populate `context["kcc_node_pool_effective"]` and the disposition
+    (`commands`, `not_applicable`, or `unevaluated`) for §2.22
+    `kcc-kubelet-cfs-quota-drift`."""
+    context["kcc_node_pool_effective"] = []
+    if kcc_reason.startswith(UNDETERMINED_PREFIX):
+        context.setdefault("unevaluated", {})[KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG] = kcc_reason
+        return
+    if kcc_read.status == kcc_health.READ_ABSENT:
+        context.setdefault("not_applicable", {})[KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG] = kcc_reason
+        return
+
+    kcc_objects = [i for i in context.get("kcc_objects") or [] if isinstance(i, dict)]
+    kcc_node_pools = [i for i in kcc_objects if i.get("kind") == KCC_CONTAINER_NODE_POOL_KIND]
+    if not kcc_node_pools:
+        context.setdefault("not_applicable", {})[KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG] = (
+            "Config Connector is installed on this cluster, but it declares no "
+            f"{KCC_CONTAINER_NODE_POOL_KIND} resources, so there is no declared-versus-effective "
+            "node-pool CPU quota enforcement setting to compare."
+        )
+        return
+
+    ns_projects = _kcc_namespace_project_map(context.get("namespaces") or [])
+    kcc_clusters = _kcc_cluster_index(kcc_objects, ns_projects)
+    current_key = (
+        str(cluster.get("project") or ""),
+        str(cluster.get("location") or ""),
+        str(cluster.get("name") or ""),
+    )
+    current_pools = context.get("node_pools") or []
+    current_pools_cmd = (commands.get("legacy-metadata") or {}).get("command", "")
+    kcc_reproducer = f"KUBECONFIG={kubeconfig} {shlex.join(KCC_NODE_POOL_REPRODUCER_ARGV)}"
+
+    describe_cache: dict[tuple[str, str, str, str], tuple[dict | None, str, str]] = {}
+    gke_commands_used: list[str] = []
+    effective_entries: list[dict] = []
+    unread_reason = ""
+
+    for item in kcc_node_pools:
+        target_project, target_location, target_cluster, target_pool = _resolve_kcc_node_pool_target(
+            item, kcc_clusters, ns_projects
+        )
+        if not (target_project and target_location and target_cluster and target_pool):
+            ready = _kcc_ready_condition(item)
+            if (
+                ready is not None
+                and str(ready.get("status")) == "False"
+                and str(ready.get("reason") or "").strip() == KCC_DEPENDENCY_NOT_FOUND_REASON
+            ):
+                continue
+            item_meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            item_ns = str(item_meta.get("namespace") or "")
+            item_name = str(item_meta.get("name") or "") or "unnamed"
+            item_label = f"{item_ns}/{item_name}" if item_ns else item_name
+            unread_reason = (
+                f"{UNDETERMINED_PREFIX} {KCC_CONTAINER_NODE_POOL_KIND} {item_label} did not "
+                "resolve to a target GCP project, location, cluster, and node pool, so effective "
+                "GKE CPU quota enforcement was not established. This check cleared nothing on this cluster."
+            )
+            break
+
+        gke_pool: dict | None = None
+        gke_cmd = ""
+        lookup_key = (target_project, target_location, target_cluster)
+        if fleet_node_pools and lookup_key in fleet_node_pools:
+            pools_list, list_cmd = fleet_node_pools[lookup_key]
+            gke_cmd = list_cmd
+            gke_pool = next(
+                (p for p in pools_list if isinstance(p, dict) and p.get("name") == target_pool),
+                None,
+            )
+        elif lookup_key == current_key:
+            gke_cmd = current_pools_cmd
+            gke_pool = next(
+                (p for p in current_pools if isinstance(p, dict) and p.get("name") == target_pool),
+                None,
+            )
+        else:
+            cache_key = (target_project, target_location, target_cluster, target_pool)
+            if cache_key not in describe_cache:
+                describe_argv = [
+                    "gcloud", "container", "node-pools", "describe", target_pool,
+                    "--cluster", target_cluster, "--location", target_location,
+                    "--project", target_project, "--format", "json",
+                ]
+                parsed_pool, desc_run = run_and_gate(describe_argv, kubeconfig, run=run)
+                cmd_str = shlex.join(describe_argv)
+                if parsed_pool is not None and isinstance(parsed_pool, dict):
+                    describe_cache[cache_key] = (parsed_pool, cmd_str, "")
+                elif desc_run.rc != 0 and any(m in desc_run.stderr for m in KCC_GKE_NOT_FOUND_MARKERS):
+                    describe_cache[cache_key] = (None, cmd_str, "")
+                else:
+                    target_ref = target_name(target_project, target_location, target_cluster)
+                    describe_cache[cache_key] = (
+                        None,
+                        cmd_str,
+                        f"{UNDETERMINED_PREFIX} could not read live GKE node-pool settings for "
+                        f"{KCC_CONTAINER_NODE_POOL_KIND} {target_pool} in {target_ref}, so effective "
+                        "CPU quota enforcement was not established. This check cleared nothing on this cluster.",
+                    )
+            gke_pool, gke_cmd, err = describe_cache[cache_key]
+            if err:
+                unread_reason = err
+                break
+
+        if gke_cmd and gke_cmd not in gke_commands_used:
+            gke_commands_used.append(gke_cmd)
+        if gke_pool is not None:
+            combined = f"{kcc_reproducer}{KCC_CFS_QUOTA_COMMAND_JOIN}{gke_cmd}" if gke_cmd else kcc_reproducer
+            effective_entries.append(
+                {
+                    "item": item,
+                    "project": target_project,
+                    "location": target_location,
+                    "cluster": target_cluster,
+                    "pool": target_pool,
+                    "gke_pool": gke_pool,
+                    "command": combined,
+                }
+            )
+
+    if unread_reason:
+        context.setdefault("unevaluated", {})[KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG] = unread_reason
+        return
+
+    context["kcc_node_pool_effective"] = effective_entries
+    cmd_parts = [kcc_reproducer]
+    for gke_cmd in sorted(gke_commands_used):
+        candidate_chain = KCC_CFS_QUOTA_COMMAND_JOIN.join([*cmd_parts, gke_cmd])
+        if len(candidate_chain) > KCC_CFS_QUOTA_MAX_COMMAND_CHARS:
+            break
+        cmd_parts.append(gke_cmd)
+    commands[KCC_KUBELET_CFS_QUOTA_DRIFT_SLUG] = {
+        "command": KCC_CFS_QUOTA_COMMAND_JOIN.join(cmd_parts),
+        "rc": 0,
+        "duration_s": round(time.monotonic() - kcc_started, 2),
+    }
+
+
 def _collect_compliance(
     cluster: dict,
     kubeconfig: Path,
@@ -11077,6 +11437,7 @@ def _collect_compliance(
     *,
     run: RunFn,
     wi_project_cache: _WiProjectDescribeCache | None = None,
+    fleet_node_pools: dict[tuple[str, str, str], tuple[list[dict], str]] | None = None,
 ) -> CollectedContext:
     name, project, location = cluster["name"], cluster["project"], cluster["location"]
     commands: dict[str, dict] = {}
@@ -11522,6 +11883,22 @@ def _collect_compliance(
             raise GateFailure(f"node-pools list gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
         context["node_pools"] = parsed if isinstance(parsed, list) else []
         commands["legacy-metadata"] = _record(node_pools_command, result)
+
+    # §2.22 `kcc-kubelet-cfs-quota-drift`: compares declared Config Connector
+    # `ContainerNodePool` specs (already listed in `kcc_objects`) against
+    # effective GKE `nodePools[].config.kubeletConfig.cpuCfsQuota` (from the
+    # fleet listing index, this cluster's node pools, or a fallback describe).
+    _populate_kcc_cfs_quota_context(
+        context,
+        commands,
+        cluster=cluster,
+        kubeconfig=kubeconfig,
+        kcc_read=kcc_read,
+        kcc_reason=kcc_reason,
+        kcc_started=kcc_started,
+        fleet_node_pools=fleet_node_pools,
+        run=run,
+    )
 
     # Whether the three admission premises `_COMPLIANCE_AUTOPILOT_NOT_APPLICABLE`
     # rests on are still intact on this cluster. They hold only while nothing
@@ -12358,6 +12735,7 @@ def collect_cluster(
     releases: dict[tuple, dict] | None = None,
     namespaces: dict[tuple[str, str], dict] | None = None,
     wi_project_cache: _WiProjectDescribeCache | None = None,
+    fleet_node_pools: dict[tuple[str, str, str], tuple[list[dict], str]] | None = None,
 ) -> dict:
     """One manifest `clusters[]` entry: every enumerated cluster gets
     one, whatever happened — `outcome` says which of the three shapes it is.
@@ -12383,6 +12761,8 @@ def collect_cluster(
             collector_kwargs: dict[str, object] = {"run": run}
             if wi_project_cache is not None and audit_id == COMPLIANCE_AUDIT_ID:
                 collector_kwargs[WI_CACHE_KWARG] = wi_project_cache
+            if fleet_node_pools is not None and audit_id == COMPLIANCE_AUDIT_ID:
+                collector_kwargs[FLEET_NODE_POOLS_KWARG] = fleet_node_pools
             collected = _COLLECTORS[audit_id](cluster, kubeconfig, checks, **collector_kwargs)
         except GateFailure as exc:
             return {
@@ -12756,6 +13136,7 @@ def collect_fleet(
             log(f"{KUBECONFIG_DIR}: {shared_note}")
 
     wi_project_cache = _WiProjectDescribeCache() if audit_id == COMPLIANCE_AUDIT_ID else None
+    fleet_node_pools = _build_fleet_node_pool_index(clusters) if audit_id == COMPLIANCE_AUDIT_ID else None
     results = [None] * len(clusters)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
@@ -12769,6 +13150,7 @@ def collect_fleet(
                 releases=releases,
                 namespaces=namespaces,
                 wi_project_cache=wi_project_cache,
+                fleet_node_pools=fleet_node_pools,
             ): index
             for index, cluster in enumerate(clusters)
         }

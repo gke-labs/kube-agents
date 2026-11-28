@@ -5,12 +5,15 @@ Audit (`fleet-consistency-drift`).
 See docs/designs/fleet-audit-collector-manifest.md for the manifest this
 emits and governance/fleet_consistency_drift_sop.md for the checks.
 
-This stream's own collector: every one of its twenty-two checks -- twenty-one
-comparative facets and §4.14's cohort-independent `no-environment-label` --
-reads GKE control-plane and node-pool metadata through `gcloud container`, no
-`kubectl` and no kubeconfig, so the checks need no per-cluster credential fetch —
-`clusters list` alone, once per project, returns every field every facet
-compares, the same shape `clusters describe` would (the SOP's own §1.3
+This stream's own collector: twenty-one comparative facets and §4.14's
+cohort-independent `no-environment-label` read GKE control-plane and node-pool
+metadata through `gcloud container` alone — no `kubectl` and no kubeconfig —
+and §4.17's cohort-independent `kubelet-cpu-cfs-quota` reads the same
+`clusters list` output first, issuing paged `kubectl` reads of `nodes` and
+`pods` only on a Standard cluster that has a Linux pool with
+`config.kubeletConfig.cpuCfsQuota: false`. `clusters list` alone, once per
+project, returns every field every comparative facet compares, the same shape
+`clusters describe` would (the SOP's own §1.3
 frames `describe` as each finding's `evidence.command`; this collector
 issues the cheaper per-project `list` instead and records that as the
 command it actually ran: the manifest publishes what happened, not what
@@ -34,6 +37,7 @@ import argparse
 import functools
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
@@ -257,6 +261,57 @@ KUBELET_CONFIG_DEFAULTS = {
     "containerLogMaxSize": "10Mi",
     "containerLogMaxFiles": "5",
 }
+# §4.17: cohort-independent check for Standard Linux node pools whose effective
+# `config.kubeletConfig.cpuCfsQuota` is `false` while live pods scheduled on
+# those pools declare `resources.limits.cpu`. Unlike §4.16's comparative
+# `kubelet-config` facet, this fires even when every pool in the cohort carries
+# `cpuCfsQuota=false` or the fleet is below the cohort floor.
+KUBELET_CFS_QUOTA_SLUG = "kubelet-cpu-cfs-quota"
+KUBELET_CFS_QUOTA_SEVERITY = "major"
+CFS_QUOTA_READ_ERROR = "cluster nodes and pods could not be read"
+GKE_NODEPOOL_LABEL = "cloud.google.com/gke-nodepool"
+CFS_QUOTA_KUBECTL_RESOURCES = ("node", "pod")
+CFS_QUOTA_TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
+CFS_QUOTA_CPU_QUANTITY_RE = re.compile(r"^(?P<num>\d+(?:\.\d+)?)(?P<suffix>[nu m kMGTPE]?i?)$".replace(" ", ""))
+CFS_QUOTA_MAX_NAMED_PODS = 5
+CFS_QUOTA_MAX_NAMED_JVM_CONTAINERS = 5
+CFS_QUOTA_ACTIVE_PROCESSOR_FLAG = "-XX:ActiveProcessorCount"
+CFS_QUOTA_MAX_RAM_PERCENTAGE_FLAG = "-XX:MaxRAMPercentage"
+CFS_QUOTA_JVM_FLAGS = (
+    CFS_QUOTA_ACTIVE_PROCESSOR_FLAG,
+    CFS_QUOTA_MAX_RAM_PERCENTAGE_FLAG,
+)
+JVM_ENV_OPTION_NAMES = frozenset(
+    {"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "JAVA_OPTS", "_JAVA_OPTIONS", "JVM_OPTS"}
+)
+JVM_IMAGE_RE = re.compile(
+    r"(?:^|[/:._-])(java|openjdk|temurin|corretto|amazoncorretto|zulu|graalvm|"
+    r"liberica|sapmachine|semeru|jre|jdk|tomcat|jetty|wildfly|jboss|kafka|"
+    r"elasticsearch|opensearch|solr|cassandra|spark|flink|trino|presto|"
+    r"keycloak|jenkins|sonarqube|maven|gradle|sbt|spring)(?:[/:._-]|$)",
+    re.IGNORECASE,
+)
+JVM_ENTRYPOINT_BASENAMES = frozenset({"java", "javaw", "jshell"})
+JVM_JAR_FLAG = "-jar"
+JVM_JAR_SUFFIX = ".jar"
+JVM_FLAG_PREFIXES = ("-Xmx", "-Xms", "-XX:")
+CFS_QUOTA_AUTOPILOT_REASON = (
+    "GKE Autopilot: Google manages node kubelet configuration and enforces "
+    "container CPU limits; `config.kubeletConfig.cpuCfsQuota` cannot be disabled per pool."
+)
+CFS_QUOTA_NO_POOLS_REASON = (
+    "This cluster runs no node pools, so Linux CFS quota enforcement "
+    "(`config.kubeletConfig.cpuCfsQuota`) has no pool to evaluate."
+)
+CFS_QUOTA_NO_LINUX_POOL_REASON = (
+    "This cluster runs only Windows node pools, so Linux CFS quota enforcement "
+    "(`config.kubeletConfig.cpuCfsQuota`) does not apply."
+)
+CFS_QUOTA_COMMAND_JOIN = "; "
+CFS_QUOTA_IMAGE_DIGEST_SEP = "@"
+CFS_QUOTA_PATH_SEP = "/"
+CFS_QUOTA_NODE_KIND = "Node"
+CFS_QUOTA_POD_KIND = "Pod"
 
 # The one check here that is not a facet. Every `Facet` is comparative and so
 # runs only inside a cohort that reached `COHORT_FLOOR`; this one asks why a
@@ -287,6 +342,9 @@ Run = collector_run.Run
 TIMEOUT_RC = collector_run.TIMEOUT_RC
 Discovery = collector_run.Discovery
 run_and_gate = collector_run.run_and_gate
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
+KUBECONFIG_VAR = collector_run.KUBECONFIG_VAR
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
@@ -1152,6 +1210,11 @@ IMPACT = {
     "database-encryption": "Secrets in this cluster's etcd are not wrapped with the customer-managed key every peer uses.",
     BOOT_DISK_SLUG: "This pool's nodes have different disk space and disk throughput for images, logs and ephemeral storage than its peers' nodes.",
     KUBELET_CONFIG_SLUG: "This pool's kubelet enforces different CPU, PID or log-rotation limits than its peers' pools.",
+    KUBELET_CFS_QUOTA_SLUG: (
+        "CPU limits declared by pods scheduled on this node pool are not enforced by "
+        "the kubelet because cpuCfsQuota is false, allowing workloads to burst across "
+        "all host CPUs and risk noisy-neighbour starvation or JVM thread-pool OOMKills."
+    ),
     UNCOHORTED_SLUG: "This cluster diverges from its cohort on so many facets that its cohort labelling, not each facet, is likely wrong.",
 }
 
@@ -1720,6 +1783,333 @@ def unlabelled_environment_candidates(clusters: list[dict], *, now: datetime) ->
     return checks_run, candidates, not_applicable
 
 
+def _linux_pools(c: dict) -> list[tuple[str, dict]]:
+    """Every non-Windows node pool on `c`, each with its pool name."""
+    return [
+        (str(p.get("name") or f"{UNNAMED_POOL_PREFIX}{index}"), p)
+        for index, p in enumerate(c.get("nodePools") or [])
+        if isinstance(p, dict) and not _is_windows_pool(p)
+    ]
+
+
+def _pool_cfs_quota_disabled(p: dict) -> bool:
+    """Whether `p`'s effective GKE config explicitly sets `cpuCfsQuota: false`.
+
+    GKE omits `cpuCfsQuota` at its default (`true`) and serializes an explicit
+    `false` (wrapped boolean) only when disabled, so strict identity against
+    `False` distinguishes a disabled quota from an unset default.
+    """
+    config = p.get("config")
+    if not isinstance(config, dict):
+        return False
+    kubelet = config.get("kubeletConfig")
+    if not isinstance(kubelet, dict):
+        return False
+    return kubelet.get(KUBELET_CONFIG_CFS_QUOTA_KEY) is False
+
+
+def _container_has_cpu_limit(container: dict) -> bool:
+    """Whether `container` declares a positive `resources.limits.cpu`."""
+    resources = container.get("resources")
+    if not isinstance(resources, dict):
+        return False
+    limits = resources.get("limits")
+    if not isinstance(limits, dict):
+        return False
+    raw = limits.get("cpu")
+    if raw is None:
+        return False
+    text = str(raw).strip()
+    if not text:
+        return False
+    match = CFS_QUOTA_CPU_QUANTITY_RE.match(text)
+    if not match:
+        return False
+    try:
+        return float(match.group("num")) > 0.0
+    except ValueError:
+        return False
+
+
+def _tokenize_command_words(items: list[str]) -> list[str]:
+    """Split direct and shell-wrapped command/args strings into individual tokens."""
+    words: list[str] = []
+    for item in items:
+        stripped = item.strip()
+        if not stripped:
+            continue
+        try:
+            words.extend(shlex.split(stripped))
+        except ValueError:
+            words.extend(stripped.split())
+    return words
+
+
+def _is_jvm_container(container: dict) -> bool:
+    """Heuristic detection of JVM containers by image name or entrypoint/args."""
+    image = str(container.get("image") or "").split(CFS_QUOTA_IMAGE_DIGEST_SEP, 1)[0]
+    if image and JVM_IMAGE_RE.search(image):
+        return True
+    command = [str(token) for token in (container.get("command") or []) if token is not None]
+    args = [str(token) for token in (container.get("args") or []) if token is not None]
+    for token in _tokenize_command_words(command + args):
+        basename = token.rsplit(CFS_QUOTA_PATH_SEP, 1)[-1].lower()
+        if basename in JVM_ENTRYPOINT_BASENAMES:
+            return True
+        if token == JVM_JAR_FLAG or token.lower().endswith(JVM_JAR_SUFFIX):
+            return True
+        if any(token.startswith(prefix) for prefix in JVM_FLAG_PREFIXES):
+            return True
+    return False
+
+
+def _missing_jvm_ergonomic_flags(container: dict) -> list[str]:
+    """Which of `CFS_QUOTA_JVM_FLAGS` (`-XX:ActiveProcessorCount`,
+    `-XX:MaxRAMPercentage`) are absent from `container`'s command, args, and
+    JVM option environment variables."""
+    parts = [
+        str(token)
+        for token in (container.get("command") or []) + (container.get("args") or [])
+        if token is not None
+    ]
+    for env_entry in container.get("env") or []:
+        if not isinstance(env_entry, dict):
+            continue
+        if str(env_entry.get("name") or "") in JVM_ENV_OPTION_NAMES:
+            value = env_entry.get("value")
+            if isinstance(value, str) and value:
+                parts.append(value)
+    joined = " ".join(parts)
+    return [flag for flag in CFS_QUOTA_JVM_FLAGS if flag not in joined]
+
+
+def _read_cluster_nodes_and_pods(
+    cluster: dict, *, run: RunFn
+) -> tuple[list[dict] | None, list[dict] | None, str, str, float, Path | None, str]:
+    """Fetch credentials and page `nodes` and `pods` for one cluster with a
+    `cpuCfsQuota=false` pool. Returns
+    `(nodes, pods, command_text, output_summary, duration_s, kubeconfig, error)`."""
+    project = str(cluster.get("_project") or "")
+    name = str(cluster.get("name") or "")
+    location = str(cluster.get("location") or cluster.get("zone") or "")
+    from collect import fetch_credentials  # noqa: PLC0415 -- shared credential helper
+
+    kubeconfig, fetched = fetch_credentials(project, name, location, run=run)
+    if fetched.rc != 0:
+        return None, None, "", "", fetched.duration_s, None, "cluster credentials could not be fetched"
+
+    parsed, result = paged_dump(
+        CFS_QUOTA_KUBECTL_RESOURCES,
+        run=run,
+        env={**os.environ, KUBECONFIG_VAR: str(kubeconfig)},
+    )
+    if parsed is None:
+        return None, None, "", "", fetched.duration_s + result.duration_s, kubeconfig, CFS_QUOTA_READ_ERROR
+
+    items = parsed.get("items") or []
+    nodes = [item for item in items if isinstance(item, dict) and item.get("kind") == CFS_QUOTA_NODE_KIND]
+    pods = [item for item in items if isinstance(item, dict) and item.get("kind") == CFS_QUOTA_POD_KIND]
+    command_text = paged_command_text(CFS_QUOTA_KUBECTL_RESOURCES, kubeconfig=kubeconfig)
+    return nodes, pods, command_text, result.stdout, fetched.duration_s + result.duration_s, kubeconfig, ""
+
+
+def _cfs_quota_pool_excerpt(
+    pool_name: str,
+    limited_pods: list[str],
+    jvm_notes: list[str],
+) -> str:
+    """Structured evidence excerpt for a §4.17 `kubelet-cpu-cfs-quota` hit."""
+    shown_pods = ", ".join(limited_pods[:CFS_QUOTA_MAX_NAMED_PODS])
+    more_pods = (
+        f", +{len(limited_pods) - CFS_QUOTA_MAX_NAMED_PODS} more"
+        if len(limited_pods) > CFS_QUOTA_MAX_NAMED_PODS
+        else ""
+    )
+    lines = [
+        f"observed: nodePools[name={pool_name}].config.kubeletConfig.{KUBELET_CONFIG_CFS_QUOTA_KEY}=false",
+        (
+            f"pods_with_cpu_limits: {len(limited_pods)} live pod(s) on {POOL_OBJECT_KIND}/{pool_name} "
+            f"declare resources.limits.cpu ({shown_pods}{more_pods})"
+        ),
+    ]
+    if jvm_notes:
+        shown_jvm = ", ".join(jvm_notes[:CFS_QUOTA_MAX_NAMED_JVM_CONTAINERS])
+        more_jvm = (
+            f", +{len(jvm_notes) - CFS_QUOTA_MAX_NAMED_JVM_CONTAINERS} more"
+            if len(jvm_notes) > CFS_QUOTA_MAX_NAMED_JVM_CONTAINERS
+            else ""
+        )
+        lines.append(
+            f"jvm_note: {len(jvm_notes)} JVM container(s) on {POOL_OBJECT_KIND}/{pool_name} omit "
+            f"{CFS_QUOTA_ACTIVE_PROCESSOR_FLAG} or {CFS_QUOTA_MAX_RAM_PERCENTAGE_FLAG} "
+            f"({shown_jvm}{more_jvm}); without CFS quota the JVM reads all host CPUs and risks OOMKill"
+        )
+    return "\n".join(lines)
+
+
+def kubelet_cfs_quota_candidates(
+    clusters: list[dict],
+    *,
+    command_by_project: dict[str, dict],
+    run: RunFn = default_run,
+    max_workers: int | None = None,
+    kubeconfigs: dict[str, Path] | None = None,
+) -> tuple[
+    dict[tuple, list[str]],
+    dict[tuple, list[dict]],
+    dict[tuple, list[dict]],
+    dict[tuple, str],
+    dict[tuple, dict],
+]:
+    """§4.17's cohort-independent `kubelet-cpu-cfs-quota` check.
+
+    Inspects every Standard cluster's Linux pools from `clusters list` first:
+    when no pool sets `config.kubeletConfig.cpuCfsQuota: false`, zero `kubectl`
+    calls are made and the check is recorded against the project's `clusters
+    list` command. When one or more pools report `cpuCfsQuota: false`, reads
+    the affected clusters' nodes and pods concurrently (bounded by
+    `max_workers`) to count live pods scheduled on those pools that declare
+    `resources.limits.cpu`, adding a secondary note for JVM containers without
+    `-XX:ActiveProcessorCount` or `-XX:MaxRAMPercentage`. When `kubeconfigs`
+    is supplied, fetched kubeconfig paths are recorded by cluster target name
+    so `kcc_health.annotate_manifest` reuses them without a second credential
+    fetch.
+    """
+    checks_run: dict[tuple, list[str]] = {}
+    candidates: dict[tuple, list[dict]] = {}
+    not_applicable: dict[tuple, list[dict]] = {}
+    limitations: dict[tuple, str] = {}
+    command_overrides: dict[tuple, dict] = {}
+    to_inspect: list[tuple[dict, list[str]]] = []
+
+    for c in clusters:
+        key = ckey(c)
+        if cluster_mode(c) == "autopilot":
+            not_applicable[key] = [{"check": KUBELET_CFS_QUOTA_SLUG, "reason": CFS_QUOTA_AUTOPILOT_REASON}]
+            continue
+        status = str(c.get("status") or "")
+        if status not in kcc_health.READABLE_STATUSES:
+            continue
+        pools = _linux_pools(c)
+        if not pools:
+            reason = CFS_QUOTA_NO_POOLS_REASON if not (c.get("nodePools") or []) else CFS_QUOTA_NO_LINUX_POOL_REASON
+            not_applicable[key] = [{"check": KUBELET_CFS_QUOTA_SLUG, "reason": reason}]
+            continue
+        disabled_pools = [pool_name for pool_name, p in pools if _pool_cfs_quota_disabled(p)]
+        if not disabled_pools:
+            checks_run[key] = [KUBELET_CFS_QUOTA_SLUG]
+            continue
+        to_inspect.append((c, disabled_pools))
+
+    if not to_inspect:
+        return checks_run, candidates, not_applicable, limitations, command_overrides
+
+    worker_count = max(1, min(max_workers or broker_admission.sweep_width(), len(to_inspect)))
+    read_results: dict[tuple, tuple[list[dict] | None, list[dict] | None, str, str, float, Path | None, str]] = {}
+    if worker_count == 1:
+        for c, _ in to_inspect:
+            read_results[ckey(c)] = _read_cluster_nodes_and_pods(c, run=run)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = {pool.submit(_read_cluster_nodes_and_pods, c, run=run): c for c, _ in to_inspect}
+            for future in as_completed(futures):
+                c = futures[future]
+                try:
+                    read_results[ckey(c)] = future.result()
+                except Exception as exc:  # noqa: BLE001 -- preserve other clusters
+                    log(f"{target_name(c)}: {KUBELET_CFS_QUOTA_SLUG} read raised {type(exc).__name__}: {exc}")
+                    read_results[ckey(c)] = (None, None, "", "", 0.0, None, CFS_QUOTA_READ_ERROR)
+
+    for c, disabled_pools in to_inspect:
+        key = ckey(c)
+        nodes, pods, kubectl_cmd, paged_summary, read_duration_s, kubeconfig, error = read_results[key]
+        if kubeconfigs is not None and kubeconfig is not None and kubeconfig.is_file():
+            kubeconfigs[target_name(c)] = kubeconfig
+        if error or nodes is None or pods is None:
+            limitations[key] = (
+                f"{KUBELET_CFS_QUOTA_SLUG}: node pool(s) {', '.join(disabled_pools)} disable CPU quota "
+                f"enforcement, but {error}, so pod CPU limits on those pools were not checked."
+            )
+            continue
+
+        checks_run[key] = [KUBELET_CFS_QUOTA_SLUG]
+        project_record = command_by_project.get(c.get("_project", ""))
+        combined_cmd = (
+            f"{project_record['command']}{CFS_QUOTA_COMMAND_JOIN}{kubectl_cmd}"
+            if project_record
+            else kubectl_cmd
+        )
+        base_digest = project_record["output_sha256"] if project_record else ""
+        command_overrides[key] = {
+            "command": combined_cmd,
+            "rc": 0,
+            "duration_s": round((project_record["duration_s"] if project_record else 0.0) + read_duration_s, 2),
+            "output_sha256": output_digest(f"{base_digest}\n{paged_summary}"),
+        }
+
+        node_to_pool: dict[str, str] = {}
+        for node in nodes:
+            meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+            node_name = str(meta.get("name") or "")
+            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
+            pool_label = str(labels.get(GKE_NODEPOOL_LABEL) or "")
+            if node_name and pool_label:
+                node_to_pool[node_name] = pool_label
+
+        disabled_set = set(disabled_pools)
+        pods_by_pool: dict[str, list[str]] = {p: [] for p in disabled_pools}
+        jvm_by_pool: dict[str, list[str]] = {p: [] for p in disabled_pools}
+        for pod in pods:
+            pod_status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+            if str(pod_status.get("phase") or "") in CFS_QUOTA_TERMINAL_POD_PHASES:
+                continue
+            pod_spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+            node_name = str(pod_spec.get("nodeName") or "")
+            pool_name = node_to_pool.get(node_name, "")
+            if pool_name not in disabled_set:
+                continue
+            meta = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+            pod_ns = str(meta.get("namespace") or "")
+            pod_name = str(meta.get("name") or "")
+            pod_ref = f"{pod_ns}/{pod_name}" if pod_ns else pod_name
+            containers = [
+                ctr
+                for ctr in (pod_spec.get("containers") or []) + (pod_spec.get("initContainers") or [])
+                if isinstance(ctr, dict)
+            ]
+            if any(_container_has_cpu_limit(ctr) for ctr in containers):
+                pods_by_pool[pool_name].append(pod_ref)
+            for ctr in containers:
+                if _container_has_cpu_limit(ctr) and _is_jvm_container(ctr):
+                    missing_flags = _missing_jvm_ergonomic_flags(ctr)
+                    if missing_flags:
+                        ctr_name = str(ctr.get("name") or "?")
+                        jvm_by_pool[pool_name].append(
+                            f"{pod_ref}/{ctr_name} (missing {', '.join(missing_flags)})"
+                        )
+
+        pool_hits: list[dict] = []
+        for pool_name in disabled_pools:
+            limited = sorted(pods_by_pool[pool_name])
+            if not limited:
+                continue
+            jvm_notes = sorted(jvm_by_pool[pool_name])
+            excerpt = _cfs_quota_pool_excerpt(pool_name, limited, jvm_notes)
+            hit = _emit(
+                KUBELET_CFS_QUOTA_SLUG,
+                pool_name,
+                excerpt,
+                KUBELET_CFS_QUOTA_SEVERITY,
+                kind=POOL_OBJECT_KIND,
+            )
+            hit["command"] = combined_cmd
+            pool_hits.append(hit)
+        if pool_hits:
+            candidates[key] = pool_hits
+
+    return checks_run, candidates, not_applicable, limitations, command_overrides
+
+
 def autopilot_not_applicable(clusters: list[dict]) -> dict[tuple, list[dict]]:
     """§6's `checks_not_applicable` for the facets `compute_drift` refuses to
     compute on Autopilot.
@@ -2122,7 +2512,14 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> tuple[list[di
     return enumerate_project_clusters(project, run=run)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, now: datetime | None = None) -> dict:
+def collect_fleet(
+    project: str | None = None,
+    *,
+    run: RunFn = default_run,
+    max_workers: int | None = None,
+    now: datetime | None = None,
+    kubeconfigs: dict[str, Path] | None = None,
+) -> dict:
     max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
@@ -2177,10 +2574,26 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         checks_run.setdefault(cluster_key, []).extend(slugs)
     for cluster_key, found in unlabelled_candidates.items():
         candidates.setdefault(cluster_key, []).extend(found)
+    cfs_run, cfs_candidates, cfs_na, cfs_limits, cfs_cmd_overrides = kubelet_cfs_quota_candidates(
+        all_clusters,
+        command_by_project=command_by_project,
+        run=run,
+        max_workers=max_workers,
+        kubeconfigs=kubeconfigs,
+    )
+    for cluster_key, slugs in cfs_run.items():
+        checks_run.setdefault(cluster_key, []).extend(slugs)
+    for cluster_key, found in cfs_candidates.items():
+        candidates.setdefault(cluster_key, []).extend(found)
     limitations = cohort_limitations(all_clusters, now=now)
     not_applicable = autopilot_not_applicable(all_clusters)
     for cluster_key, skipped in unlabelled_na.items():
         not_applicable.setdefault(cluster_key, []).extend(skipped)
+    for cluster_key, skipped in cfs_na.items():
+        not_applicable.setdefault(cluster_key, []).extend(skipped)
+    for cluster_key, sentence in cfs_limits.items():
+        existing = limitations.get(cluster_key)
+        limitations[cluster_key] = f"{existing} {sentence}" if existing else sentence
     # Everything a compared cluster did not vote on. `cohort_limitations`
     # speaks for the clusters nothing compared at all, and these two never
     # cover the same cluster, but the join is written to survive one of them
@@ -2198,7 +2611,10 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
         record = command_by_project.get(project_name)
         cluster_key = ckey(c)
         ran = checks_run.get(cluster_key, [])
-        commands = [{"check": slug, **record} for slug in ran] if record else []
+        commands = [
+            {"check": slug, **(cfs_cmd_overrides[cluster_key] if slug == KUBELET_CFS_QUOTA_SLUG and cluster_key in cfs_cmd_overrides else record)}
+            for slug in ran
+        ] if record else []
         found = candidates.get(cluster_key, [])
         if record:
             for candidate in found:
@@ -2373,7 +2789,8 @@ def main(argv: list[str] | None = None) -> int:
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     # The Config Connector reads below end inside a budget measured from here.
     started = time.monotonic()
-    manifest = collect_fleet(args.project)
+    fetched_kubeconfigs: dict[str, Path] = {}
+    manifest = collect_fleet(args.project, kubeconfigs=fetched_kubeconfigs)
     # With `--config-connector` (`kcc_health.FLAG`), which the SOP command
     # passes, or while an audit run of this stream is in flight, so the read
     # does not depend on the model copying the flag; a chat fleet question
@@ -2390,7 +2807,15 @@ def main(argv: list[str] | None = None) -> int:
         # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
         with ThreadPoolExecutor(max_workers=broker_admission.sweep_width()) as pool:
             kcc_health.annotate_manifest(
-                manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map, kinds=kcc_health.CONTAINER_KINDS
+                manifest,
+                deadline=kcc_health.run_deadline(started),
+                mapper=pool.map,
+                kubeconfig_for=(
+                    (lambda entry: fetched_kubeconfigs.get(str(entry.get("name") or "")))
+                    if fetched_kubeconfigs
+                    else None
+                ),
+                kinds=kcc_health.CONTAINER_KINDS,
             )
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
