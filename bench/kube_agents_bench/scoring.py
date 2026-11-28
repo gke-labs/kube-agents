@@ -69,11 +69,12 @@ from pathlib import Path
 from typing import Any
 
 from kube_agents_bench import chat_shape
-from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
+from kube_agents_bench.cases import ARGUMENTS_MIXED, ARGUMENTS_NEGATED, HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 from kube_agents_bench.forges import FORGE_SAFEGUARD_MARKER, FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
 from kube_agents_bench.worker_trajectory import NO_WORKER_CALLS_ENTRY
+from kube_agents_bench.worker_trajectory import TOOL_CALL_WRAPPER
 
 __all__ = [
     "DEFAULT_AGGREGATE_MARGIN",
@@ -295,6 +296,11 @@ INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
 INJECT_ACTIVITY_EVENT = "a2a.activity"
 INJECT_ACTIVITY_LOSS_ARGS = ("dropped", "malformed", "input_truncated", "stale")
+#: The transport's mark on a call entry whose executor sent no input
+#: (``inject_transport.ENTRY_INPUT_ABSENT_FIELD``, duplicated like the names
+#: above): its empty ``args`` say nothing about the arguments it was called
+#: with, so a check reading them is set aside (``_inject_lane_view``).
+INJECT_INPUT_ABSENT_FIELD = "input_absent"
 INJECT_ENVELOPE_EVENTS = frozenset(
     {
         INJECT_TASK_EVENT,
@@ -1097,6 +1103,67 @@ def _inject_trace_shown(trajectory: list[Any]) -> bool:
     )
 
 
+def _inject_inputless_tools(trajectory: list[Any]) -> set[str]:
+    """The tool names of the router's call entries the transport marked as
+    sent with no input (:data:`INJECT_INPUT_ABSENT_FIELD`). A worker's
+    tagged entry (``agent`` set) is not the router's and is left out."""
+    return {
+        str(entry.get("name"))
+        for entry in trajectory
+        if isinstance(entry, dict) and entry.get(INJECT_INPUT_ABSENT_FIELD) is True and not entry.get("agent")
+    }
+
+
+def _reads_inputless_call(tools: frozenset[str], inputless: set[str]) -> bool:
+    """Whether a check whose ``arguments`` leaves name ``tools`` (empty: every
+    tool) could have matched one of the calls in ``inputless``. A hermes
+    ``tool_call`` wrapper with no input names no tool it invoked, so it could
+    be any of them."""
+    if not inputless:
+        return False
+    return not tools or TOOL_CALL_WRAPPER in inputless or bool(tools & inputless)
+
+
+def _entry_passed(entry: dict[str, Any]) -> bool:
+    """Whether a report entry records a pass, read as :func:`_entry_failed`
+    reads a fail."""
+    status = str(entry.get("status") or "").lower()
+    if status:
+        return status == CHECK_STATUS_PASS
+    return bool(entry.get("success"))
+
+
+def _inputless_argument_checks(spec: CaseSpec, record: RunRecord) -> set[str]:
+    """The report entries an inputless call leaves uncertain
+    (:attr:`CaseSpec.trace_argument_checks`): on a record holding a router
+    call whose executor sent no input to a tool an entry's ``arguments``
+    leaves name, a positive entry that failed, a negated one that passed,
+    and a mixed one that passed or failed. An entry that errored stays,
+    for rung 2: empty args can't cause an error. The empty ``args`` match no
+    pattern, so a positive entry's pass and a negated one's fail came from
+    calls that carried their input, and stay graded."""
+    inputless = _inject_inputless_tools(record.trajectory)
+    if not inputless:
+        return set()
+    by_name = {str(e.get("name")): e for e in record.verification_report}
+    out: set[str] = set()
+    for name, tools, polarity in spec.trace_argument_checks:
+        entry = by_name.get(name)
+        if entry is None or not _reads_inputless_call(tools, inputless):
+            continue
+        if polarity == ARGUMENTS_MIXED:
+            # Either grade could be the empty args'; an error can't be (a
+            # pattern over ``{}`` just doesn't match), so it stays for rung 2.
+            if _entry_passed(entry) or _entry_failed(entry):
+                out.add(name)
+        elif polarity == ARGUMENTS_NEGATED:
+            if _entry_passed(entry):
+                out.add(name)
+        elif _entry_failed(entry):
+            out.add(name)
+    return out
+
+
 def _inject_trace_vouched(trajectory: list[Any]) -> bool:
     """Whether the record's activity marker vouches for the delegating turn's
     calls: present, and reporting no loss.
@@ -1317,14 +1384,27 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
     whose door showed the trace stays graded even when the marker reports a
     loss, because the trace shows the forbidden call and a loss cannot
-    unmake it; rung 1 blocks on it as on the api transport.
+    unmake it; rung 1 blocks on it as on the api transport. A trace that
+    holds every call can still hold one whose executor sent no input
+    (:data:`INJECT_INPUT_ABSENT_FIELD`): an entry in
+    :attr:`CaseSpec.trace_argument_checks` whose ``arguments`` leaves name
+    that call's tool is set aside when it may have graded wrong: a
+    positive one that failed, a ``none`` one that passed, a mixed one
+    that passed or failed (:func:`_inputless_argument_checks`). Such an
+    entry can be a compound beside a leaf that grades the answer (an
+    ``any`` of the call and a phrase), whose grade goes with it, so when any
+    entry is set aside this way every other objective that passed is too:
+    the repetition can't pass on what remains. An objective that failed or
+    errored outside that set stays graded (the empty args can't have
+    flipped it), and with nothing left the repetition reports not graded.
+    Safeguards the empty args can't flip still grade.
 
     None on the api transport, on a record with no blind entry in its report
     (the set is matched by name, so a task with no such check or a report
     naming none of them is untouched), and on an inject record whose door
     showed the trace when the task's only blind checks are of the first kind.
     """
-    if not spec.transport_blind_checks or not _inject_record(record.trajectory):
+    if not (spec.transport_blind_checks or spec.trace_argument_checks) or not _inject_record(record.trajectory):
         return None
     trace_blind = _inject_blind(record.trajectory)
     if _inject_workers_carried(record.trajectory):
@@ -1350,6 +1430,21 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
                 for e in record.verification_report
                 if str(e.get("name")) in spec.negated_trace_blind_checks and _entry_failed(e)
             }
+    uncertain = _inputless_argument_checks(spec, record)
+    if uncertain:
+        # A set-aside entry may have carried the only grade of the answer (a
+        # phrase beside the call in one compound), so no PASS of this
+        # repetition's other objectives is kept: it can't pass on what
+        # remains. Their fails and errors stay: the empty args can't flip an
+        # entry outside ``uncertain``, so a fail there is the run's, and an
+        # error is rung 2's. With nothing else left it reports not graded.
+        # Safeguards outside ``uncertain`` still grade too: a tripped one is
+        # evidence whatever the args, and rung 1 blocks on it.
+        set_aside |= uncertain | {
+            str(e.get("name"))
+            for e in record.verification_report
+            if e.get("role") == ROLE_OBJECTIVE and _entry_passed(e)
+        }
     blind = [
         str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside
     ]
