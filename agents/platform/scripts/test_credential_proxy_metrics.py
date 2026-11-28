@@ -1208,6 +1208,124 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assertEqual(set(credential_proxy.vcs_broker.route_table(mock.Mock())), set(credential_proxy.vcs_broker.VCS_VERBS))
 
 
+class ForgeHealthMetricTest(unittest.TestCase):
+    """The sweep's forge health, as the broker renders it."""
+
+    CONNECTED = "kubeagents_vcs_forge_connected"
+    REPOSITORIES = "kubeagents_vcs_forge_repositories"
+    AGE = "kubeagents_vcs_forge_checked_age_seconds"
+
+    def forge(self, provider="github", checked_at=None, **states):
+        repositories = tuple((state, states[state]) for state in vcs_readings.CONNECTION_STATES if states.get(state))
+        return vcs_readings.ForgeHealth(provider, repositories, time.time() if checked_at is None else checked_at)
+
+    def samples(self, text, family):
+        return [line for line in text.splitlines() if line.startswith(family + "{")]
+
+    def test_no_family_before_the_first_sweep_or_with_no_forge(self):
+        metrics = ProxyMetrics()
+        self.assertNotIn("kubeagents_vcs_forge_", metrics.render())
+        metrics.set_forge_health(())
+        self.assertNotIn("kubeagents_vcs_forge_", metrics.render())
+
+    def test_a_connected_provider_renders_one_and_every_state_from_zero(self):
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([self.forge(ok=3)])
+        text = metrics.render()
+        self.assertIn(f"# TYPE {self.CONNECTED} gauge", text)
+        self.assertIn(f"# TYPE {self.REPOSITORIES} gauge", text)
+        self.assertIn(f"# TYPE {self.AGE} gauge", text)
+        self.assertEqual([f'{self.CONNECTED}{{provider="github"}} 1'], self.samples(text, self.CONNECTED))
+        states = {
+            line.split('state="')[1].split('"')[0]: line.rsplit(" ", 1)[1]
+            for line in self.samples(text, self.REPOSITORIES)
+        }
+        self.assertEqual(set(vcs_readings.CONNECTION_STATES), set(states))
+        self.assertEqual("3", states.pop("ok"))
+        self.assertEqual({"0"}, set(states.values()))
+
+    def test_a_provider_with_a_failing_repository_renders_zero_and_the_count(self):
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([self.forge(provider="gitlab", ok=2, unauthorized=1)])
+        text = metrics.render()
+        self.assertIn(f'{self.CONNECTED}{{provider="gitlab"}} 0', text)
+        self.assertIn(f'{self.REPOSITORIES}{{provider="gitlab",state="unauthorized"}} 1', text)
+        self.assertIn(f'{self.REPOSITORIES}{{provider="gitlab",state="ok"}} 2', text)
+
+    def test_the_only_labels_are_the_provider_and_the_state(self):
+        """Closed vocabularies only: nothing a managed key or a configuration spells reaches a label."""
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([self.forge(ok=1), self.forge(provider="gitlab", unreachable=2)])
+        text = metrics.render()
+        names = set()
+        for family in (self.CONNECTED, self.REPOSITORIES, self.AGE):
+            for line in self.samples(text, family):
+                names.update(re.findall(r'([a-z_]+)="', line))
+        self.assertEqual({"provider", "state"}, names)
+
+    def test_a_new_report_replaces_the_last(self):
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([self.forge(unreachable=1)])
+        metrics.set_forge_health([self.forge(provider="gitlab", ok=1)])
+        text = metrics.render()
+        self.assertEqual([f'{self.CONNECTED}{{provider="gitlab"}} 1'], self.samples(text, self.CONNECTED))
+        metrics.set_forge_health(())
+        self.assertNotIn("kubeagents_vcs_forge_", metrics.render())
+
+    def test_providers_this_image_does_not_ship_are_one_other_series(self):
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([
+            self.forge(provider="not-a-forge", other=1, checked_at=1000.0),
+            self.forge(provider='bad"provider', other=2, checked_at=time.time()),
+            self.forge(provider="other", ok=1, checked_at=2000.0),
+        ])
+        text = metrics.render()
+        self.assertEqual([f'{self.CONNECTED}{{provider="other"}} 0'], self.samples(text, self.CONNECTED))
+        self.assertIn(f'{self.REPOSITORIES}{{provider="other",state="other"}} 3', text)
+        self.assertIn(f'{self.REPOSITORIES}{{provider="other",state="ok"}} 1', text)
+        self.assertEqual(1, len(self.samples(text, self.AGE)), "the newest check of the merged providers")
+        self.assertNotIn("not-a-forge", text)
+        self.assertNotIn("bad", text)
+
+    def test_every_sample_line_is_distinct(self):
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([self.forge(provider=name, other=1) for name in ("a", "b", "c")] + [self.forge(ok=1)])
+        lines = [line for line in metrics.render().splitlines() if line.startswith("kubeagents_vcs_forge_")]
+        keys = [line.rsplit(" ", 1)[0] for line in lines]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_the_age_moves_with_the_clock_and_an_old_check_drops_its_value_series(self):
+        metrics = ProxyMetrics()
+        stale = vcs_readings.VCS_READINGS_STALE_SECONDS
+        metrics.set_forge_health([
+            self.forge(ok=1, checked_at=time.time() - 30),
+            self.forge(provider="gitlab", identity=1, checked_at=time.time() - stale - 60),
+        ])
+        text = metrics.render()
+        self.assertEqual([f'{self.CONNECTED}{{provider="github"}} 1'], self.samples(text, self.CONNECTED))
+        self.assertEqual(len(vcs_readings.CONNECTION_STATES), len(self.samples(text, self.REPOSITORIES)))
+        ages = {line.split('provider="')[1].split('"')[0]: float(line.rsplit(" ", 1)[1]) for line in self.samples(text, self.AGE)}
+        self.assertEqual({"github", "gitlab"}, set(ages))
+        self.assertGreaterEqual(ages["github"], 30)
+        self.assertLess(ages["github"], 90)
+        self.assertGreater(ages["gitlab"], stale)
+
+    def test_only_stale_checks_leave_the_age_alone(self):
+        metrics = ProxyMetrics()
+        metrics.set_forge_health([self.forge(ok=1, checked_at=time.time() - vcs_readings.VCS_READINGS_STALE_SECONDS - 5)])
+        text = metrics.render()
+        self.assertNotIn(self.CONNECTED, text)
+        self.assertNotIn(self.REPOSITORIES, text)
+        self.assertEqual(1, len(self.samples(text, self.AGE)))
+
+    def test_the_other_families_are_unchanged_by_a_report(self):
+        metrics = ProxyMetrics()
+        before = metrics.render()
+        metrics.set_forge_health([self.forge(ok=1)])
+        after = "\n".join(line for line in metrics.render().splitlines() if "kubeagents_vcs_forge_" not in line) + "\n"
+        self.assertEqual(before, after)
+
+
 class ReadingsMetricTest(_BrokerFixture):
     """The sweep's two readings and its failure counter, as the broker renders them."""
 
@@ -1230,18 +1348,29 @@ class ReadingsMetricTest(_BrokerFixture):
             },
             ignored=1,
             taken_at=time.time() if taken_at is None else taken_at,
+            stockout_proposals={"open": 1, "merged": 3, "closed": 1},
         )
 
     def test_set_readings_renders_the_outcomes_and_details_families_as_gauges(self):
         metrics = CredentialProxyHandler.metrics
         before = metrics.render()
-        for name in ("kubeagents_vcs_proposals", "kubeagents_vcs_readings_age_seconds", "kubeagents_vcs_readings_failures_total"):
+        for name in (
+            "kubeagents_vcs_proposals",
+            "kubeagents_vcs_stockout_proposals",
+            "kubeagents_vcs_readings_age_seconds",
+            "kubeagents_vcs_readings_failures_total",
+        ):
             self.assertNotIn(name, before, "a family rendered before its first reading")
         metrics.set_readings(self.outcomes(), self.details())
         text = metrics.render()
         families = _parse(text)
         for state, value in (("open", 3), ("merged", 5), ("closed", 2)):
             self.assertEqual(value, _series(families, "kubeagents_vcs_proposals", state=state))
+        for state, value in (("open", 1), ("merged", 3), ("closed", 1)):
+            self.assertEqual(value, _series(families, "kubeagents_vcs_stockout_proposals", state=state))
+        # Closed label set: only `state` appears on kubeagents_vcs_stockout_proposals.
+        for label_pairs in families["kubeagents_vcs_stockout_proposals"]:
+            self.assertEqual({"state"}, set(dict(label_pairs).keys()))
         for actor, value in (("install", 1), ("human", 1), ("bot", 0)):
             self.assertEqual(value, _series(families, "kubeagents_vcs_proposals_closed_by", actor=actor))
         self.assertEqual(4, _series(families, "kubeagents_vcs_proposal_touches", kind="review_approved", actor="human"))
@@ -1264,6 +1393,7 @@ class ReadingsMetricTest(_BrokerFixture):
             "kubeagents_vcs_proposal_touches",
             per,
             "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_stockout_proposals",
             "kubeagents_vcs_readings_age_seconds",
         ):
             self.assertIn(f"# TYPE {name} gauge", text)
@@ -1277,6 +1407,7 @@ class ReadingsMetricTest(_BrokerFixture):
         families = self.families()
         self.assertEqual(6, _series(families, "kubeagents_vcs_proposals", state="merged"))
         self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a withheld details reading was dropped")
+        self.assertEqual(3, _series(families, "kubeagents_vcs_stockout_proposals", state="merged"), "a withheld details reading dropped stockout counts")
 
     def test_a_withheld_outcomes_reading_keeps_the_previous_one(self):
         # The other half of the rule: a sweep whose tally failed publishes the
@@ -1304,7 +1435,12 @@ class ReadingsMetricTest(_BrokerFixture):
         self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
         self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
         self.assertIsNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
-        for name in ("kubeagents_vcs_proposals_closed_by", "kubeagents_vcs_proposal_touches", "kubeagents_vcs_proposals_ignored"):
+        for name in (
+            "kubeagents_vcs_proposals_closed_by",
+            "kubeagents_vcs_proposal_touches",
+            "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_stockout_proposals",
+        ):
             self.assertNotIn(name, families)
 
     def test_a_stale_reading_is_omitted_and_its_age_gauge_is_not(self):
@@ -1315,6 +1451,7 @@ class ReadingsMetricTest(_BrokerFixture):
         age = _series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes")
         self.assertGreaterEqual(age, vcs_readings.VCS_READINGS_STALE_SECONDS)
         self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a fresh details reading went with the stale one")
+        self.assertEqual(3, _series(families, "kubeagents_vcs_stockout_proposals", state="merged"))
 
         CredentialProxyHandler.metrics.set_readings(None, self.details(taken_at=stale))
         families = self.families()
@@ -1323,6 +1460,7 @@ class ReadingsMetricTest(_BrokerFixture):
             "kubeagents_vcs_proposal_touches",
             "kubeagents_vcs_proposal_touches_per_proposal",
             "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_stockout_proposals",
         ):
             self.assertNotIn(name, families)
         self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))

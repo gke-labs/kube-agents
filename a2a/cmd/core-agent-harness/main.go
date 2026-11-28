@@ -71,7 +71,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	fs.SetOutput(stderr)
 	var o options
 	fs.StringVar(&o.personaDir, "persona-dir", "", "the rendered persona (instructions.md, skills/<name>/SKILL.md), read once into memory")
-	fs.BoolVar(&o.personaRequired, "persona-required", false, "fail the turn when --persona-dir is missing, rather than run with no persona")
+	fs.BoolVar(&o.personaRequired, "persona-required", false, "fail the turn when --persona-dir is missing, writable, or doesn't match its content manifest, rather than run with no persona")
 	fs.IntVar(&o.compactOverBytes, "compact-over-bytes", defaultCompactOverBytes, "compact the conversation before the turn when its history is over this many bytes")
 	fs.StringVar(&o.model, "model", "", "the model name (required)")
 	if err := fs.Parse(args); err != nil {
@@ -124,7 +124,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 // turn builds the agent for one turn and runs it, emitting its events.
 func turn(ctx context.Context, o options, env coreagentwire.Envelope, emit func(coreagentwire.Event), stderr io.Writer) error {
-	llm, err := newModel(ctx, o.model)
+	llm, err := newModel(ctx, o.model, env.Policy.WebSearch)
 	if err != nil {
 		return fmt.Errorf("model: %w", err)
 	}

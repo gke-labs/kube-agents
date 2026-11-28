@@ -55,6 +55,10 @@ CRON_JOB_ORIGIN_PATH = "/v1/cron/jobs/{job_id}/origin"
 #: A tick or a cronjob_manage call waits at most this long, on loopback.
 SESSION_KV_TIMEOUT_SECONDS = 2.0
 HTTP_NOT_FOUND = 404
+#: Session KV is on the pod's loopback address: a proxy from the environment
+#: must not get the request and its bearer token, and urllib does not leave
+#: out a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 #: Where Hermes installs the module that resolves the creating turn's origin,
 #: and the name a test loads it under.
@@ -123,7 +127,7 @@ def recorded_origin(job_id: str) -> tuple[str, str] | None:
     if not job_id or headers is None:
         return None
     try:
-        with urllib.request.urlopen(
+        with _SESSION_KV_OPENER.open(
             urllib.request.Request(_origin_url(job_id), headers=headers), timeout=SESSION_KV_TIMEOUT_SECONDS
         ) as response:
             loaded = json.loads(response.read() or b"{}")
@@ -182,7 +186,7 @@ def record_job_origin(job_id: str) -> bool:
             method="PUT",
             headers={**headers, "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=SESSION_KV_TIMEOUT_SECONDS):
+        with _SESSION_KV_OPENER.open(request, timeout=SESSION_KV_TIMEOUT_SECONDS):
             return True
     except Exception as exc:  # noqa: BLE001 — the create or update itself has succeeded
         logger.warning("cron origin: could not record job %s: %r", job_id, exc)

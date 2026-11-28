@@ -25,6 +25,11 @@ const (
 	maxLLMResponseBytes        = 4 << 20
 	defaultAgentDataDir        = "/opt/data"
 	defaultAgentDefaultsDir    = "/opt/defaults"
+	synthesizePromptTemplate   = "You are synthesizing a Kubernetes GitOps Open Knowledge Format (OKF) %s record from verified pull request and incident history.\n" +
+		"Preserve all exact identifiers, PR/issue numbers, file paths, and resource quantities.\n" +
+		"Set guard.severity to \"warn\" by default (for reviewer comments, edit-before-merge adjustments, naming/quota conventions, and general operational guidance).\n" +
+		"Set guard.severity to \"block\" ONLY when the pull request resolved a verified crash, outage, or availability failure with a concrete root cause (such as OOMKilled, CrashLoopBackOff, quorum loss, or pod eviction deadlock).\n" +
+		"Return ONLY valid JSON matching this schema (omit 'guard' if no machine-checkable invariant applies):\n%s\n\nInput evidence:\n%s"
 )
 
 var reJSONCodeFence = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
@@ -227,14 +232,7 @@ func (cfg LLMConfig) Synthesize(ctx context.Context, rtype RecordType, payload a
 		schemaHint = `{"title": "<concise lesson title>", "root_cause": "<what happened and why it failed>", "fix": "<what change resolved it>", "verification": "<how resolution was verified>", "prevention": "<rule to prevent repeat outage>", "guard": {"rule": "<1-line invariant>", "severity": "<warn_or_block>", "expect": {"file": "<path>", "path": "<yaml_path_or_$text>", "op": "<op>", "value": "<val>"}}}`
 	}
 	evidenceJSON, _ := json.MarshalIndent(payload, "", "  ")
-	prompt := fmt.Sprintf(
-		"You are synthesizing a Kubernetes GitOps Operational Knowledge Framework (OKF) %s record from verified pull request and incident history.\n"+
-			"Preserve all exact identifiers, PR/issue numbers, file paths, and resource quantities.\n"+
-			"Set guard.severity to \"warn\" by default (for reviewer comments, edit-before-merge adjustments, naming/quota conventions, and general operational guidance).\n"+
-			"Set guard.severity to \"block\" ONLY when the pull request resolved a verified crash, outage, or availability failure with a concrete root cause (such as OOMKilled, CrashLoopBackOff, quorum loss, or pod eviction deadlock).\n"+
-			"Return ONLY valid JSON matching this schema (omit 'guard' if no machine-checkable invariant applies):\n%s\n\nInput evidence:\n%s",
-		rtype, schemaHint, string(evidenceJSON),
-	)
+	prompt := fmt.Sprintf(synthesizePromptTemplate, rtype, schemaHint, string(evidenceJSON))
 	jsonText, ok := cfg.chatCompletionJSON(ctx, prompt)
 	if !ok {
 		return nil

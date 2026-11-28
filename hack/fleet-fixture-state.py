@@ -59,8 +59,8 @@ kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
-serial-flood VM, the world-open firewall rule and its VM, the peered
-jumbo-frame network, the two orphaned snapshots) is published as
+serial-flood VM, the world-open firewall rule and its VM, the health-check
+shadow rules on that VM's tag, the peered jumbo-frame network, the two orphaned snapshots) is published as
 `<role>.confirmed` alone, and its subjects
 are read with `gcloud compute instances list`, `gcloud compute firewall-rules
 list`, `gcloud compute networks list` or `gcloud compute snapshots list` in the
@@ -202,9 +202,10 @@ BLOB_SHA_SHORT = 8
 PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules", "network": "networks", "snapshot": "snapshots", "reservation": "reservations"}
 PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall|network|snapshot|reservation)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
 # A reservation is the project's, and the node pool that names it is a
-# cluster's. So this one project subject is also for a cluster role: the
-# missing-reservation-pool role asserts on its pool and on the absence of the
-# reservation that the pool names. It is a state subject only: no probe takes
+# cluster's. So this one project subject is also for a cluster role: each of
+# the two reservation roles (missing-reservation-pool and
+# missing-reservation-autoscaled) asserts on its pool and on the absence of
+# the reservation that the pool names. It is a state subject only: no probe takes
 # it, because a probe passes when an object is there.
 RESERVATION_KIND = "reservation"
 # The collection `source_disk_gone` reads beside a snapshot subject.

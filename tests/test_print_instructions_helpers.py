@@ -366,6 +366,52 @@ class GchatStepsAreTheGatewaysTest(unittest.TestCase):
         out = self._run(env, {"GOOGLE_CHAT_HOME_CHANNEL": self._SPACE})
         self.assertIn(f"is {self._SPACE}: add the app to that space", out)
 
+    def test_chat_project_id_and_unmanaged_manual_commands(self):
+        env = (
+            self._env()
+            + "PROJECT_ID=gke-host-proj\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+        )
+        out = self._run(env, {"PROJECT_NUMBER": "111111111111", "CHAT_PROJECT_NUMBER": "222222222222"})
+        self.assertIn("?project=workspace-chat-proj", out)
+        self.assertIn("projects/workspace-chat-proj/topics/file-topic", out)
+        self.assertIn("CHAT_MANAGE_PROJECT=false: have an administrator of 'workspace-chat-proj' run:", out)
+        self.assertIn(
+            "gcloud iam service-accounts create kubeagents-chat-gsa --project=workspace-chat-proj",
+            out,
+        )
+        self.assertIn("roles/iam.serviceAccountTokenCreator", out)
+        self.assertIn(
+            "member=\"serviceAccount:kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com\" --role=\"roles/pubsub.subscriber\"",
+            out,
+        )
+        self.assertIn("https://chat.google.com/dm/222222222222", out)
+        self.assertIn("service-222222222222@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn(
+            "have an administrator of 'workspace-chat-proj' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above",
+            out,
+        )
+        self.assertNotIn("re-run install.sh (it re-applies the Chat Pub/Sub resources)", out)
+        self.assertNotIn("111111111111", out)
+
+        out_unreadable = self._run(env, {"PROJECT_NUMBER": "111111111111"})
+        self.assertIn("service-<CHAT_PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out_unreadable)
+        self.assertNotIn("service-<PROJECT_NUMBER>@", out_unreadable)
+        self.assertIn("CHAT_PROJECT_NUMBER is unavailable;", out_unreadable)
+        self.assertNotIn("111111111111", out_unreadable)
+
+        out_custom_gsa = self._run(
+            env + "CHAT_GSA_NAME=custom-chat-two-gsa\n",
+            {"PROJECT_NUMBER": "111111111111", "CHAT_PROJECT_NUMBER": "222222222222"},
+        )
+        self.assertIn(
+            "gcloud iam service-accounts create custom-chat-two-gsa --project=workspace-chat-proj",
+            out_custom_gsa,
+        )
+        self.assertIn(
+            "member=\"serviceAccount:custom-chat-two-gsa@workspace-chat-proj.iam.gserviceaccount.com\" --role=\"roles/pubsub.subscriber\"",
+            out_custom_gsa,
+        )
+
 
 class ChatSetupChecklistsTest(unittest.TestCase):
     """print_chat_setup_checklists, which install.sh calls after its apply and
@@ -410,6 +456,8 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         return proc.stdout + proc.stderr, printed
 
     _CHAT = {"GOOGLE_CHAT_ENABLED": "true", "GOOGLE_CHAT_HOME_CHANNEL": "", "ALLOWED_USERS": "a@example.com",
+             "CHAT_PROJECT_ID": "chat-proj", "CHAT_MANAGE_PROJECT": "false", "CHAT_PROJECT_NUMBER": "987654321098",
+             "CHAT_GSA_NAME": "custom-chat-gsa",
              "CHAT_TOPIC_NAME": "t", "CHAT_SUB_NAME": "t-sub", "PROJECT_NUMBER": "123456789012",
              "NAMESPACE": "custom-ns"}
 
@@ -420,6 +468,10 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         handoff = printed["print_instructions_gchat"]
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "GCHAT_STEPS_GOOGLE_CHAT_ENABLED=true",
+                     "GCHAT_STEPS_CHAT_PROJECT_ID=chat-proj",
+                     "GCHAT_STEPS_CHAT_MANAGE_PROJECT=false",
+                     "GCHAT_STEPS_CHAT_PROJECT_NUMBER=987654321098",
+                     "GCHAT_STEPS_CHAT_GSA_NAME=custom-chat-gsa",
                      "GCHAT_STEPS_HOME_CHANNEL=\n", "GCHAT_STEPS_ALLOWED_USERS=a@example.com",
                      "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012"):
             with self.subTest(line=line):

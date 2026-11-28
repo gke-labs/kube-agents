@@ -150,7 +150,7 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 }
 
 # The project-scoped fixtures (the startup-fail VM, the world-open firewall
-# rule and its VM, the peered mtu-peer-declared network, the two orphaned
+# rule and its VM, the health-check shadow rules, the peered mtu-peer-declared network, the two orphaned
 # snapshots; fixtures.json roles with cluster_slot null) are Compute Engine
 # objects, which container.viewer cannot read. The CI health bot's scan runs
 # every gcloud read as this account, so the presence probe and the state pass
@@ -634,6 +634,74 @@ resource "google_container_node_pool" "missing_reservation_pool" {
       key                      = "compute.googleapis.com/reservation-name"
       values                   = ["seeded-absent-reservation"]
     }
+  }
+}
+
+# Defect (capacity, reservations): the same missing reservation on a pool
+# that the autoscaler tries to grow. The pool autoscales from 0 to 1 node,
+# and deployment/reserved-batch in seeded-reservation (defects-a.tf) has
+# one pod that only this pool can hold. The autoscaler asks for a node, GKE
+# refuses it because the reservation is not found, and the pod stays Pending
+# with the pool at zero nodes; the autoscaler's visibility log repeats
+# scale.up.error.reservation.not.found. Zero nodes cost nothing. The stack
+# plants no reservation: a reservation with the name below would heal the
+# defect and start one node. "dev" in the name makes the pool non-production
+# for the stockout collector, so its reservation check (3.10) does not name
+# this pool and missing-reservation-pool stays that check's only pool; do
+# not rename it to a name without such a token. The collector's 3.9 names
+# the pool, as it names each autoscaled pool in one zone. n2-standard-2 and
+# the 20 GB disk as on missing-reservation-pool. Catalogue role:
+# missing-reservation-autoscaled.
+resource "google_container_node_pool" "dev_reserved_pool" {
+  name       = "dev-reserved-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.seeded_a.name
+  node_count = 0
+
+  autoscaling {
+    min_node_count = 0
+    max_node_count = 1
+  }
+
+  node_config {
+    machine_type    = "n2-standard-2"
+    disk_size_gb    = 20
+    resource_labels = local.fleet_labels
+    service_account = google_service_account.fleet_nodes.email
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+
+    # trivy GCP-0048, as on the pools above.
+    metadata = {
+      disable-legacy-endpoints = "true"
+    }
+    labels = {
+      "seeded-role" = "missing-reservation-autoscaled"
+    }
+
+    taint {
+      key    = "seeded-role"
+      value  = "missing-reservation-autoscaled"
+      effect = "NO_SCHEDULE"
+    }
+
+    reservation_affinity {
+      consume_reservation_type = "SPECIFIC_RESERVATION"
+      key                      = "compute.googleapis.com/reservation-name"
+      values                   = ["seeded-absent-reservation"]
+    }
+  }
+
+  # The autoscaler owns the size of this pool, and it asks for one node again
+  # and again. The provider reads node_count from the instance group's target
+  # size, so a plan in the minutes of such a try can see 1 and plan a resize
+  # to 0: a change that means nothing, on a random reconcile pass. The role's
+  # state assertion holds the pool at zero nodes, not this field.
+  lifecycle {
+    ignore_changes = [node_count]
   }
 }
 
@@ -1163,6 +1231,49 @@ resource "google_compute_firewall" "world_open_deny_remote" {
   deny {
     protocol = "tcp"
     ports    = ["22", "3389"]
+  }
+}
+
+
+# Defect (networking): a DENY that blocks load-balancer health checks. The
+# networking audit's §2.8 (`firewall-health-check-shadowed`) flags an enabled
+# INGRESS DENY that, at the priority of an enabled allow of the Google Cloud
+# health-check probe ranges or above, covers those ranges, that allow's target
+# and every TCP port it opens, on a network where a live instance is in that
+# target. Both rules aim at the world-open VM's tag, so no new VM is needed:
+# the VM is the live instance the check requires. tcp:80 is not a management
+# port, so §2.6's finding on that VM is unchanged, and nothing on the VM
+# listens on 80 or sits behind a load balancer, so no real probe is blocked.
+# The names lead with distinct prefixes (`hc-shadow-allow-`, `hc-shadow-deny-`)
+# so the case can grade `FirewallRule/hc-shadow-deny-`, which only the
+# finding's object carries, and `hc-shadow-allow-`, which only its excerpt
+# names. Catalogue role: health-check-shadowed.
+resource "google_compute_firewall" "hc_shadow_allow" {
+  name          = "hc-shadow-allow-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  priority      = 1000
+  source_ranges = ["35.191.0.0/16", "130.211.0.0/22"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+}
+
+#trivy:ignore:AVD-GCP-0027
+resource "google_compute_firewall" "hc_shadow_deny" {
+  name          = "hc-shadow-deny-${var.cluster_prefix}"
+  network       = "default"
+  direction     = "INGRESS"
+  priority      = 900
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["${var.cluster_prefix}-world-open"]
+
+  deny {
+    protocol = "tcp"
+    ports    = ["80"]
   }
 }
 

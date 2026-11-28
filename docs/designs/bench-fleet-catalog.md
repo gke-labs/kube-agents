@@ -9,7 +9,7 @@ case when one is not.
 
 **The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
 Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
-against at run time, the project-scoped `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`,
+against at run time, the project-scoped `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `health-check-shadowed`, `declared-mtu-peering`,
 `declared-orphan-snapshot` and `orphan-snapshot` included (`cluster_slot: null`). `docs/designs/fleet-fixtures.yaml` is the
 machine-readable form of the rest of this document — the day-N gates below, and
 `orphan-disks`, the one project-scoped fixture the catalog does not probe — and it may not
@@ -96,12 +96,12 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Sixty fixtures: fifty-three across the four cluster slots and seven project-scoped. Six of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
+Sixty-two fixtures: fifty-four across the four cluster slots and eight project-scoped. Seven of the project-scoped ones, `startup-fail-vm`, `rotated-console-vm`, `world-open-ingress`, `health-check-shadowed`, `declared-mtu-peering`, `declared-orphan-snapshot` and `orphan-snapshot`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
-fixtures are on slot `a`, across the sixteen seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-long-name`, `seeded-cpu-cycle`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
-defect node pools, the declared zonal pool and the pool that names a missing reservation. Slot `c` is the configuration outlier, on its control plane and on its default
+fixtures are on slot `a`, across the seventeen seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-reservation`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-family`, `seeded-long-name`, `seeded-cpu-cycle`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
+defect node pools, the declared zonal pool and the two pools that name a missing reservation. Slot `c` is the configuration outlier, on its control plane and on its default
 pool, and since the ComputeClass fixtures (`defects-c.tf`) also the one cluster whose only pool
 carries a compute-class label: ComputeClass `general-ccc` over the labelled, untainted default pool,
 ComputeClass `reserved-ccc` with no pool, which names a reservation that does not exist,
@@ -136,6 +136,7 @@ its roles are never published.
 | `hpa-saturated`                     | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                                                                                                                                         |
 | `declared-single-zone-pool`         | a       | 0   | `declared-zonal-pool`, a single-zone autoscaling pool held at zero nodes behind a NoSchedule taint; declared on purpose in the GitOps repository's `knowledge/`, so the capacity audit lists it under Declared intent                                                                                                                         |
 | `missing-reservation-pool`          | a       | 0   | `missing-reservation-pool`, a pool with no autoscaling held at zero nodes behind a NoSchedule taint, bound to one named reservation (`SPECIFIC_RESERVATION`) that exists in no zone of the project; GKE accepts the pool and refuses its first node                                                                                           |
+| `missing-reservation-autoscaled`    | a       | 0   | `dev-reserved-pool`, a pool that autoscales from 0 to 1 node and names the same missing reservation, and `deployment/reserved-batch` in `seeded-reservation`, whose one pod only that pool can hold; GKE refuses each node that the autoscaler asks for, and the pod stays Pending                                                            |
 | `deprecated-api-caller`             | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                                                                                                                                 |
 | `idle-nodepool`                     | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                                                                                                                                           |
 | `default-pool-headroom`             | a       | 0   | seeded-a's default pool itself, three e2-standard-2 nodes asserted to keep 100m CPU unrequested each for the next planted fixture; not a defect, the room the slot's fixtures schedule into                                                                                                                                                   |
@@ -144,6 +145,7 @@ its roles are never published.
 | `startup-fail-vm`                   | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                                                                                                                                       |
 | `rotated-console-vm`                | project | 0   | `serial-flood-<prefix>`, a standalone e2-micro in `var.zone` whose startup script fails at boot and whose systemd timer then writes about 2 MiB of counted filler lines to serial port 1, two minutes after boot and daily after, so the boot's failure lines rotate out of the 1 MiB buffer within minutes; the reconcile does not reset it  |
 | `world-open-ingress`                | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                                                                                                                               |
+| `health-check-shadowed`             | project | 0   | `hc-shadow-deny-<prefix>`, a DENY of tcp:80 from the internet at priority 900 above `hc-shadow-allow-<prefix>`, an allow of tcp:80 from the health-check ranges at 1000, both on `world-open-<prefix>`'s tag                                                                                                                                  |
 | `declared-mtu-peering`              | project | 0   | `mtu-peer-declared`, a custom-mode VPC at MTU 8896, no subnet, peered both ways with `default` (MTU 1460); not a defect, the networking SOP's 2.4 peered-MTU posture, declared in `knowledge/`, listed under Declared intent                                                                                                                  |
 | `declared-orphan-snapshot`          | project | 91  | `declared-orphan-snap-<prefix>`, a snapshot of a throwaway disk the planter deleted, taken by no schedule: the GCE compute audit's orphaned-snapshots posture once it is more than 90 full days old, declared on purpose in the GitOps repository's `knowledge/` note and so listed under Declared intent; not ready, not drifted, until then |
 | `orphan-snapshot`                   | project | 91  | `orphan-snap-<prefix>`, the second snapshot of the same disk, undeclared: the control the compute audit keeps filing beside the declared one                                                                                                                                                                                                  |
@@ -304,8 +306,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` (or, for a finished Job, on `status.completionTime`) returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Forty-eight of the fifty-three are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
-`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `cpu-burst-and-flat`, `declared-single-zone-pool`, `missing-reservation-pool`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
+Forty-nine of the fifty-four are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `generated-name-family`, `cpu-burst-and-flat`, `declared-single-zone-pool`, `missing-reservation-pool`, `missing-reservation-autoscaled`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the six
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,

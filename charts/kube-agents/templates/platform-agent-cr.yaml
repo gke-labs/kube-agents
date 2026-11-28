@@ -985,6 +985,14 @@ spec:
   networkPolicy:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .Values.platformAgent.schedules }}
+  {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.schedules" "path" (list) "field" "schedules") }}
+  {{- if hasKey . "suspendAll" }}
+  {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.schedules.suspendAll" "path" (list "schedules") "field" "suspendAll") }}
+  {{- end }}
+  schedules:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
   {{- /* Runs the forge checks, and fails, before anything is written. */}}
   {{- $providers := include "kube-agents.forgeProviders" . }}
@@ -1201,7 +1209,11 @@ spec:
     {{- if $integ.googleChat.enabled }}
     googleChat:
       enabled: true
-      projectId: {{ .Values.platformAgent.harness.projectId | quote }}
+      projectId: {{ ($integ.googleChat.projectId | default .Values.platformAgent.harness.projectId) | quote }}
+      {{- with $integ.googleChat.serviceAccountEmail }}
+      {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.integration.googleChat.serviceAccountEmail" "path" (list "integration" "googleChat") "field" "serviceAccountEmail") }}
+      serviceAccountEmail: {{ . | quote }}
+      {{- end }}
       topicName: {{ required "platformAgent.integration.googleChat.topicName is required when googleChat is enabled" $integ.googleChat.topicName | quote }}
       subscriptionName: {{ required "platformAgent.integration.googleChat.subscriptionName is required when googleChat is enabled" $integ.googleChat.subscriptionName | quote }}
       {{- with $integ.googleChat.allowedUsers }}

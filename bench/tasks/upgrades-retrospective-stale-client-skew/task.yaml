@@ -22,8 +22,8 @@
 # Error or Warning arises for it under any entry. The case lands marked
 # `expected_fail: true` (.agents/rules/eval_driven_development.md, "When the fix is
 # not yours"): the nightly records EXPECTED_FAIL, not FAILED, and passing every
-# repetition reds the job until the marker comes off. #2717 is the open gap, the
-# after-upgrade case for this entry; what closes it is a risk shape that reads a
+# repetition reds the job until the marker comes off. #4545 is the open gap for
+# this entry (#2717 closed with it open); what closes it is a risk shape that reads a
 # client image's tag minor against the control plane's (the readiness report's
 # client-addon-skew rule is the source of truth for the skew), and the pull request
 # that lands it flips the marker in the same diff.
@@ -90,7 +90,7 @@ infrastructure:
 validated: false
 
 # Red until the collector carries an entry-10 shape: see "Red on the retrospective
-# job" above (#2717). The pull request that lands the shape removes this marker.
+# job" above (#4545). The pull request that lands the shape removes this marker.
 expected_fail: true
 
 # Slug per docs/designs/domains.yaml.

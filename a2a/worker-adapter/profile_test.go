@@ -478,11 +478,15 @@ func TestAConfirmsCredentialsReachTheTaskAndOnlyWhileItRuns(t *testing.T) {
 	url := startServer(t)
 	d := newFakeDispatcher(t, url)
 	tokenFile := filepath.Join(t.TempDir(), "task-token")
+	// The harness reports what it read through a file of its own: the
+	// result is scrubbed, and a token= value is a credential's shape.
+	readFile := filepath.Join(t.TempDir(), "read-token")
 	harness := stub(t, fmt.Sprintf(`
 read first || exit 1
 sleep 1.5
-printf '{"type":"result","subtype":"success","result":"token=%%s"}\n' "$(cat %s)"
-`, tokenFile))
+cat %s > %s
+echo '{"type":"result","subtype":"success","result":"read"}'
+`, tokenFile, readFile))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
@@ -532,8 +536,8 @@ printf '{"type":"result","subtype":"success","result":"token=%%s"}\n' "$(cat %s)
 	if _, final := drainLeases(d, task, 20*time.Second); !final {
 		t.Fatal("no final renewal")
 	}
-	if got := artifactText(foldTask(t, testClient(t, url), pwProfile, task), lib.ArtifactResult); got != "token=proxy-token-for-test" {
-		t.Errorf("the harness read %q from the token file, want the confirm's proxy token", got)
+	if got, err := os.ReadFile(readFile); err != nil || string(got) != "proxy-token-for-test" {
+		t.Errorf("the harness read %q from the token file (err %v), want the confirm's proxy token", got, err)
 	}
 	if _, err := os.Stat(tokenFile); !os.IsNotExist(err) {
 		t.Errorf("the proxy token file outlived its task: %v", err)

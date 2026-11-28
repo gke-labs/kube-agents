@@ -1641,6 +1641,89 @@ class C1IsolationIsStructural(unittest.TestCase):
             with self.subTest(content=content[:40]):
                 self.assertEqual(redactor.redact_text(content), content)
 
+    # The fragment length the shared fixture's contract names: no run of this
+    # many characters of a redacted secret may reach the caller.
+    SECRET_FRAGMENT_CHARS = 8
+    # The fixture scope the broker answers for. The answer scrubber reads the
+    # "answer" cases of the same file.
+    TOOL_OUTPUT_SCOPE = "tool-output"
+
+    def _tool_output_cases(self, expect: str) -> list[dict]:
+        document = json.loads(h.text("credential_shapes_fixture"))
+        self.assertEqual(1, document["version"])
+        cases = [
+            case for case in document["cases"]
+            if self.TOOL_OUTPUT_SCOPE in case["scope"] and case["expect"] == expect
+        ]
+        self.assertTrue(cases, f"the shared fixture has no {expect} case for tool output")
+        return cases
+
+    @staticmethod
+    def _broker_replies(text: str, role: str) -> dict[str, str]:
+        """What a caller in `role` reads of `text` from the exec route and from the MCP relay."""
+        proxy = h.credential_proxy
+        result = proxy.ExecutionResult(
+            exit_code=0, stdout=text, stderr=text, duration_ms=0, truncated=False, timed_out=False,
+        )
+        response, _ = proxy.exec_response(result, role)
+        body = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": text}]}}
+        ).encode("utf-8")
+        reply, _ = proxy.redact_reply_body(body, role)
+        relayed = json.loads(reply)["result"]["content"][0]["text"]
+        return {"exec stdout": response["stdout"], "exec stderr": response["stderr"], "mcp result": relayed}
+
+    def test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output(self) -> None:
+        """What a profile worker or a session pod reads back from the broker carries no credential shape.
+
+        Those callers' models read the exec route's stdout and stderr and the
+        MCP relay's result with nothing between them and the broker, so the
+        broker is the one place a token in a ConfigMap or an env value can be
+        stopped. Each redact case of the shared fixture is run through both
+        replies; the secret must not survive, nor any fragment of it as long as
+        the fixture's contract names.
+        """
+        proxy = h.credential_proxy
+        for role in (proxy.CALLER_ROLE_PROFILE, proxy.CALLER_ROLE_SESSION):
+            for case in self._tool_output_cases("redact"):
+                secret = case["secret"]
+                fragments = {
+                    secret[start:start + self.SECRET_FRAGMENT_CHARS]
+                    for start in range(len(secret) - self.SECRET_FRAGMENT_CHARS + 1)
+                }
+                for reply, text in self._broker_replies(case["text"], role).items():
+                    with self.subTest(role=role, case=case["id"], reply=reply):
+                        self.assertNotIn(secret, text, f"{case['id']} reaches a {role} caller in the clear")
+                        survivors = sorted(fragment for fragment in fragments if fragment in text)
+                        self.assertEqual([], survivors, f"part of {case['id']} reaches a {role} caller")
+                        # `kubectl -o json` output stays JSON: a redaction that
+                        # leaves a lone backslash behind breaks every parse of it.
+                        if self._parses_as_json(case["text"]):
+                            self.assertTrue(self._parses_as_json(text), f"{case['id']} no longer parses: {text!r}")
+
+    @staticmethod
+    def _parses_as_json(text: str) -> bool:
+        try:
+            json.loads(text)
+        except ValueError:
+            return False
+        return True
+
+    def test_C1_the_broker_leaves_must_keep_tool_output_byte_identical(self) -> None:
+        """The other half: a redactor that eats digests and base64 gets switched off.
+
+        Base64 data, image digests, UUIDs, resourceVersions and a list's
+        continue token (base64 JSON, so it opens `eyJ` as a JWT does) are what a
+        kubectl read is mostly made of. Each keep case of the shared fixture
+        must reach a profile or session caller byte for byte.
+        """
+        proxy = h.credential_proxy
+        for role in (proxy.CALLER_ROLE_PROFILE, proxy.CALLER_ROLE_SESSION):
+            for case in self._tool_output_cases("keep"):
+                for reply, text in self._broker_replies(case["text"], role).items():
+                    with self.subTest(role=role, case=case["id"], reply=reply):
+                        self.assertEqual(case["text"], text)
+
     # The env var the operator renders into the agent container to name the bus
     # principal it authenticated that container as. This is the literal both
     # sides must agree on, and each module holds its own copy because neither
@@ -1859,7 +1942,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         operator = h.text("broker_split_go")
         manifests = h.text("manifests_go")
         kube_proxy_manifests = h.text("kube_proxy_manifests_go")
-        kube_proxy_main = h.text("k8s_api_proxy_main_go")
+        kube_proxy_server = h.text("k8s_api_proxy_server_go")
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
@@ -1905,7 +1988,7 @@ class C1IsolationIsStructural(unittest.TestCase):
                 )
                 read_name = self._one_match(
                     r'%s\s*=\s*"([^"]+)"' % const_name,
-                    kube_proxy_main,
+                    kube_proxy_server,
                     "k8s-api-proxy's %s" % const_name,
                 )
                 self.assertEqual(

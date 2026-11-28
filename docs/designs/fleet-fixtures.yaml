@@ -11,7 +11,7 @@
 # What this file adds on top of that catalogue is the part fixtures.json does
 # not carry: the day-N availability gate below, and the fixtures that are not
 # on a cluster at all (`orphan-disks`, `startup-fail-vm`, `rotated-console-vm`,
-# `world-open-ingress`, `declared-mtu-peering`, `declared-orphan-snapshot` and
+# `world-open-ingress`, `health-check-shadowed`, `declared-mtu-peering`, `declared-orphan-snapshot` and
 # `orphan-snapshot` are
 # project-scoped, so they have no cluster slot). fixtures.json carries all but
 # `orphan-disks` as project-scoped roles (`cluster_slot: null`), which the runner
@@ -43,7 +43,7 @@
 slots:
   - slot: a
     suffix: a
-    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the pool that names a missing reservation
+    carries: The seeded namespaces, the two defect node pools, the declared zonal pool and the two pools that name a missing reservation
   - slot: b
     suffix: b
     carries: The held-back control plane, and the upgrade-readiness drain defects
@@ -269,6 +269,25 @@ fixtures:
       node it would add, so the pool can never grow. The stack plants no
       reservation: the missing one is the defect. Zero nodes cost nothing.
 
+  - role: missing-reservation-autoscaled
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/dev-reserved-pool
+      - deployment/reserved-batch
+    namespace: seeded-reservation
+    defect: >-
+      A single-zone pool that autoscales from 0 to 1 node, held behind the
+      taint seeded-role=missing-reservation-autoscaled, that consumes the
+      reservation that missing-reservation-pool names (SPECIFIC_RESERVATION),
+      which exists in no zone of the project; and a Deployment (one replica)
+      whose pod only that pool can hold. The autoscaler asks for a node, GKE
+      refuses it, and the pod stays Pending with the pool at zero nodes: the
+      autoscaler's visibility log repeats scale.up.error.reservation.not.found.
+      `dev` in the pool's name makes it non-production for the stockout
+      audit, so the reservation check (3.10) does not name it. Zero nodes
+      cost nothing.
+
   - role: deprecated-api-caller
     slot: a
     available_from_day: 0
@@ -338,6 +357,19 @@ fixtures:
       A firewall rule opening tcp:2379 to the internet on the one VM that
       carries its tag, which holds an external IP. Nothing listens on 2379.
       A deny rule blocks tcp:22 and tcp:3389 on that VM.
+
+  - role: health-check-shadowed
+    slot: null # Project-scoped, on default; not attached to any cluster.
+    available_from_day: 0
+    objects:
+      - firewall/hc-shadow-allow-<prefix>
+      - firewall/hc-shadow-deny-<prefix>
+      - instance/world-open-<prefix>
+    defect: >-
+      A DENY of tcp:80 from the whole internet at priority 900, above an
+      allow of tcp:80 from the load-balancer health-check ranges at 1000,
+      both on the world-open VM's tag. The VM is the live instance the check
+      needs; nothing on it listens on 80 or sits behind a load balancer.
 
   - role: declared-mtu-peering
     slot: null # Project-scoped, global; not attached to any cluster.

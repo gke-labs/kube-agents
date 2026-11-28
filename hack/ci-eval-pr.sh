@@ -358,9 +358,14 @@ readonly EVAL_FENCE_GATEWAY_AWAY_LATCH=".gateway-away"
 readonly EVAL_ARM_CLEAR_TIMEOUT_SECONDS=600
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
-# script, so five stalled calls still finish and name themselves inside this.
-# A first-run audit's pause comes after one more read of the roster and the
-# runs' ledger, bounded at 10s by the ledger's busy timeout.
+# script and not tried again in a pass once it has timed out. A first-run
+# audit's pause comes after one more read of the roster and the runs' ledger,
+# bounded at 10s by the ledger's busy timeout. So a pause whose every call
+# stalls still finishes and names them inside this when it covers the
+# first-run stage's audits, or the other model-run jobs
+# (scripts/test_ci_pause_scheduled_audits.py holds both). A pass over the
+# other model-run jobs and stage audits together can outlast it: a pause once
+# the stage is past some of its audits, or the resume of all that were paused.
 readonly EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS=300
 readonly EVAL_PAUSE_AUDITS_ATTEMPTS=3
 readonly EVAL_PAUSE_AUDITS_DECIDED_EXIT=3
@@ -1283,7 +1288,7 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # fleet reader's token), a `gcloud container clusters describe` on this job's
 # own credential, which already lists the same clusters above, a `gcloud
 # compute ... list` of a project-scoped role's objects or of the project's
-# reservations (the missing-reservation-pool role), a `gcloud compute
+# reservations (the two reservation roles), a `gcloud compute
 # instances get-serial-port-output` of the startup-fail VM, on the same
 # credential, or one GET of the leased repository's declared-intent note
 # (the catalog's `repository/...` assertions, #5827) with the grading read
@@ -2662,8 +2667,8 @@ scheduled_audits() { # <pause|chain|resume> <label>
 }
 
 # The first-run stage's audits are three of the clock-started ones plus two more, and
-# the stage skips one that is paused, so the lease and fan-out pauses leave them on
-# (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
+# the stage skips one that is paused, so the lease and fan-out pauses leave each on
+# until the stage is past it (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
 # says when), every
 # EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
 # run would be a second full run nothing grades. Started outside the job table
@@ -4941,6 +4946,9 @@ unit_cost_hint() {
     # The same shape again, plus a detector stop and relaunch before the live
     # card wait. Unmeasured; priced with its siblings.
     gitops-drift-backlog-digest) echo 900 ;;
+    # The same shape with no detector stop: a publish, a card wait and the
+    # digest's settle. Unmeasured; priced with its siblings.
+    gitops-drift-own-release-digest) echo 900 ;;
     # The two CUJ 1 halves (#2889), registered 2026-10-20. Same shape as
     # gitops-drift-out-of-band-triage and gitops-drift-noise-filtered-triage
     # -- infra lock, a plant, an inject and a card wait -- and the band is a
@@ -5031,7 +5039,8 @@ unit_cost_hint() {
     # One real scheduled compliance audit the stack fires and waits out, with
     # the stream's stored report and digest record moved aside, so a full
     # audit every time. The fired run took 11 to 13 minutes on two dev
-    # installs; unmeasured on a lane. Off the infra lock (infra_lock_exempt),
+    # installs, and 329 to 539s on the nightlies of 2026-11-25 and 11-26, a
+    # repetition 483 to 684s. Off the infra lock (infra_lock_exempt),
     # so it is in none of the stack chains this hint prices; priced as the
     # case above, over compliance-rbac-overgrant's requested run, so it
     # launches early.
@@ -5043,13 +5052,19 @@ unit_cost_hint() {
     obtainability-planted-orphan-service) echo 900 ;;
     # The same full audit after a plant that waits eleven minutes, so that
     # the failed pulls it plants are older than the check's ten (3.28).
-    # Unmeasured: the audit band plus the wait.
-    obtainability-image-pull-failing) echo 1600 ;;
+    # Measured at 1030-1174s a repetition, the stack's wait included, on the
+    # main-e nightly (builds 2125379018969583616 and 2125741413462183936,
+    # 2026-11-25 and 11-26).
+    obtainability-image-pull-failing) echo 1200 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
     # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
     # kustomize case runs in the second phase (writes_alone), so its hint
     # orders it only among that phase's units.
     gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 900 ;;
+    # The networking audit over the health-check-shadowed role, parked in
+    # FIXTURE_NOT_READY until its fixture is on the pool, and unmeasured: the
+    # same full audit as networking-world-open-ingress.
+    networking-health-check-shadowed) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10
     # unmeasured, plus a stack that plants one Config Connector object and
@@ -5310,6 +5325,7 @@ unit_delegation_timeout() {
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 3000 ;;
+    networking-health-check-shadowed) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took

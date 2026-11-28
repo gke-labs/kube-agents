@@ -189,10 +189,12 @@ const (
 	dataVolumeBaseSize       = "8Gi"
 	perClusterProfileStorage = "400Mi"
 	credentialProxyPort      = 8765
-	// The Chat consumers' broker env: the project id both carry, the legacy
-	// consumer's subscription name, and the fully qualified subscription
-	// form both consumers' env carries.
+	// The Chat consumers' broker env: the project id both carry, the optional
+	// service account email the broker impersonates for cross-project Chat,
+	// the legacy consumer's subscription name, and the fully qualified
+	// subscription form both consumers' env carries.
 	googleChatProjectIDEnvVar          = "GOOGLE_CHAT_PROJECT_ID"
+	googleChatServiceAccountEnvVar     = "GOOGLE_CHAT_SERVICE_ACCOUNT"
 	legacyGoogleChatSubscriptionEnvVar = "GOOGLE_CHAT_SUBSCRIPTION_NAME"
 	googleChatSubscriptionFormat       = "projects/%s/subscriptions/%s"
 	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
@@ -344,6 +346,16 @@ const (
 	driftDetectorClusterNameEnv    = "DRIFT_DETECTOR_CLUSTER_NAME"
 	driftDetectorSubscriptionEnv   = "DRIFT_DETECTOR_SUBSCRIPTION"
 	driftDetectorGitopsManagersEnv = "DRIFT_DETECTOR_GITOPS_MANAGERS"
+	driftDetectorOwnReleaseEnv     = "DRIFT_DETECTOR_OWN_RELEASE"
+
+	// helmReleaseNameAnnotation is, with helmReleaseNamespaceAnnotation, what
+	// Helm stamps on the PlatformAgent it renders; the two name the release
+	// the detector is told is the install's own.
+	helmReleaseNameAnnotation = "meta.helm.sh/release-name"
+
+	// driftDetectorOwnReleaseSeparator joins namespace and name in
+	// DRIFT_DETECTOR_OWN_RELEASE, as the detector's --own-release splits them.
+	driftDetectorOwnReleaseSeparator = "/"
 
 	// driftDetectorProjectNumberDigits is the character set a GCP project number
 	// is made of, and the whole of the test for one: a project ID must start with
@@ -1071,6 +1083,7 @@ var DefaultBuiltInPlugins = []string{
 	"pr_opened",
 	"chat_metrics",
 	"eval_run_tag",
+	"model_identity",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
@@ -2282,6 +2295,14 @@ type managedDatabaseConfig struct {
 	JournalMode string `json:"journal_mode"`
 }
 
+// managedSecurityConfig is the `security` block rendered into the managed scope.
+// Every required dependency ships in the sealed image, so Hermes' runtime
+// package downloads (`tools/lazy_deps.py` into /opt/data/lazy-packages) are
+// pinned off unconditionally without exposing a Hermes-specific CRD knob.
+type managedSecurityConfig struct {
+	AllowLazyInstalls bool `json:"allow_lazy_installs"`
+}
+
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	return renderConfigYAMLWith(agent, agentPlugins, agentPlaceholderAPIKey)
 }
@@ -2377,6 +2398,11 @@ func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*ag
 		// its own retention would keep conversation history past the period the
 		// install promises to delete it after.
 		Sessions managedSessionsConfig `json:"sessions"`
+		// Security pins Hermes' `security.allow_lazy_installs` to false unconditionally.
+		// Every required dependency ships in the sealed image, so no profile needs
+		// runtime PyPI downloads into /opt/data/lazy-packages and no Hermes-specific
+		// CRD knob is exposed. No omitempty so `false` is always rendered and pinned.
+		Security managedSecurityConfig `json:"security"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -2456,6 +2482,10 @@ func renderConfigYAMLWith(agent *agentv1alpha1.PlatformAgent, agentPlugins []*ag
 	// reconcile.
 	cfg.Kanban.Admission = resolveKanbanAdmission(agent)
 	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
+	// Security. Pin runtime package downloads off across every profile: every
+	// required dependency ships in the sealed image, and pinning this directly
+	// avoids exposing a Hermes-specific CRD knob.
+	cfg.Security = managedSecurityConfig{AllowLazyInstalls: false}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -4505,6 +4535,19 @@ func driftDetectorGitopsManagers(agent *agentv1alpha1.PlatformAgent) string {
 	return ""
 }
 
+// driftDetectorOwnRelease names the Helm release that rendered this
+// PlatformAgent, as <namespace>/<name>, or "" when the CR does not carry both
+// of Helm's annotations (a kustomize or hand install) or either is not a name.
+// The detector refuses to start on a malformed value, so one is never passed.
+func driftDetectorOwnRelease(agent *agentv1alpha1.PlatformAgent) string {
+	namespace := agent.Annotations[helmReleaseNamespaceAnnotation]
+	name := agent.Annotations[helmReleaseNameAnnotation]
+	if len(validation.IsDNS1123Label(namespace)) > 0 || len(validation.IsDNS1123Subdomain(name)) > 0 {
+		return ""
+	}
+	return namespace + driftDetectorOwnReleaseSeparator + name
+}
+
 // driftDetectorHarness returns the project, location and cluster name the detector
 // is given, empty when the harness does not name them.
 //
@@ -4648,7 +4691,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// drift-pubsub module is off, so writing these unconditionally would put the
 	// harness triple a second time on a container that does not read it — the same
 	// three values, under different names, on every credential proxy in the fleet,
-	// for a process that is not running. All six names are reserved in
+	// for a process that is not running. All seven names are reserved in
 	// mergeCredentialProxyEnv whether or not this branch writes them, so the CR
 	// cannot supply the ones this skips.
 	//
@@ -4663,6 +4706,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			corev1.EnvVar{Name: driftDetectorClusterNameEnv, Value: driftClusterName},
 			corev1.EnvVar{Name: driftDetectorSubscriptionEnv, Value: driftDetectorSubscription(agent)},
 			corev1.EnvVar{Name: driftDetectorGitopsManagersEnv, Value: driftDetectorGitopsManagers(agent)},
+			corev1.EnvVar{Name: driftDetectorOwnReleaseEnv, Value: driftDetectorOwnRelease(agent)},
 		)
 	}
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"})
@@ -5106,6 +5150,9 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 		if gchat := integration.GoogleChat; googleChatEnabled(agent) {
 			subscription := fmt.Sprintf(googleChatSubscriptionFormat, gchat.ProjectID, gchat.SubscriptionName)
 			envVars = append(envVars, corev1.EnvVar{Name: googleChatProjectIDEnvVar, Value: gchat.ProjectID})
+			if sa := strings.TrimSpace(gchat.ServiceAccountEmail); sa != "" {
+				envVars = append(envVars, corev1.EnvVar{Name: googleChatServiceAccountEnvVar, Value: sa})
+			}
 			if a2aChatArmed(agent) {
 				// The next stack takes Chat: the install's one subscription
 				// goes to the A2A relay instance and the legacy instance is
@@ -5333,6 +5380,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// that set it would open the relay to whatever the broker's
 		// credential can pull.
 		platformPubsubSubscriptionsEnvVar,
+		googleChatProjectIDEnvVar,
+		googleChatServiceAccountEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a
@@ -5405,7 +5454,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// These ten are appended by buildAgentAPIAuthSidecar after this merge
+		// These eleven are appended by buildAgentAPIAuthSidecar after this merge
 		// runs, so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
@@ -5422,7 +5471,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		driftDetectorClusterNameEnv,
 		driftDetectorSubscriptionEnv,
 		driftDetectorGitopsManagersEnv,
-		// Not every DRIFT_DETECTOR_* name belongs on this list, and the six
+		driftDetectorOwnReleaseEnv,
+		// Not every DRIFT_DETECTOR_* name belongs on this list, and the seven
 		// above are not here for being drift variables. They are here because
 		// buildAgentAPIAuthSidecar appends each one after this merge, so an
 		// unreserved name would duplicate and stall the apply, as the note
@@ -6045,6 +6095,11 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	if platformFrontDoorEnabled(agent) {
 		frontDoorProfile = platformProfileName
 	}
+	// On the gateway container, which owns the shared-state setup: that is where the
+	// entrypoint merges the Platform Agent's cron roster and applies this. The hermes-bridge
+	// sidecar copies this container's env and so carries it too, unread; the dashboard
+	// sidecar, which runs the entrypoint without the setup, does not.
+	gatewayEnvVars = append(gatewayEnvVars, builtinSchedulesEnv(agent))
 	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,

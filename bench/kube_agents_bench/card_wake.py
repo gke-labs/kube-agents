@@ -807,6 +807,11 @@ def _add_tokens(base: dict, extra: dict) -> None:
             base[bucket] = nested
         elif current is None or isinstance(current, dict):
             base[bucket] = value
+        elif isinstance(value, bool) or isinstance(current, bool):
+            # A flag (``usage_partial``) stays a flag: partial if any part
+            # was, as ``harness._sum_tokens`` keeps it. ``True + True`` is 2,
+            # which ``scoring._tokens_partial`` would read as complete.
+            base[bucket] = bool(current) or bool(value)
         else:
             base[bucket] = current + value
 

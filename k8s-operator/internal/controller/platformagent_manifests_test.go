@@ -229,6 +229,76 @@ func TestManagedConfigPinsJournalModeUnderARuntimeClass(t *testing.T) {
 	}
 }
 
+func TestManagedConfigPinsSecurityAllowLazyInstallsFalse(t *testing.T) {
+	cases := map[string]*agentv1alpha1.PlatformAgent{
+		"nil security spec": newTestPlatformAgent(),
+		"custom service account": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: "custom-sa"}
+			return a
+		}(),
+		"egress allowlist": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Security = &agentv1alpha1.SecuritySpec{EgressPolicy: "Allowlist"}
+			return a
+		}(),
+	}
+
+	for name, agent := range cases {
+		t.Run(name, func(t *testing.T) {
+			data := buildConfigMapData(agent, nil)
+			var cfg map[string]any
+			if err := yaml.Unmarshal([]byte(data[managedConfigKey]), &cfg); err != nil {
+				t.Fatalf("managed config does not parse as YAML: %v", err)
+			}
+			sec, ok := cfg["security"].(map[string]any)
+			if !ok {
+				t.Fatalf("managed config missing security map, got:\n%s", data[managedConfigKey])
+			}
+			got, ok := sec["allow_lazy_installs"].(bool)
+			if !ok || got != false {
+				t.Errorf("security.allow_lazy_installs = %v (%T), want false", sec["allow_lazy_installs"], sec["allow_lazy_installs"])
+			}
+			for key, overlay := range data {
+				if key != managedConfigKey && strings.Contains(overlay, "allow_lazy_installs") {
+					t.Errorf("allow_lazy_installs leaked into %q:\n%s", key, overlay)
+				}
+			}
+		})
+	}
+
+	t.Run("survives plugin config merge and plugin cannot override", func(t *testing.T) {
+		agent := newTestPlatformAgent()
+		plugin := &agentv1alpha1.AgentPlugin{
+			ObjectMeta: metav1.ObjectMeta{Name: "customplugin", Namespace: agent.Namespace},
+			Spec: agentv1alpha1.AgentPluginSpec{
+				Image: "example.com/plugin:v1",
+				Config: "platforms:\n  slack:\n    extra:\n      custom_flag: true\n" +
+					"security:\n  allow_lazy_installs: true\n",
+			},
+		}
+		rendered := renderConfigYAML(agent, []*agentv1alpha1.AgentPlugin{plugin})
+		var cfg map[string]any
+		if err := yaml.Unmarshal([]byte(rendered), &cfg); err != nil {
+			t.Fatalf("managed config does not parse as YAML: %v", err)
+		}
+		platforms, _ := cfg["platforms"].(map[string]any)
+		slack, _ := platforms["slack"].(map[string]any)
+		extra, _ := slack["extra"].(map[string]any)
+		if got, ok := extra["custom_flag"].(bool); !ok || !got {
+			t.Fatalf("plugin config did not merge into platforms.slack.extra (merge path not exercised), got:\n%s", rendered)
+		}
+		sec, ok := cfg["security"].(map[string]any)
+		if !ok {
+			t.Fatalf("managed config lost security map after plugin merge, got:\n%s", rendered)
+		}
+		got, ok := sec["allow_lazy_installs"].(bool)
+		if !ok || got != false {
+			t.Errorf("security.allow_lazy_installs = %v, want false (plugin must not override)", sec["allow_lazy_installs"])
+		}
+	})
+}
+
 // The memory subtree is no longer rendered into the managed scope: it is
 // profile-shaped (the front door's per-user provider is exactly what a
 // kanban-spawned specialist must not get), and the scope is machine-global. The
@@ -5434,6 +5504,9 @@ func TestIncidentContextStaysABuiltIn(t *testing.T) {
 	if !IsBuiltInPlugin("incident_context") {
 		t.Errorf("incident_context must remain a built-in so an AgentPlugin cannot shadow it")
 	}
+	if !IsBuiltInPlugin("model_identity") {
+		t.Errorf("model_identity must remain a built-in so an AgentPlugin cannot shadow it")
+	}
 }
 
 func TestRenderProfileOverlayYAML(t *testing.T) {
@@ -6640,6 +6713,70 @@ func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
 	}
 }
 
+// The detector is told which Helm release is the install's own from the
+// annotations Helm stamps on the PlatformAgent, and is told nothing when the CR
+// does not carry both as names: the detector refuses to start on a malformed
+// --own-release, so a value it could not parse must never reach it.
+func TestCredentialProxyNamesTheOwnReleaseFromTheHelmAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		want        string
+	}{
+		{
+			name: "both annotations",
+			annotations: map[string]string{
+				"meta.helm.sh/release-name":      "kube-agents",
+				"meta.helm.sh/release-namespace": "kubeagents-system",
+			},
+			want: "kubeagents-system/kube-agents",
+		},
+		{name: "no annotations", annotations: nil, want: ""},
+		{
+			name:        "the name alone",
+			annotations: map[string]string{"meta.helm.sh/release-name": "kube-agents"},
+			want:        "",
+		},
+		{
+			name:        "the namespace alone",
+			annotations: map[string]string{"meta.helm.sh/release-namespace": "kubeagents-system"},
+			want:        "",
+		},
+		{
+			name: "a name that would not parse as namespace/name",
+			annotations: map[string]string{
+				"meta.helm.sh/release-name":      "kube/agents",
+				"meta.helm.sh/release-namespace": "kubeagents-system",
+			},
+			want: "",
+		},
+		{
+			name: "a namespace that is not a name",
+			annotations: map[string]string{
+				"meta.helm.sh/release-name":      "kube-agents",
+				"meta.helm.sh/release-namespace": "kubeagents system",
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})
+			agent.Annotations = tt.annotations
+
+			var got []string
+			for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+				if e.Name == "DRIFT_DETECTOR_OWN_RELEASE" {
+					got = append(got, e.Value)
+				}
+			}
+			if len(got) != 1 || got[0] != tt.want {
+				t.Errorf("DRIFT_DETECTOR_OWN_RELEASE = %q, want exactly one %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // An unconfigured detector still gets its switch, set to "false" rather than
 // left out, and gets none of its settings. Both halves matter. The switch is
 // there so that a Deployment says whether the detector is meant to be running;
@@ -6648,7 +6785,7 @@ func TestCredentialProxyCarriesTheDriftDetectorEnvironment(t *testing.T) {
 // harness triple under five more names on every credential proxy in the fleet
 // for a process that is not started.
 //
-// The CR supplies all six here to make the second half a real assertion rather
+// The CR supplies all seven here to make the second half a real assertion rather
 // than an observation about a fixture: the names are reserved in
 // mergeCredentialProxyEnv whether or not the operator writes them, so an entry
 // the operator skips has to be dropped, not passed through.
@@ -6662,6 +6799,7 @@ func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
 			{Name: "DRIFT_DETECTOR_CLUSTER_NAME", Value: "cr-supplied"},
 			{Name: "DRIFT_DETECTOR_SUBSCRIPTION", Value: "cr-supplied"},
 			{Name: "DRIFT_DETECTOR_GITOPS_MANAGERS", Value: "cr-supplied"},
+			{Name: "DRIFT_DETECTOR_OWN_RELEASE", Value: "cr-supplied"},
 		},
 	}
 
@@ -6686,7 +6824,7 @@ func TestCredentialProxyDisablesTheDriftDetectorWhenUnconfigured(t *testing.T) {
 // Same property as the watcher's switch, and the same failure mode if it breaks:
 // `containers[].env` is a listType=map keyed on name, so a duplicate makes the
 // Deployment unappliable and the operator stops reconciling altogether. The
-// operator appends these six after mergeCredentialProxyEnv runs, so the only
+// operator appends these seven after mergeCredentialProxyEnv runs, so the only
 // thing standing between a CR naming one of them and a frozen reconcile is the
 // reserved list.
 func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
@@ -6697,6 +6835,7 @@ func TestDeploymentEnvCannotOverrideTheDriftDetectorEnvironment(t *testing.T) {
 		"DRIFT_DETECTOR_CLUSTER_NAME",
 		"DRIFT_DETECTOR_SUBSCRIPTION",
 		"DRIFT_DETECTOR_GITOPS_MANAGERS",
+		"DRIFT_DETECTOR_OWN_RELEASE",
 	}
 
 	agent := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(true)})

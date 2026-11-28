@@ -6655,14 +6655,16 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
 
     def test_a_configured_name_is_recorded(self):
         out = self._bootstrap({"PLATFORM_AGENT_GSA_NAME": "agent-two-gsa",
+                               "CHAT_GSA_NAME": "chat-two-gsa",
                                "GKE_DB_KMS_KEYRING": "ring-two"})
         self.assertIn("PLATFORM_AGENT_GSA_NAME=agent-two-gsa\n", out)
+        self.assertIn("CHAT_GSA_NAME=chat-two-gsa\n", out)
         self.assertIn("GKE_DB_KMS_KEYRING=ring-two\n", out)
 
     def test_an_unset_name_is_not_frozen_as_a_default(self):
         out = self._bootstrap({})
         for key in ("PLATFORM_AGENT_GSA_NAME", "GITHUB_MINTER_GSA_NAME", "LITELLM_GSA_NAME",
-                    "GKE_DB_KMS_KEYRING", "GKE_DB_KMS_KEY", "NAMESPACE"):
+                    "CHAT_GSA_NAME", "GKE_DB_KMS_KEYRING", "GKE_DB_KMS_KEY", "NAMESPACE"):
             with self.subTest(key=key):
                 # re.MULTILINE, or `^` anchors at offset 0 only -- which is the
                 # file's comment header, so the assertion could never fail.
@@ -8067,31 +8069,31 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
                 self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
             with self.subTest(locale=locale, platform="google_chat"):
-                proc = self._interview("", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
+                proc = self._interview("", "", ["", "", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
                 out = proc.stdout + proc.stderr
                 self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
-                self.assertIn("went on ASKED=5", proc.stdout, out)
+                self.assertIn("went on ASKED=6", proc.stdout, out)
 
     def test_the_google_chat_home_channel_is_confirmed_too(self):
         # #3320 on Chat, which the gateway takes whenever it is enabled under
-        # next. Allowlist, topic, subscription, then the home channel.
-        lead = ["", "", ""]
+        # next. Allowlist, Chat project ID, topic, subscription, then the home channel.
+        lead = ["", "", "", ""]
         proc = self._interview("", "", lead + ["", "n", "spaces/AAA"], choice="1")
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("went on ASKED=7", proc.stdout, out)
         self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
         self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
         self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("", "", lead + ["", "y"], choice="1")
-        self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("went on ASKED=6", proc.stdout, proc.stdout + proc.stderr)
 
     def test_choosing_both_asks_the_gateway_prompts(self):
-        # Allowlist, topic, subscription and home for Chat, then Slack's five.
-        chat = ["", "", "", "spaces/AAA"]
+        # Allowlist, Chat project ID, topic, subscription and home for Chat, then Slack's five.
+        chat = ["", "", "", "", "spaces/AAA"]
         answers = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD", "C0123ABCD", "#ops"]
         proc = self._interview("", "", chat + answers, choice="3")
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("went on ASKED=10", proc.stdout, out)
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)", out)
         self.assertNotIn("comma-separated for several workspaces", out)
 
@@ -8101,7 +8103,7 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
         # digest, not that they go to Slack's home channel.
         for seeded, there in (("#general", None), ("C0123ABCD", "Slack's home channel")):
             with self.subTest(seeded=seeded):
-                chat = ["", "", "", "", "y"]
+                chat = ["", "", "", "", "", "y"]
                 answers = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD", "C0123ABCD", "#ops"]
                 proc = self._interview("", f"SLACK_HOME_CHANNEL={seeded}\n", chat + answers, choice="3")
                 out = proc.stdout + proc.stderr
@@ -8336,6 +8338,14 @@ class SlackGatewaySettingsWiringTest(unittest.TestCase):
                                    'gcloud() { return 1; }')
         self.assertIn("rc=0", out)
         self.assertIn("CHECKLIST args=[] number=[]", out)
+
+    def test_the_menu_reads_the_chat_project_number_when_chat_project_id_is_set(self):
+        out = self._menu_checklist(
+            'google_chat_enabled=true\nexport CHAT_PROJECT_ID=workspace-chat-proj\n'
+            'gcloud() { if [ "$1 $2 $3" = "projects describe workspace-chat-proj" ]; then echo 777888999; else echo 111222333; fi; }'
+        )
+        self.assertIn("rc=0", out)
+        self.assertIn("CHECKLIST args=[] number=[777888999]", out)
 
     def test_the_menu_reads_google_chat_on_the_way_the_generator_does(self):
         out = self._menu_checklist("google_chat_enabled=yes slack_enabled=false")
@@ -8624,7 +8634,7 @@ class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
         )
 
     def test_each_google_chat_prompt_defaults_to_its_own_current_value(self):
-        for var in ("allowed_users", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
+        for var in ("allowed_users", "chat_project_id", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
             with self.subTest(var=var):
                 self.assertRegex(
                     self._SOURCE,
@@ -9048,7 +9058,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
     # integration's settings and nothing in the test exported them.
     _EMPTY_COMPANIONS = {
         "SLACK_ENABLED": "SLACK_ALLOWED_USERS=''\nSLACK_HOME_CHANNEL=''\nSLACK_HOME_CHANNEL_NAME=''\nSLACK_HOME_CHANNEL_POLICY=''\n",
-        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
+        "GOOGLE_CHAT_ENABLED": "ALLOWED_USERS=''\nCHAT_PROJECT_ID=''\nCHAT_MANAGE_PROJECT=''\nCHAT_TOPIC_NAME=''\nGOOGLE_CHAT_HOME_CHANNEL=''\nGOOGLE_CHAT_HOME_CHANNEL_POLICY=''\nGOOGLE_CHAT_MODE=''\n",
     }
 
     def _check(self, tmp, content, flags, extra_env=None):
@@ -9437,6 +9447,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ("--slack-home-channel-name", "SLACK_HOME_CHANNEL_NAME", "#gke alerts"),
                 ("--slack-home-channel-policy", "SLACK_HOME_CHANNEL_POLICY", "manual"),
                 ("--google-chat-allowed-users", "ALLOWED_USERS", "a@example.com b@example.com"),
+                ("--chat-project-id", "CHAT_PROJECT_ID", "workspace-chat-proj"),
+                ("--chat-manage-project", "CHAT_MANAGE_PROJECT", "false"),
                 ("--google-chat-home-channel", "GOOGLE_CHAT_HOME_CHANNEL", "spaces/AAAA"),
                 ("--google-chat-home-channel-policy", "GOOGLE_CHAT_HOME_CHANNEL_POLICY", "manual"),
                 ("--chat-topic-name", "CHAT_TOPIC_NAME", "my-topic"),
@@ -9499,10 +9511,12 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                 ),
                 (
                     "--enable-google-chat",
-                    "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_TOPIC_NAME=my-topic "
+                    "GOOGLE_CHAT_ENABLED=true ALLOWED_USERS=a@example.com CHAT_PROJECT_ID=chat-proj "
+                    "CHAT_MANAGE_PROJECT=false CHAT_TOPIC_NAME=my-topic "
                     "GOOGLE_CHAT_HOME_CHANNEL=spaces/A GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual "
                     "GOOGLE_CHAT_MODE=debug CHAT_SUB_NAME=my-sub",
-                    ["ALLOWED_USERS=a@example.com", "CHAT_TOPIC_NAME=my-topic",
+                    ["ALLOWED_USERS=a@example.com", "CHAT_PROJECT_ID=chat-proj",
+                     "CHAT_MANAGE_PROJECT=false", "CHAT_TOPIC_NAME=my-topic",
                      "GOOGLE_CHAT_HOME_CHANNEL=spaces/A", "GOOGLE_CHAT_HOME_CHANNEL_POLICY=manual",
                      "GOOGLE_CHAT_MODE=debug", "GOOGLE_CHAT_ENABLED=true"],
                     ("CHAT_SUB_NAME",),
@@ -9627,7 +9641,14 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     def test_the_menu_refuses_a_chat_flag_it_would_drop(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for flag in ("--enable-slack", "--enable-google-chat=false", "--slack-allowed-users=U1", "--chat-topic-name=t"):
+            for flag in (
+                "--enable-slack",
+                "--enable-google-chat=false",
+                "--slack-allowed-users=U1",
+                "--chat-topic-name=t",
+                "--chat-project-id=chat-proj",
+                "--chat-manage-project=false",
+            ):
                 with self.subTest(flag=flag):
                     proc = self._run(
                         f'run_menu_system() {{ echo "MENU RAN"; }}; print_banner() {{ :; }}; main --menu {flag}',
@@ -12875,6 +12896,15 @@ class DomainScopedFlagsTest(unittest.TestCase):
             help_text,
         )
 
+    def test_chat_project_id_and_chat_manage_project_flags_reach_parameters(self):
+        """--chat-project-id and --chat-manage-project populate their PARAM_* vars."""
+        proc = self._parse(
+            "--chat-project-id=chat-host-proj --chat-manage-project=false",
+            'echo "P=[$PARAM_CHAT_PROJECT_ID] M=[$PARAM_CHAT_MANAGE_PROJECT]"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertIn("P=[chat-host-proj] M=[false]", proc.stdout)
+
 
 class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
     """--enable-slack with nobody to ask for the tokens is refused.
@@ -13091,6 +13121,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
     # is applied with ${VAR:-...}, which reads the empty assignment as "unset".
     PARSE_TIME_CHECKED_TOGGLES = [
         "--enable-google-chat",
+        "--chat-manage-project",
         "--enable-slack",
         "--enable-gke-backup-plan",
         "--disallow-secrets-read",
@@ -13148,6 +13179,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
     # The environment key each toggle is seeded from, before parse_args runs.
     SEEDED_TOGGLE_ENV_KEYS = {
         "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
+        "--chat-manage-project": "CHAT_MANAGE_PROJECT",
         "--enable-slack": "SLACK_ENABLED",
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
         "--disallow-secrets-read": "DISALLOW_SECRETS_READ",
@@ -13212,6 +13244,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         )
         seeded_params = [
             "PARAM_ENABLE_GOOGLE_CHAT",
+            "PARAM_CHAT_MANAGE_PROJECT",
             "PARAM_ENABLE_SLACK",
             "PARAM_ENABLE_GKE_BACKUP_PLAN",
             "PARAM_DISALLOW_SECRETS_READ",

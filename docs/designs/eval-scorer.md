@@ -230,9 +230,10 @@ the marker, not as a loss. An entry with a router-scope `arguments` leaf naming 
 changed its grade, since they match no pattern: a positive entry that failed, a `none`-wrapped one
 that passed, and one with both kinds of leaf that passed or failed; an error stays graded. Such an
 entry can carry the only grade of the answer (a phrase beside the call in one compound), so when any
-entry is set aside this way, every objective of the repetition is too, and it reports not graded on
-the transport instead of passing on what remains; safeguards the empty args can't flip still grade.
-#7453 tracks a precise version that re-grades the entry instead. An entry that can fire only on a
+entry is set aside this way, every other objective of the repetition that passed is too, and the
+repetition can't pass on what remains; an objective that failed or errored outside that set stays
+graded, since the empty args can't have flipped it, and with nothing left the repetition reports not
+graded on the transport. Safeguards the empty args can't flip still grade. #7453 tracks a precise version that re-grades the entry instead. An entry that can fire only on a
 session or profile pod's call (`CaseSpec.session_only_checks`: a lone router-scope
 `tool_called`, or a `none` of only such leaves, naming only tools no Hermes turn has) is set aside
 on a vouched trace that holds no call the worker adapter published, when it passed or, not being a

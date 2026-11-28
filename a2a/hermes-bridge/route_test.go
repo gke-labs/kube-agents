@@ -40,7 +40,15 @@ type routePut struct {
 func newRouteStore(t *testing.T, status int) *routeStore {
 	t.Helper()
 	s := &routeStore{status: status}
-	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.srv = httptest.NewServer(s.handler())
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+// handler answers as the session-kv store does for the writes and reads the
+// bridge makes, counting route and origin writes.
+func (s *routeStore) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			// The pushed-report lookup (incident.go) reads the same store;
 			// this one holds no report and counts route writes alone.
@@ -69,9 +77,7 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 		s.mu.Unlock()
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, `{"detail":"refused"}`)
-	}))
-	t.Cleanup(s.srv.Close)
-	return s
+	})
 }
 
 func (s *routeStore) setStatus(status int) {
@@ -358,6 +364,20 @@ func TestAPI_ARouteThatCannotBeRecordedIsSaidInTheAnswer(t *testing.T) {
 	}
 	if got := task.Artifact(lib.ArtifactResult).Parts[0].Text; !strings.HasSuffix(got, routeLostNote) {
 		t.Fatalf("answer = %q, want it to end with the route-lost note", got)
+	}
+}
+
+// The route-lost note is user text: it names none of the bridge's internals
+// (.agents/rules/chat_ux.md, "No plumbing in user text") and says what to do.
+func TestRouteLostNoteIsPlainUserText(t *testing.T) {
+	note := strings.ToLower(routeLostNote)
+	for _, word := range []string{"card", "route", "record", "task", "session", "kanban", "board"} {
+		if strings.Contains(note, word) {
+			t.Errorf("routeLostNote = %q, carries the internal name %q", routeLostNote, word)
+		}
+	}
+	if !strings.Contains(note, "ask me about it") {
+		t.Errorf("routeLostNote = %q, want it to say what would work instead", routeLostNote)
 	}
 }
 

@@ -865,8 +865,11 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   topic/subscription names (defaults match the `chat-pubsub` Terraform
   module). Requires the Chat Pub/Sub backend to exist
   (`terraform/modules/chat-pubsub`); `projectId`
-  is taken from `platformAgent.harness.projectId`. Restrict access via
-  `allowedUsers` (empty = everyone).
+  defaults to `platformAgent.harness.projectId` when empty, and
+  `serviceAccountEmail` optionally names the dedicated Chat service account
+  (`kubeagents-chat-gsa@<chat_project_id>.iam.gserviceaccount.com`) impersonated
+  by the credential broker when the Chat project differs from the GKE host
+  project. Restrict access via `allowedUsers` (empty = everyone).
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
   tokens are read from the credentials Secret's `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).
@@ -1860,7 +1863,10 @@ helm uninstall kube-agents -n kubeagents-system
   (CI enforces this via `make chart-check`). `make chart-check` also renders
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
-  (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+  (`hack/check_chart_webhooks.py`); fix that one by editing the template. It
+  also renders the chart across its feature-toggle value sets and fails if any
+  rendered YAML document repeats a mapping key
+  (`tests/test_chart_no_duplicate_keys.py`).
 - `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
   operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`

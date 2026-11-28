@@ -585,12 +585,17 @@ func TestACancelByIDOfAReleasedProfileTaskWritesItsStopRecord(t *testing.T) {
 
 // TestARefusedDelegationLeavesAProfileTasksResultAlone: a session turn's
 // completed after a refused delegation is only its hand-off line; a profile
-// task keeps running after a refusal, and its completed is its own result.
+// task keeps running after a refusal, and its completed is its own result;
+// and a wake's completed is the person's answer (#6861), so it stands too.
 func TestARefusedDelegationLeavesAProfileTasksResultAlone(t *testing.T) {
 	rec := &SessionRecord{Tasks: []TaskRef{
 		{ID: "task-session", DelegationEnd: "delegation-refused"},
 		{ID: "task-profile", Tier: "read", DelegationEnd: "delegation-refused"},
+		{ID: "task-wake", Role: taskRoleWake, WakeDelegate: true, DelegationEnd: "delegation-refused"},
 	}}
+	if state, _, handOff := rec.handOffEnd("task-wake", lib.StateCompleted); handOff || state != lib.StateCompleted {
+		t.Fatalf("wake: %s, %v; want its answer to stand", state, handOff)
+	}
 	if state, _, handOff := rec.handOffEnd("task-session", lib.StateCompleted); !handOff || state != lib.StateFailed {
 		t.Fatalf("session turn: %s, %v; want the hand-off rewritten to failed", state, handOff)
 	}

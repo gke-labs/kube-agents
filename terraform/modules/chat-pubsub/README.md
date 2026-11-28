@@ -24,4 +24,19 @@ module "chat_pubsub" {
 }
 ```
 
+### Cross-project and cross-organization Google Chat
+
+When the Google Chat app and its Pub/Sub topic live in a different GCP project or organization from the GKE cluster, pass `chat_service_account_id`:
+
+```hcl
+module "chat_pubsub" {
+  source                      = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/chat-pubsub?ref=1.2.0"
+  project_id                  = "my-workspace-chat-project"
+  agent_service_account_email = "kubeagents-platform-gsa@my-gke-project.iam.gserviceaccount.com"
+  chat_service_account_id     = "kubeagents-chat-gsa"
+}
+```
+
+With `chat_service_account_id` set, the module creates `<chat_service_account_id>@<project_id>.iam.gserviceaccount.com`, grants `agent_service_account_email` `roles/iam.serviceAccountTokenCreator` on that service account as a resource, and binds `roles/pubsub.subscriber` and `roles/pubsub.viewer` on the subscription to the Chat service account instead of the agent's GSA. Set `manage = false` when the installing identity cannot administer `project_id` and a project admin provisions those resources out of band; the module then creates nothing and still outputs `topic_name`, `subscription_name`, and `chat_service_account_email` for the `PlatformAgent` CR.
+
 See the [Release versioning guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

@@ -7,7 +7,7 @@ REST API only, and reads and writes git. Every subcommand prints JSON on stdout
 so any harness (a Hermes skill, a mode-next worker, a Kubernetes CronJob, a CI
 step) can drive it.
 
-System of record: Operational Knowledge Framework (OKF) records in the GitOps
+System of record: Open Knowledge Format (OKF) records in the GitOps
 repository, ``knowledge/decision/*.md`` / ``knowledge/decisions/*.md`` and
 ``knowledge/lesson/*.md`` / ``knowledge/lessons/*.md`` (Markdown + YAML
 frontmatter). The Hindsight bank is a derived index of them and can be rebuilt
@@ -101,12 +101,36 @@ RECORD_TYPES = (
     "escalation",
     "observation",
 )
-STATUSES = ("proposed", "active", "rejected", "superseded", "retired")
+STATUS_PROPOSED = "proposed"
+STATUS_ACTIVE = "active"
+STATUS_REJECTED = "rejected"
+STATUS_SUPERSEDED = "superseded"
+STATUS_RETIRED = "retired"
+STATUSES = (STATUS_PROPOSED, STATUS_ACTIVE, STATUS_REJECTED, STATUS_SUPERSEDED, STATUS_RETIRED)
+EXTERNAL_DOC_STATUS_MAP = {
+    "accepted": STATUS_ACTIVE,
+    "approved": STATUS_ACTIVE,
+    STATUS_ACTIVE: STATUS_ACTIVE,
+    "stable": STATUS_ACTIVE,
+    STATUS_PROPOSED: STATUS_PROPOSED,
+    "draft": STATUS_PROPOSED,
+    STATUS_REJECTED: STATUS_REJECTED,
+    "deprecated": STATUS_SUPERSEDED,
+    STATUS_SUPERSEDED: STATUS_SUPERSEDED,
+    STATUS_RETIRED: STATUS_RETIRED,
+    "obsolete": STATUS_RETIRED,
+}
 SEVERITIES = ("block", "warn", "info")
 VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
+SKIP_FILENAMES = frozenset({"index.md", "log.md", "readme.md", "template.md", "state_of_being.md"})
+SKIP_EXTERNAL_DOC_FILENAMES = SKIP_FILENAMES | frozenset({"0000-template.md"})
 RECORD_STRATEGY = "record"
 DOC_PREFIX = "okf:"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+# Hindsight is an in-cluster Service, or on the pod's loopback: a proxy from the
+# environment must not get the decision records, and urllib does not leave out
+# such a host by itself.
+_HINDSIGHT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_RECALL_MAX_TOKENS = 2048
 MAX_CONTEXT_LENGTH = 200
@@ -745,7 +769,7 @@ def load_records(repo: Path) -> List[Record]:
         if not base.is_dir():
             continue
         for p in sorted(base.glob("*.md")):
-            if p.name.lower() in ("index.md", "readme.md", "template.md", "state_of_being.md"):
+            if p.name.lower() in SKIP_FILENAMES:
                 continue
             rel = str(p.relative_to(repo))
             if rel in seen:
@@ -876,28 +900,16 @@ def parse_external_doc_record(text: str, rel_path: str) -> Record:
     if not title:
         title = stem.replace("-", " ").replace("_", " ").strip() or rec_id
 
-    status_map = {
-        "accepted": "active",
-        "approved": "active",
-        "active": "active",
-        "proposed": "proposed",
-        "draft": "proposed",
-        "rejected": "rejected",
-        "deprecated": "superseded",
-        "superseded": "superseded",
-        "retired": "retired",
-        "obsolete": "retired",
-    }
     raw_status_val = meta.get("status")
     if raw_status_val is None:
-        status = "active"
+        status = STATUS_ACTIVE
     elif isinstance(raw_status_val, str):
         raw_status = raw_status_val.strip().lower()
-        status = "active" if not raw_status else status_map.get(raw_status, "proposed")
+        status = STATUS_ACTIVE if not raw_status else EXTERNAL_DOC_STATUS_MAP.get(raw_status, STATUS_PROPOSED)
     else:
-        status = "proposed"
+        status = STATUS_PROPOSED
     if status not in _VALID_STATUS_SET:
-        status = "proposed"
+        status = STATUS_PROPOSED
     scope = meta.get("scope") if isinstance(meta.get("scope"), dict) else {"paths": ["**"]}
     if not any(scope.get(k) for k in ("paths", "resources", "checks")):
         scope = dict(scope)
@@ -1068,7 +1080,7 @@ def load_external_doc_records(repo: Path, extra_repos: Optional[Iterable[str]] =
             if not base.is_dir():
                 continue
             for p in sorted(base.rglob("*.md")):
-                if p.name.lower() in ("index.md", "readme.md", "template.md", "state_of_being.md", "0000-template.md"):
+                if p.name.lower() in SKIP_EXTERNAL_DOC_FILENAMES:
                     continue
                 rel = f"{prefix}{p.relative_to(rdir).as_posix()}"
                 try:
@@ -1763,7 +1775,7 @@ class Hindsight:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with _HINDSIGHT_OPENER.open(req, timeout=self.timeout) as resp:
             raw = resp.read()
             return json.loads(raw) if raw else None
 
@@ -2089,13 +2101,7 @@ def _load_single_repo_external_docs(
         if not base.is_dir():
             continue
         for p in sorted(base.rglob("*.md")):
-            if p.name.lower() in (
-                "index.md",
-                "readme.md",
-                "template.md",
-                "state_of_being.md",
-                "0000-template.md",
-            ):
+            if p.name.lower() in SKIP_EXTERNAL_DOC_FILENAMES:
                 continue
             rel = f"{prefix}{p.relative_to(rdir).as_posix()}"
             try:

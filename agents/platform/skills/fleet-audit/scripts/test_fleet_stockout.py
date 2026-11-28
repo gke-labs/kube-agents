@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -38,6 +39,7 @@ os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
 import audit_report  # noqa: E402
+import manifest_delta  # noqa: E402
 
 # The longest identifiers a recorded command can carry in its kubeconfig path
 # under the shipped platform profile: a 30-character project id, a 40-character
@@ -135,6 +137,18 @@ def pod(name, node_selector=None, *, phase="Pending", scheduled="False", reason=
         "spec": {"nodeSelector": dict(node_selector or {}), "tolerations": [dict(t) for t in tolerations]},
         "status": {"phase": phase, "conditions": [condition]},
     }
+
+
+def running_pod(name, node_name, *, namespace="shop", owner=("ReplicaSet", "web-7d9f8b6c4"), template_hash="7d9f8b6c4", phase="Running", containers=None, init_containers=None):
+    """A pod as a read of one node's pods returns it: placed on `node_name`,
+    by default a Deployment's pod that requests no GPU."""
+    meta = {"name": name, "namespace": namespace, "labels": {"pod-template-hash": template_hash} if template_hash else {}}
+    if owner:
+        meta["ownerReferences"] = [{"kind": owner[0], "name": owner[1]}]
+    spec = {"nodeName": node_name, "containers": containers or [{"name": "app"}]}
+    if init_containers:
+        spec["initContainers"] = init_containers
+    return {"kind": "Pod", "metadata": meta, "spec": spec, "status": {"phase": phase}}
 
 
 def capacity_history(rates, machine_type="n2-standard-8", price=None):
@@ -1467,6 +1481,169 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         self.assertIsNone(fs.check_single_zone_nodepool(pool, has_nap=True, current_node_count=1))
 
 
+class GpuPoolMissingTaintTest(unittest.TestCase):
+    """§3.15. The shapes are the ones read from two throwaway clusters (GKE
+    1.36.4) on 2026-11-23: a GPU pool added beside a pool without GPUs carries
+    `nvidia.com/gpu=present:NO_SCHEDULE` in its settings, and the default GPU
+    pool of a cluster created with one carried no taint, also when read 300
+    seconds after a pool without GPUs was added."""
+
+    GKE_TAINT = {"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}
+
+    @staticmethod
+    def gpu_pool(name="gpu", taints=None, machine_type="n1-standard-4", labels=None):
+        config = {"machineType": machine_type, "accelerators": [{"acceleratorType": "nvidia-tesla-t4", "acceleratorCount": "1"}]}
+        if taints is not None:
+            config["taints"] = taints
+        if labels is not None:
+            config["labels"] = labels
+        return {"name": name, "config": config}
+
+    def check(self, pool, plain_pools=("default-pool",), live=0, stray=(), read=0):
+        # The pool's taints as the collector hands them over: the settings'
+        # taints in the scheduler's shape.
+        taints = fs.pool_taint_records([pool])[pool["name"]]["taints"]
+        return fs.check_gpu_pool_missing_taint(pool, taints, list(plain_pools), live, None if stray is None else list(stray), read)
+
+    def test_flags_an_untainted_gpu_pool_beside_a_pool_without_gpus(self):
+        hit = self.check(self.gpu_pool())
+        self.assertEqual(hit["object"], "NodePool/gpu")
+        self.assertIn("1 x nvidia-tesla-t4 on n1-standard-4", hit["excerpt"])
+        self.assertIn("no NoSchedule or NoExecute taint in the pool's settings", hit["excerpt"])
+        self.assertTrue(hit["excerpt"].endswith("; the pool has no node now, so no pod runs on it; the cluster also has an untainted node pool without accelerators (default-pool)"), hit["excerpt"])
+        # The settings alone: the grade is `SEVERITY`'s.
+        self.assertNotIn("severity", hit)
+        self.assertEqual(fs._emit(fs.GPU_POOL_MISSING_TAINT, hit)["severity"], "minor")
+
+    def test_does_not_flag_a_cluster_with_gpu_pools_only(self):
+        """There GKE adds no taint and every pod has nowhere else to go."""
+        self.assertIsNone(self.check(self.gpu_pool(), plain_pools=()))
+
+    def test_does_not_flag_gke_s_own_taint(self):
+        self.assertIsNone(self.check(self.gpu_pool(taints=[self.GKE_TAINT])))
+
+    def test_does_not_flag_an_owner_s_own_blocking_taint(self):
+        for effect in ("NO_SCHEDULE", "NO_EXECUTE"):
+            with self.subTest(effect=effect):
+                self.assertIsNone(self.check(self.gpu_pool(taints=[{"key": "dedicated", "value": "gpu", "effect": effect}])))
+
+    def test_a_preference_taint_does_not_protect_the_pool(self):
+        hit = self.check(self.gpu_pool(taints=[{"key": "dedicated", "value": "gpu", "effect": "PREFER_NO_SCHEDULE"}]))
+        self.assertEqual(hit["object"], "NodePool/gpu")
+
+    def test_the_procedure_carries_the_headline_and_the_impact_sentence(self):
+        """The ledger title comes from the procedure and the chat summary from
+        the renderer; one sentence, held in step here. So is the impact."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.GPU_POOL_MISSING_TAINT}`)")[1].split("\n### ")[0]
+        remediation_line = next(line for line in section.splitlines() if line.startswith("- **Remediation:**"))
+        self.assertIn(audit_report.CHECK_PHRASES[fs.GPU_POOL_MISSING_TAINT].format(object="<name>"), remediation_line)
+        impact_line = next(line for line in section.splitlines() if line.startswith("- **Impact:**"))
+        self.assertIn(f'"{fs.IMPACT[fs.GPU_POOL_MISSING_TAINT]}"', impact_line)
+
+    def test_a_node_pool_finding_is_filed_without_a_namespace(self):
+        """The excerpt names workloads by namespace; the pool itself is in none.
+        A namespace on the finding would give the pool a second identity."""
+        self.assertIn(fs.GPU_POOL_MISSING_TAINT, audit_report.UNNAMESPACED_CHECKS)
+        self.assertEqual(audit_report.GPU_POOL_TAINT_CHECK, fs.GPU_POOL_MISSING_TAINT)
+
+    def test_the_procedure_s_node_count_is_the_collector_s(self):
+        """The procedure writes the number of nodes read as a word; it is the collector's constant."""
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.GPU_POOL_MISSING_TAINT}`)")[1].split("\n### ")[0]
+        self.assertEqual(fs.GPU_POOL_NODES_READ_MAX, 5)
+        self.assertIn("for up to five of that pool's nodes", section)
+        self.assertIn("on five nodes of a pool at most", section)
+
+    def test_does_not_flag_a_pool_the_owners_opted_out(self):
+        """The standard exclusion S4, read from the node labels in the pool's settings."""
+        self.assertIsNone(self.check(self.gpu_pool(labels={fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE})))
+        self.assertIsNotNone(self.check(self.gpu_pool(labels={fs.OPT_OUT_LABEL: "no"})))
+
+    def test_other_pools_past_the_named_count_are_counted_and_come_last(self):
+        """A long list of other pools must not push the pods sentence out of a cut excerpt."""
+        pools = [f"web-{i:02d}" for i in range(fs.GPU_POOL_PLAIN_POOLS_NAMED_MAX + 77)]
+        hit = self.check(self.gpu_pool(), plain_pools=pools, live=1, stray=[running_pod("web-1", "n1")], read=1)
+        self.assertLess(len(hit["excerpt"]), audit_report.MAX_EXCERPT_CHARS)
+        self.assertLess(hit["excerpt"].index("that requests no GPU"), hit["excerpt"].index("untainted node pools"))
+        self.assertTrue(hit["excerpt"].endswith("(web-00, web-01, web-02 and 77 more)"), hit["excerpt"])
+
+    def test_does_not_flag_a_pool_without_accelerators(self):
+        self.assertIsNone(self.check({"name": "web", "config": {"machineType": "e2-standard-4"}}))
+
+    def test_pods_that_request_no_gpu_make_it_major(self):
+        stray = [running_pod("web-1", "n1", owner=("ReplicaSet", "web-7d9f8b6c4")), running_pod("web-2", "n1", owner=("ReplicaSet", "web-7d9f8b6c4")), running_pod("job-x", "n2", owner=None, template_hash="")]
+        hit = self.check(self.gpu_pool(), live=2, stray=stray, read=2)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("3 pods that request no GPU run on its nodes now (nodes read: 2 of 2): shop/web (2), shop/job-x (1)", hit["excerpt"])
+
+    def test_one_such_pod_and_one_other_pool_read_as_one(self):
+        hit = self.check(self.gpu_pool(), live=1, stray=[running_pod("web-1", "n1")], read=1)
+        self.assertIn("1 pod that requests no GPU runs on its nodes now (nodes read: 1 of 1): shop/web (1)", hit["excerpt"])
+        self.assertIn("an untainted node pool without accelerators (default-pool)", hit["excerpt"])
+
+    def test_no_such_pod_leaves_the_configuration_grade(self):
+        hit = self.check(self.gpu_pool(), live=3, stray=[], read=3)
+        self.assertNotIn("severity", hit)
+        self.assertIn("no pod that requests no GPU runs on its nodes now (nodes read: 3 of 3; DaemonSet pods, system pods, finished pods and pods with a resource claim are not counted)", hit["excerpt"])
+
+    def test_an_unread_pod_list_is_said_and_not_graded_up(self):
+        hit = self.check(self.gpu_pool(), live=1, stray=None, read=1)
+        self.assertNotIn("severity", hit)
+        self.assertIn("the pods on its nodes were not read", hit["excerpt"])
+
+    def test_workloads_past_the_named_count_are_counted(self):
+        stray = [running_pod(f"p{i}", "n1", owner=("StatefulSet", f"db{i}"), template_hash="") for i in range(fs.GPU_POOL_WORKLOADS_NAMED_MAX + 2)]
+        hit = self.check(self.gpu_pool(), live=1, stray=stray, read=1)
+        self.assertIn(" and 2 more", hit["excerpt"])
+
+    def test_only_workload_pods_that_request_no_gpu_on_the_pool_s_nodes_count(self):
+        gpu_request = running_pod("train", "n1", containers=[{"name": "c", "resources": {"requests": {"nvidia.com/gpu": "1"}}}])
+        gpu_limit = running_pod("infer", "n1", containers=[{"name": "c", "resources": {"limits": {"nvidia.com/gpu": "1"}}}])
+        gpu_init = running_pod("warm", "n1", init_containers=[{"name": "i", "resources": {"limits": {"nvidia.com/gpu": "1"}}}])
+        # NVIDIA's device plugin can be set to advertise a MIG slice or a shared GPU
+        # under other names of its domain (`mixed` MIG strategy, `renameByDefault=true`).
+        gpu_slice = running_pod("mig-train", "n1", containers=[{"name": "c", "resources": {"limits": {"nvidia.com/mig-1g.5gb": "1"}}}])
+        gpu_shared = running_pod("shared-infer", "n1", containers=[{"name": "c", "resources": {"requests": {"nvidia.com/gpu.shared": "1"}}}])
+        daemon = running_pod("agent", "n1", owner=("DaemonSet", "agent"), template_hash="")
+        system = running_pod("dns", "n1", namespace="kube-system")
+        finished = running_pod("done", "n1", phase="Succeeded")
+        elsewhere = running_pod("web-9", "other-node")
+        # A pod with a resource claim may take its GPU through the claim.
+        claimed = running_pod("dra-train", "n1")
+        claimed["spec"]["resourceClaims"] = [{"name": "gpu", "resourceClaimTemplateName": "single-gpu"}]
+        kept = running_pod("web-1", "n1")
+        counted = fs.pods_without_gpu([gpu_request, gpu_limit, gpu_init, gpu_slice, gpu_shared, daemon, system, finished, elsewhere, claimed, kept], ["n1"])
+        self.assertEqual([p["metadata"]["name"] for p in counted], ["web-1"])
+
+    def test_a_declared_zero_gpu_quantity_is_no_gpu_request(self):
+        """A chart that writes `nvidia.com/gpu: "0"` for an optional resource asks
+        for no GPU, so its pod on a GPU machine is one that requests none."""
+        for field in fs.CONTAINER_RESOURCE_FIELDS:
+            for zero in ("0", 0, "0.0", "0m"):
+                with self.subTest(field=field, zero=zero):
+                    pod = running_pod("web-1", "n1", containers=[{"name": "c", "resources": {field: {"nvidia.com/gpu": zero}}}])
+                    self.assertFalse(fs.pod_requests_gpu(pod))
+                    self.assertEqual([p["metadata"]["name"] for p in fs.pods_without_gpu([pod], ["n1"])], ["web-1"])
+            for some in ("1", 1, "2", "10"):
+                with self.subTest(field=field, some=some):
+                    pod = running_pod("train", "n1", containers=[{"name": "c", "resources": {field: {"nvidia.com/gpu": some}}}])
+                    self.assertTrue(fs.pod_requests_gpu(pod))
+        # One container with a zero and one with a real request: the pod requests a GPU.
+        mixed = running_pod("mixed", "n1", containers=[
+            {"name": "sidecar", "resources": {"limits": {"nvidia.com/gpu": "0"}}},
+            {"name": "train", "resources": {"limits": {"nvidia.com/gpu": "1"}}},
+        ])
+        self.assertTrue(fs.pod_requests_gpu(mixed))
+
+    def test_a_pod_list_item_that_is_no_object_is_skipped(self):
+        """A pod list item that is no JSON object has no node and no owner to
+        read: it is skipped, and the pods beside it are still counted."""
+        kept = running_pod("web-1", "n1")
+        counted = fs.pods_without_gpu([None, "not-a-pod", 7, kept], ["n1"])
+        self.assertEqual([p["metadata"]["name"] for p in counted], ["web-1"])
+
+
 class ReservationTest(unittest.TestCase):
     def test_flags_mostly_idle_reservation(self):
         r = {"name": "r1", "specificReservation": {"count": 10, "inUseCount": 2}}
@@ -1885,6 +2062,9 @@ class CollectClusterTest(unittest.TestCase):
                 return run_of(0)
             if argv[:3] == ["kubectl", "get", "computeclasses"]:
                 return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["kubectl", "get", fs.CAPACITY_BUFFER_RESOURCE]:
+                self.assertIn(fs.KUBECTL_CHUNK_SIZE_ARG, argv)
+                return run_of(0, json.dumps(dump_of()))
             if argv[:3] == ["kubectl", "get", "--raw"]:
                 return run_of(0, json.dumps({"metadata": {}, "items": []}))
             if argv[:2] == ["kubectl", "get"]:
@@ -1941,6 +2121,10 @@ class CollectClusterTest(unittest.TestCase):
         advice_rc=0,
         advice_stderr="denied",
         advice_stdout=None,
+        capacity_buffers=None,
+        capacity_buffers_rc=0,
+        capacity_buffers_stderr="denied",
+        capacity_buffers_stdout=None,
     ):
         target = cluster or self.CLUSTER
         self.issued = []
@@ -1949,6 +2133,17 @@ class CollectClusterTest(unittest.TestCase):
             self.issued.append(argv)
             if "get-credentials" in argv:
                 return run_of(0)
+            if argv[:3] == ["kubectl", "get", fs.CAPACITY_BUFFER_RESOURCE]:
+                if capacity_buffers_rc:
+                    return run_of(capacity_buffers_rc, "", capacity_buffers_stderr)
+                if capacity_buffers_stdout is not None:
+                    return run_of(0, capacity_buffers_stdout, capacity_buffers_stderr)
+                items = (
+                    list(capacity_buffers)
+                    if capacity_buffers is not None
+                    else [i for i in dump_items if i.get("kind") == fs.CAPACITY_BUFFER_KIND]
+                )
+                return run_of(0, json.dumps(dump_of(*items)))
             if argv[:2] == ["kubectl", "get"]:
                 return run_of(0, json.dumps(dump_of(*dump_items)))
             if argv[:3] == ["gcloud", "container", "node-pools"]:
@@ -2226,7 +2421,7 @@ class CollectClusterTest(unittest.TestCase):
         declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
         # `spot-scarcity-risk` rides along because this fixture's cluster asks
         # for no Spot capacity at all, which is its own declared non-applicability.
-        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk", fs.UNBACKED_MANUAL_FALLBACK})
+        self.assertEqual(set(declared), {"single-zone-nodepool", "spot-scarcity-risk", fs.UNBACKED_MANUAL_FALLBACK, fs.GPU_POOL_MISSING_TAINT})
         self.assertIn("Autopilot", declared["single-zone-nodepool"])
 
     def test_autopilot_never_issues_the_node_pools_read(self):
@@ -2254,6 +2449,127 @@ class CollectClusterTest(unittest.TestCase):
         self.assertIn("single-zone-nodepool", entry["limitations"])
         self.assertIn("PERMISSION_DENIED", entry["limitations"])
         self.assertIn("rc=1", entry["limitations"])
+
+    UNTAINTED_GPU_POOL = {"name": "gpu", "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": "n1-standard-4", "accelerators": [{"acceleratorType": "nvidia-tesla-t4", "acceleratorCount": "1"}]}}
+    PLAIN_POOL = {"name": "web", "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": "e2-standard-4"}}
+
+    def gpu_taint_candidates(self, entry):
+        return [c for c in entry["candidates"] if c["check"] == fs.GPU_POOL_MISSING_TAINT]
+
+    def test_an_untainted_gpu_pool_is_reported_with_the_pods_on_its_nodes(self):
+        items = [node("gke-gpu-1", "gpu"), node("gke-web-1", "web"), running_pod("web-1", "gke-gpu-1"), running_pod("web-2", "gke-web-1")]
+        entry = self.run_with(dump_items=items, pools=[self.UNTAINTED_GPU_POOL, self.PLAIN_POOL])
+        (candidate,) = self.gpu_taint_candidates(entry)
+        self.assertEqual(candidate["object"], "NodePool/gpu")
+        self.assertEqual(candidate["severity"], "major")
+        self.assertIn("1 pod that requests no GPU runs on its nodes now (nodes read: 1 of 1): shop/web (1)", candidate["excerpt"])
+        # The count comes from the pods read, so the command names that read
+        # too: once, with the procedure's `<node>` and no node's name, because
+        # a command that named the nodes would change with every replaced node.
+        self.assertIn("node-pools", candidate["command"])
+        self.assertTrue(candidate["command"].endswith("kubectl get --raw '/api/v1/pods?limit=500&fieldSelector=spec.nodeName%3D<node>'"), candidate["command"])
+        self.assertEqual(len(candidate["command"].split(fs.CHAIN_SEPARATOR)), 2, candidate["command"])
+        self.assertNotIn("gke-gpu-1", candidate["command"])
+        self.assertNotIn(fs.NODE_NAME_PLACEHOLDER, candidate["command"])
+        self.assertEqual(candidate["command"], audit_report.validate_check_command(candidate["command"], "clusters[0]", fs.GPU_POOL_MISSING_TAINT))
+        self.assertIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_pods_read_is_not_an_empty_pool(self):
+        """The finding files on the settings alone and says the pods were not
+        read; one limitation says so for the cluster, with no exit code and no
+        tool output, because the sentence is read in chat."""
+        second = {**self.UNTAINTED_GPU_POOL, "name": "gpu-b"}
+        items = [node("gke-gpu-1", "gpu"), node("gke-gpu-b-1", "gpu-b"), node("gke-web-1", "web"), running_pod("web-1", "gke-gpu-1")]
+        with patch.object(fs, "read_pods_on_nodes", return_value=(None, "rc=1: Error from server (Forbidden): pods is forbidden")) as read:
+            entry = self.run_with(dump_items=items, pools=[self.UNTAINTED_GPU_POOL, second, self.PLAIN_POOL])
+        self.assertEqual(read.call_count, 2)
+        candidates = self.gpu_taint_candidates(entry)
+        self.assertEqual({c["object"] for c in candidates}, {"NodePool/gpu", "NodePool/gpu-b"})
+        for candidate in candidates:
+            self.assertEqual(candidate["severity"], "minor")
+            self.assertIn("the pods on its nodes were not read", candidate["excerpt"])
+            self.assertNotIn("no pod that requests no GPU", candidate["excerpt"])
+            # No pods read to name: the cluster's node pools read stands for the finding.
+            self.assertNotIn("command", candidate)
+        self.assertEqual(entry["limitations"].count(fs.GPU_POOL_PODS_UNREAD_LIMITATION), 1, entry["limitations"])
+        self.assertNotIn("rc=", fs.GPU_POOL_PODS_UNREAD_LIMITATION)
+        # A cluster's gaps are joined with a semicolon, so one gap holds none.
+        self.assertNotIn(";", fs.GPU_POOL_PODS_UNREAD_LIMITATION)
+        self.assertNotIn("Forbidden", entry["limitations"])
+        # The ledger's limitations cell is the tighter of the two places it is read; the chat card's line is 300.
+        self.assertLessEqual(len(fs.GPU_POOL_PODS_UNREAD_LIMITATION), audit_report.MAX_CELL_CHARS)
+
+    def test_the_pods_are_read_on_five_nodes_at_most_and_the_excerpt_says_how_many(self):
+        items = [node(f"gke-gpu-{i:02d}", "gpu") for i in range(12)] + [node("gke-web-1", "web")]
+        with patch.object(fs, "read_pods_on_nodes", return_value=([running_pod("web-1", "gke-gpu-00")], "")) as read:
+            entry = self.run_with(dump_items=items, pools=[self.UNTAINTED_GPU_POOL, self.PLAIN_POOL])
+        (call,) = read.call_args_list
+        self.assertEqual(call.args[0], [f"gke-gpu-{i:02d}" for i in range(fs.GPU_POOL_NODES_READ_MAX)])
+        (candidate,) = self.gpu_taint_candidates(entry)
+        self.assertIn("(nodes read: 5 of 12)", candidate["excerpt"])
+
+    def test_no_pod_is_read_for_a_pool_the_settings_clear(self):
+        """A tainted GPU pool, an opted-out one and a pool without GPUs cost no read."""
+        tainted = {**self.UNTAINTED_GPU_POOL, "name": "gpu-t", "config": {**self.UNTAINTED_GPU_POOL["config"], "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        opted_out = {**self.UNTAINTED_GPU_POOL, "name": "gpu-o", "config": {**self.UNTAINTED_GPU_POOL["config"], "labels": {fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE}}}
+        items = [node("gke-gpu-t-1", "gpu-t"), node("gke-gpu-o-1", "gpu-o"), node("gke-web-1", "web")]
+        with patch.object(fs, "read_pods_on_nodes", return_value=([], "")) as read:
+            entry = self.run_with(dump_items=items, pools=[tainted, opted_out, self.PLAIN_POOL])
+        read.assert_not_called()
+        self.assertEqual(self.gpu_taint_candidates(entry), [])
+
+    def test_an_untainted_gpu_pool_at_zero_nodes_is_the_configuration_grade(self):
+        entry = self.run_with(dump_items=[node("gke-web-1", "web")], pools=[self.UNTAINTED_GPU_POOL, self.PLAIN_POOL])
+        (candidate,) = self.gpu_taint_candidates(entry)
+        self.assertEqual(candidate["severity"], "minor")
+        self.assertIn("the pool has no node now", candidate["excerpt"])
+        self.assertNotIn("command", candidate)
+
+    def test_a_first_or_a_last_node_alone_does_not_change_what_the_digest_counts(self):
+        """A GPU pool that scales to zero crosses it often. With no pod that
+        requests no GPU on it, the finding differs between the two states
+        in its excerpt only, which the run's digest does not count; a
+        command of its own would move the digest at each crossing."""
+        pools = [self.UNTAINTED_GPU_POOL, self.PLAIN_POOL]
+        gpu_pod = running_pod("train", "gke-gpu-1", containers=[{"name": "c", "resources": {"limits": {"nvidia.com/gpu": "1"}}}])
+        (empty,) = self.gpu_taint_candidates(self.run_with(dump_items=[node("gke-web-1", "web")], pools=pools))
+        (in_use,) = self.gpu_taint_candidates(self.run_with(dump_items=[node("gke-gpu-1", "gpu"), node("gke-web-1", "web"), gpu_pod], pools=pools))
+        self.assertIn("no pod that requests no GPU runs on its nodes now (nodes read: 1 of 1", in_use["excerpt"])
+        self.assertNotIn("command", in_use)
+        counted_empty, counted_in_use = (
+            {key: value for key, value in candidate.items() if key not in manifest_delta.VOLATILE_CANDIDATE_KEYS} for candidate in (empty, in_use)
+        )
+        self.assertEqual(counted_empty, counted_in_use)
+
+    def test_a_gpu_pool_gke_tainted_or_a_cluster_of_gpu_pools_only_is_not_reported(self):
+        tainted = {**self.UNTAINTED_GPU_POOL, "config": {**self.UNTAINTED_GPU_POOL["config"], "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        for pools in ([tainted, self.PLAIN_POOL], [self.UNTAINTED_GPU_POOL]):
+            with self.subTest(pools=[p["name"] for p in pools]):
+                entry = self.run_with(pools=pools)
+                self.assertEqual(self.gpu_taint_candidates(entry), [])
+                self.assertIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
+
+    def test_a_gpu_pool_beside_tainted_pools_only_is_not_reported(self):
+        """A pod with no toleration has no other pool to run on, so the GPU
+        pool is the cluster's general pool."""
+        dedicated = {**self.PLAIN_POOL, "config": {**self.PLAIN_POOL["config"], "taints": [{"key": "dedicated", "value": "batch", "effect": "NO_SCHEDULE"}]}}
+        entry = self.run_with(pools=[self.UNTAINTED_GPU_POOL, dedicated])
+        self.assertEqual(self.gpu_taint_candidates(entry), [])
+
+    def test_autopilot_declares_the_gpu_taint_check_not_applicable(self):
+        entry = self.run_with(cluster={**self.CLUSTER, "autopilot": True})
+        declared = {e["check"]: e["reason"] for e in entry.get("checks_not_applicable") or []}
+        self.assertIn("Autopilot", declared[fs.GPU_POOL_MISSING_TAINT])
+        self.assertNotIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
+
+    def test_a_failed_pools_read_leaves_the_gpu_taint_check_unevaluated(self):
+        entry = self.run_with(pools_rc=1, pools_stderr="PERMISSION_DENIED on container.nodePools.list")
+        unevaluated = {e["check"]: e["reason"] for e in entry["checks_unevaluated"]}
+        self.assertIn("PERMISSION_DENIED", unevaluated[fs.GPU_POOL_MISSING_TAINT])
+        # The procedure tells the agent that the cluster's limitation names each such check.
+        self.assertIn(fs.GPU_POOL_MISSING_TAINT, fs.GPU_POOL_POOLS_UNREAD_CLAUSE)
+        self.assertIn(fs.GPU_POOL_POOLS_UNREAD_CLAUSE, entry["limitations"])
+        self.assertNotIn(fs.GPU_POOL_MISSING_TAINT, {c["check"] for c in entry["commands"]})
 
     def test_a_standard_cluster_with_no_pools_ran_the_check(self):
         """The other half of the same conflation: zero pools is an answer, and
@@ -2648,7 +2964,7 @@ class CollectClusterTest(unittest.TestCase):
         self.assertNotIn("spot-scarcity-risk", self.declared_not_applicable(entry))
         self.assertEqual(
             {e["check"] for e in entry["checks_unevaluated"]},
-            {"reservation-mismatch-risk", "single-zone-nodepool", "spot-scarcity-risk"},
+            {"reservation-mismatch-risk", "single-zone-nodepool", "spot-scarcity-risk", fs.GPU_POOL_MISSING_TAINT},
         )
         self.assertIn("spot-scarcity-risk read no Spot node pool", entry["limitations"])
 
@@ -4706,6 +5022,37 @@ class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
         self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
 
 
+class GpuPoolPodReadTest(unittest.TestCase):
+    """`read_pods_on_nodes` over the real paged read: one server-filtered read a node."""
+
+    def read(self, answers):
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            for node_name, answer in answers.items():
+                if f"spec.nodeName%3D{node_name}" in argv[-1]:
+                    return answer
+            raise AssertionError(f"an unexpected read was issued: {argv}")
+
+        with patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            return fs.read_pods_on_nodes(list(answers), run=run, env={}), issued
+
+    def test_each_node_is_one_paged_read_filtered_to_that_node(self):
+        page = lambda *names: run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": n}} for n in names]}))  # noqa: E731
+        (pods, why), issued = self.read({"n1": page("a", "b"), "n2": page("c")})
+        self.assertEqual(why, "")
+        self.assertEqual([p["metadata"]["name"] for p in pods], ["a", "b", "c"])
+        self.assertEqual([a[:3] for a in issued], [["kubectl", "get", "--raw"]] * 2)
+        self.assertEqual(issued[0][3], "/api/v1/pods?limit=500&fieldSelector=spec.nodeName%3Dn1")
+
+    def test_one_failed_read_fails_the_whole_read(self):
+        page = run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "a"}}]}))
+        (pods, why), _issued = self.read({"n1": page, "n2": run_of(1, "", "Error from server (Forbidden): pods is forbidden")})
+        self.assertIsNone(pods)
+        self.assertIn("rc=1", why)
+
+
 def manual_pool(name, machine_type, compute_class_label=None):
     labels = {fs.COMPUTE_CLASS_LABEL: compute_class_label} if compute_class_label else {}
     return {"name": name, "locations": ["us-central1-a", "us-central1-b"], "config": {"machineType": machine_type, "labels": labels}}
@@ -4998,6 +5345,579 @@ class UnbackedManualFallbackCollectTest(unittest.TestCase):
         ):
             text = f"{class_read}; {pools_read}"
             self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", self.SLUG))
+
+
+def capacity_buffer(
+    name,
+    namespace="serving",
+    *,
+    conditions=(),
+    strategy="buffer.x-k8s.io/active-capacity",
+    pod_template_ref="serving-buffer-template",
+    scalable_ref=None,
+    replicas=3,
+    status_replicas=None,
+    ready_replicas=None,
+    labels=None,
+    owner_references=None,
+):
+    metadata = {"name": name, "namespace": namespace}
+    if labels:
+        metadata["labels"] = labels
+    if owner_references:
+        metadata["ownerReferences"] = owner_references
+    spec = {}
+    if pod_template_ref is not None:
+        spec["podTemplateRef"] = {"name": pod_template_ref}
+    if scalable_ref is not None:
+        spec["scalableRef"] = scalable_ref
+    if replicas is not None:
+        spec["replicas"] = replicas
+    if strategy:
+        spec["provisioningStrategy"] = strategy
+    status = {}
+    if conditions is not None:
+        status["conditions"] = list(conditions)
+    if strategy:
+        status["provisioningStrategy"] = strategy
+    if status_replicas is not None:
+        status["replicas"] = status_replicas
+    if ready_replicas is not None:
+        status["readyReplicas"] = ready_replicas
+    return {
+        "apiVersion": "autoscaling.x-k8s.io/v1beta1",
+        "kind": "CapacityBuffer",
+        "metadata": metadata,
+        "spec": spec,
+        "status": status,
+    }
+
+
+class CapacityBufferNotReadyCheckTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 14, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_healthy_v1beta1_steady_state_provisioning_true_over_24h_is_clean(self):
+        """Upstream v1beta1 emits ReadyForProvisioning, LimitedByQuotas, and
+        Provisioning only; every healthy buffer stays Provisioning=True
+        (FakePodsInjected) with no Ready condition and no readyReplicas field
+        forever."""
+        old_ts = (self.NOW - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cb = capacity_buffer(
+            "healthy-v1beta1",
+            namespace="serving",
+            status_replicas=3,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok", "lastTransitionTime": old_ts},
+                {"type": "LimitedByQuotas", "status": "False", "reason": "ok", "lastTransitionTime": old_ts},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "message": "capacity buffer 3 fake pods injected",
+                    "lastTransitionTime": old_ts,
+                },
+            ],
+        )
+        self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_ready_for_provisioning_false_flags_major_with_verbatim_message(self):
+        message = 'Buffer not ready for provisioning: failed to resolve podTemplateRef "serving-buffer-template": not found'
+        cb = capacity_buffer(
+            "serving-buf",
+            namespace="serving",
+            conditions=[
+                {
+                    "type": "ReadyForProvisioning",
+                    "status": "False",
+                    "reason": "error",
+                    "message": message,
+                    "lastTransitionTime": "2026-10-14T11:59:50Z",
+                }
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "serving")
+        self.assertEqual(hit["object"], "CapacityBuffer/serving-buf")
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("ReadyForProvisioning=False (error): " + message, hit["excerpt"])
+        self.assertIn("provisioningStrategy=buffer.x-k8s.io/active-capacity", hit["excerpt"])
+        self.assertIn("podTemplateRef=serving-buffer-template", hit["excerpt"])
+
+    def test_ready_false_flags_critical_with_verbatim_message(self):
+        message = "Scale-up failed: ZONE_RESOURCE_POOL_EXHAUSTED in us-central1-a"
+        cb = capacity_buffer(
+            "gpu-buf",
+            namespace="inference",
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok"},
+                {"type": "Ready", "status": "False", "reason": "ScaleUpFailed", "message": message},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "inference")
+        self.assertEqual(hit["object"], "CapacityBuffer/gpu-buf")
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("Ready=False (ScaleUpFailed): " + message, hit["excerpt"])
+
+    def test_ready_false_and_ready_for_provisioning_false_both_appear_at_critical(self):
+        cb = capacity_buffer(
+            "broken-buf",
+            conditions=[
+                {"type": "Ready", "status": "False", "reason": "NotReady", "message": "buffer not ready"},
+                {"type": "ReadyForProvisioning", "status": "False", "reason": "error", "message": "missing limits"},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("buffer not ready", hit["excerpt"])
+        self.assertIn("missing limits", hit["excerpt"])
+
+    def test_limited_by_quotas_true_with_zero_replicas_flags_critical(self):
+        message = "Buffer replicas capped at 0 by namespace ResourceQuota ns-quota"
+        cb = capacity_buffer(
+            "quota-zero-buf",
+            namespace="payments",
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok"},
+                {"type": "LimitedByQuotas", "status": "True", "reason": "QuotaExceeded", "message": message},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "0 replicas"},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "payments")
+        self.assertEqual(hit["object"], "CapacityBuffer/quota-zero-buf")
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("LimitedByQuotas=True (QuotaExceeded): " + message, hit["excerpt"])
+        self.assertIn("(status.replicas=0)", hit["excerpt"])
+
+    def test_limited_by_quotas_true_partial_or_absent_replicas_flags_major(self):
+        message = "Buffer replicas reduced from 5 to 2 by namespace ResourceQuota"
+        for status_replicas in (2, None):
+            cb = capacity_buffer(
+                "quota-partial-buf",
+                namespace="payments",
+                replicas=5,
+                status_replicas=status_replicas,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "LimitedByQuotas", "status": "True", "reason": "QuotaExceeded", "message": message},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected"},
+                ],
+            )
+            with self.subTest(status_replicas=status_replicas):
+                hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["severity"], "major")
+                self.assertIn("LimitedByQuotas=True (QuotaExceeded): " + message, hit["excerpt"])
+                if status_replicas is not None:
+                    self.assertIn(f"(status.replicas={status_replicas})", hit["excerpt"])
+                else:
+                    self.assertNotIn("status.replicas=", hit["excerpt"])
+
+    def test_provisioning_false_failure_reasons_flag_major(self):
+        for reason, message in (
+            ("FailedToMakeFakePods", "cannot construct fake pod from template"),
+            ("FailedToGetPodTemplate", 'PodTemplate "serving-buffer-template" not found'),
+        ):
+            cb = capacity_buffer(
+                "prov-fail-buf",
+                namespace="serving",
+                status_replicas=0,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "LimitedByQuotas", "status": "False"},
+                    {"type": "Provisioning", "status": "False", "reason": reason, "message": message},
+                ],
+            )
+            with self.subTest(reason=reason):
+                hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["severity"], "major")
+                self.assertIn(f"Provisioning=False ({reason}): {message}", hit["excerpt"])
+
+    def test_provisioning_false_buffer_is_empty_on_fixed_nonzero_spec_flags_major(self):
+        cb = capacity_buffer(
+            "fixed-empty-buf",
+            namespace="serving",
+            replicas=3,
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "buffer has 0 replicas"},
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["severity"], "major")
+        self.assertIn("Provisioning=False (BufferIsEmpty): buffer has 0 replicas", hit["excerpt"])
+
+    def test_provisioning_false_benign_buffer_is_empty_is_clean(self):
+        zero_spec = capacity_buffer(
+            "scaled-zero-fixed",
+            replicas=0,
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "0 replicas"},
+            ],
+        )
+        dynamic_empty = capacity_buffer(
+            "scaled-zero-dynamic",
+            replicas=None,
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "serving-frontend"},
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty", "message": "0 replicas"},
+            ],
+        )
+        dynamic_no_quota_cond = capacity_buffer(
+            "scaled-zero-dynamic-no-quota-cond",
+            replicas=None,
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "serving-frontend"},
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty"},
+            ],
+        )
+        for cb in (zero_spec, dynamic_empty, dynamic_no_quota_cond):
+            with self.subTest(name=cb["metadata"]["name"]):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_ready_replicas_shortfall_past_grace_flags_critical_with_stable_excerpt(self):
+        # 15m01s = 901s past lastTransitionTime -> strictly past 900s grace window.
+        past_grace = (self.NOW - timedelta(seconds=fs.CAPACITY_BUFFER_PROVISIONING_GRACE_S + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cb = capacity_buffer(
+            "starved-buf",
+            namespace="payments",
+            status_replicas=3,
+            ready_replicas=1,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True", "reason": "ok"},
+                {"type": "LimitedByQuotas", "status": "False", "reason": "ok"},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "message": "capacity buffer 3 fake pods triggered scale-up",
+                    "lastTransitionTime": past_grace,
+                },
+            ],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["namespace"], "payments")
+        self.assertEqual(hit["object"], "CapacityBuffer/starved-buf")
+        self.assertEqual(hit["severity"], "critical")
+        self.assertIn("Provisioning=True (FakePodsInjected): capacity buffer 3 fake pods triggered scale-up", hit["excerpt"])
+        self.assertIn(f"since {past_grace} (past 15m grace)", hit["excerpt"])
+        self.assertIn("readyReplicas=1/3", hit["excerpt"])
+        # Stability invariant: running a day later against the unchanged object must
+        # emit the exact same excerpt so audit_report.carry_unchanged_findings holds.
+        hit_next_day = fs.check_capacity_buffer_not_ready(cb, now=self.NOW + timedelta(hours=24))
+        self.assertIsNotNone(hit_next_day)
+        self.assertEqual(hit_next_day["excerpt"], hit["excerpt"])
+
+    def test_ready_replicas_shortfall_within_grace_window_is_not_flagged(self):
+        for age_s in (0, 60, fs.CAPACITY_BUFFER_PROVISIONING_GRACE_S - 1, fs.CAPACITY_BUFFER_PROVISIONING_GRACE_S):
+            ts = (self.NOW - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            cb = capacity_buffer(
+                "fresh-buf",
+                status_replicas=3,
+                ready_replicas=0,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": ts},
+                ],
+            )
+            with self.subTest(age_s=age_s):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_ready_replicas_met_or_non_int_or_ready_true_is_healthy(self):
+        old_ts = (self.NOW - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        cases = [
+            capacity_buffer(
+                "fully-ready-replicas",
+                status_replicas=3,
+                ready_replicas=3,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                ],
+            ),
+            capacity_buffer(
+                "explicit-ready-true",
+                status_replicas=3,
+                ready_replicas=0,
+                conditions=[
+                    {"type": "ReadyForProvisioning", "status": "True"},
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                    {"type": "Ready", "status": "True", "reason": "Ready"},
+                ],
+            ),
+            capacity_buffer(
+                "bool-ready-replicas-ignored",
+                status_replicas=3,
+                ready_replicas=False,
+                conditions=[
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                ],
+            ),
+            capacity_buffer(
+                "string-ready-replicas-ignored",
+                status_replicas=3,
+                ready_replicas="1",
+                conditions=[
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": old_ts},
+                ],
+            ),
+        ]
+        for cb in cases:
+            with self.subTest(name=cb["metadata"]["name"]):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_nanosecond_and_offset_timestamps_parse_cleanly(self):
+        for ts in ("2026-10-14T11:30:00.123456789Z", "2026-10-14T13:30:00+02:00"):
+            cb = capacity_buffer(
+                "ts-buf",
+                status_replicas=3,
+                ready_replicas=0,
+                conditions=[
+                    {"type": "Provisioning", "status": "True", "reason": "FakePodsInjected", "lastTransitionTime": ts},
+                ],
+            )
+            with self.subTest(ts=ts):
+                hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit["severity"], "critical")
+
+    def test_missing_or_unparseable_transition_time_or_empty_status_is_not_flagged(self):
+        for cb in (
+            capacity_buffer("no-status", conditions=None),
+            capacity_buffer("empty-conds", conditions=[]),
+            capacity_buffer("no-ts", status_replicas=3, ready_replicas=0, conditions=[{"type": "Provisioning", "status": "True"}]),
+            capacity_buffer("bad-ts", status_replicas=3, ready_replicas=0, conditions=[{"type": "Provisioning", "status": "True", "lastTransitionTime": "not-a-time"}]),
+        ):
+            with self.subTest(name=cb["metadata"]["name"]):
+                self.assertIsNone(fs.check_capacity_buffer_not_ready(cb, now=self.NOW))
+
+    def test_scalable_ref_context_is_included(self):
+        cb = capacity_buffer(
+            "dyn-buf",
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "serving-frontend"},
+            replicas=None,
+            conditions=[{"type": "ReadyForProvisioning", "status": "False", "reason": "error", "message": "bad ref"}],
+        )
+        hit = fs.check_capacity_buffer_not_ready(cb, now=self.NOW)
+        self.assertIn("scalableRef=Deployment/serving-frontend", hit["excerpt"])
+
+    def test_the_procedure_carries_the_collector_s_impact_sentence(self):
+        sop = Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md"
+        section = sop.read_text().split(f"(`{fs.CAPACITY_BUFFER_CHECK}`)")[1]
+        impact_line = next(line for line in section.splitlines() if line.startswith("- **Impact:**"))
+        self.assertIn(fs.IMPACT[fs.CAPACITY_BUFFER_CHECK], impact_line)
+
+
+class CapacityBufferCollectTest(unittest.TestCase):
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    SLUG = fs.CAPACITY_BUFFER_CHECK
+
+    def test_served_crd_with_failing_buffers_records_command_and_candidates(self):
+        bad_config = capacity_buffer(
+            "bad-template",
+            namespace="team-a",
+            conditions=[
+                {
+                    "type": "ReadyForProvisioning",
+                    "status": "False",
+                    "reason": "error",
+                    "message": "Buffer not ready for provisioning: missing podTemplateRef",
+                }
+            ],
+        )
+        quota_blocked = capacity_buffer(
+            "quota-blocked",
+            namespace="team-b",
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "True", "reason": "QuotaExceeded", "message": "capped at 0"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty"},
+            ],
+        )
+        prov_failed = capacity_buffer(
+            "fake-pods-failed",
+            namespace="team-c",
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "FailedToMakeFakePods", "message": "pod template error"},
+            ],
+        )
+        shortfall = capacity_buffer(
+            "starved-headroom",
+            namespace="team-d",
+            status_replicas=3,
+            ready_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "lastTransitionTime": "2020-01-01T00:00:00Z",
+                },
+            ],
+        )
+        healthy_v1beta1 = capacity_buffer(
+            "healthy-v1beta1-buf",
+            namespace="team-a",
+            status_replicas=3,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {
+                    "type": "Provisioning",
+                    "status": "True",
+                    "reason": "FakePodsInjected",
+                    "lastTransitionTime": "2020-01-01T00:00:00Z",
+                },
+            ],
+        )
+        benign_dynamic_empty = capacity_buffer(
+            "idle-dynamic-buf",
+            namespace="team-a",
+            replicas=None,
+            pod_template_ref=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+            status_replicas=0,
+            conditions=[
+                {"type": "ReadyForProvisioning", "status": "True"},
+                {"type": "LimitedByQuotas", "status": "False"},
+                {"type": "Provisioning", "status": "False", "reason": "BufferIsEmpty"},
+            ],
+        )
+        entry = self.run_with(
+            capacity_buffers=[bad_config, quota_blocked, prov_failed, shortfall, healthy_v1beta1, benign_dynamic_empty]
+        )
+        self.assertEqual(entry["outcome"], "collected")
+        cb_cmds = [c for c in entry["commands"] if c["check"] == self.SLUG]
+        self.assertEqual(len(cb_cmds), 1)
+        self.assertIn(f"kubectl get {fs.CAPACITY_BUFFER_RESOURCE} -A {fs.KUBECTL_CHUNK_SIZE_ARG} -o json", cb_cmds[0]["command"])
+        filed = {c["object"]: c for c in entry["candidates"] if c["check"] == self.SLUG}
+        self.assertEqual(
+            set(filed),
+            {
+                "CapacityBuffer/bad-template",
+                "CapacityBuffer/quota-blocked",
+                "CapacityBuffer/fake-pods-failed",
+                "CapacityBuffer/starved-headroom",
+            },
+        )
+        self.assertEqual((filed["CapacityBuffer/bad-template"]["namespace"], filed["CapacityBuffer/bad-template"]["severity"]), ("team-a", "major"))
+        self.assertEqual((filed["CapacityBuffer/quota-blocked"]["namespace"], filed["CapacityBuffer/quota-blocked"]["severity"]), ("team-b", "critical"))
+        self.assertEqual((filed["CapacityBuffer/fake-pods-failed"]["namespace"], filed["CapacityBuffer/fake-pods-failed"]["severity"]), ("team-c", "major"))
+        self.assertEqual((filed["CapacityBuffer/starved-headroom"]["namespace"], filed["CapacityBuffer/starved-headroom"]["severity"]), ("team-d", "critical"))
+        for candidate in filed.values():
+            self.assertEqual(candidate["command"], cb_cmds[0]["command"])
+
+    def test_served_crd_with_no_buffers_records_check_as_run(self):
+        entry = self.run_with(capacity_buffers=[])
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIn(self.SLUG, {c["check"] for c in entry["commands"]})
+        self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_not_applicable", [])})
+        self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+
+    def test_standard_exclusions_apply_while_dynamic_buffers_are_checked(self):
+        cond = [{"type": "Ready", "status": "False", "reason": "Failed", "message": "stockout"}]
+        excluded = [
+            capacity_buffer("sys-buf", namespace="kube-system", conditions=cond),
+            capacity_buffer("addon-buf", labels={fs.ADDON_MANAGER_LABEL: "Reconcile"}, conditions=cond),
+            capacity_buffer("owned-buf", owner_references=[{"kind": "App", "name": "x"}], conditions=cond),
+            capacity_buffer("optout-buf", labels={fs.OPT_OUT_LABEL: fs.OPT_OUT_VALUE}, conditions=cond),
+            capacity_buffer("zero-buf", replicas=0, conditions=cond),
+        ]
+        dynamic = capacity_buffer(
+            "dynamic-buf",
+            namespace="prod",
+            replicas=None,
+            scalable_ref={"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+            conditions=cond,
+        )
+        entry = self.run_with(capacity_buffers=[*excluded, dynamic])
+        filed = [c["object"] for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual(filed, ["CapacityBuffer/dynamic-buf"])
+
+    def test_unserved_crd_maps_to_checks_not_applicable_without_failing_dump_gate(self):
+        for stderr in (
+            'error: the server doesn\'t have a resource type "capacitybuffers"',
+            'no matches for kind "CapacityBuffer" in version "autoscaling.x-k8s.io/v1beta1"',
+        ):
+            with self.subTest(stderr=stderr):
+                entry = self.run_with(capacity_buffers_rc=1, capacity_buffers_stderr=stderr)
+                self.assertEqual(entry["outcome"], "collected")
+                [reason] = [e["reason"] for e in entry.get("checks_not_applicable", []) if e["check"] == self.SLUG]
+                self.assertEqual(reason, fs.CAPACITY_BUFFER_NOT_APPLICABLE_REASON)
+                self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+                self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_unevaluated", [])})
+                # Other stockout checks still evaluated cleanly.
+                self.assertIn("ccc-missing-fallbacks", {c["check"] for c in entry["commands"]})
+
+    def test_read_failures_and_bad_json_map_to_checks_unevaluated(self):
+        cases = [
+            {"capacity_buffers_rc": 1, "capacity_buffers_stderr": "Error from server (Forbidden): cannot list resource"},
+            {"capacity_buffers_rc": fs.TIMEOUT_RC, "capacity_buffers_stderr": "the server doesn't have a resource type (timed out)"},
+            {"capacity_buffers_rc": 0, "capacity_buffers_stdout": ""},
+            {"capacity_buffers_rc": 0, "capacity_buffers_stdout": "{}"},
+            {"capacity_buffers_rc": 0, "capacity_buffers_stdout": "{truncated"},
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                entry = self.run_with(**kwargs)
+                self.assertEqual(entry["outcome"], "collected")
+                [reason] = [e["reason"] for e in entry.get("checks_unevaluated", []) if e["check"] == self.SLUG]
+                self.assertIn(fs.CAPACITY_BUFFER_RESOURCE, reason)
+                self.assertIn(self.SLUG, entry.get("limitations", ""))
+                self.assertNotIn(self.SLUG, {c["check"] for c in entry["commands"]})
+                self.assertNotIn(self.SLUG, {e["check"] for e in entry.get("checks_not_applicable", [])})
+
+    def test_typed_list_items_without_per_item_kind_are_evaluated(self):
+        item = capacity_buffer(
+            "typed-list-buf",
+            namespace="serving",
+            conditions=[{"type": "Ready", "status": "False", "reason": "InsufficientCapacity", "message": "zone out of stock"}],
+        )
+        del item["kind"]
+        other_kind = {
+            "kind": "ConfigMap",
+            "metadata": {"name": "not-a-buffer", "namespace": "serving"},
+            "status": {"conditions": [{"type": "Ready", "status": "False"}]},
+        }
+        entry = self.run_with(capacity_buffers=[item, other_kind])
+        filed = [c["object"] for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual(filed, ["CapacityBuffer/typed-list-buf"])
+
+    def test_command_stays_under_published_command_cap(self):
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        cb_argv = ["kubectl", "get", fs.CAPACITY_BUFFER_RESOURCE, "-A", fs.KUBECTL_CHUNK_SIZE_ARG, "-o", "json"]
+        text = f"KUBECONFIG={kubeconfig} {shlex.join(cb_argv)}"
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", self.SLUG))
 
 
 if __name__ == "__main__":

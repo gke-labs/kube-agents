@@ -512,7 +512,8 @@ normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positi
 # matches the binary's own default, because the value is the kind of thing an
 # operator tunes per install — a cluster with slow-starting workloads wants it
 # higher — and threading it through an env var means doing so does not require
-# rebuilding the image. Set to 1 to restore firing on the first event.
+# rebuilding the image. Set to 1, with WATCHER_SETTLE at 0, to restore firing
+# on the first event: the settle gate below runs after this count.
 readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
 WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
 normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}" positive
@@ -1172,7 +1173,7 @@ start_drift_detector() {
     echo "start-services: ALERT SESSION_KV_API_KEY is empty, so drift-detector cannot authenticate to the Session KV server and will exit on every start — NO out-of-band changes are being detected. Add the key to the agent Secret (upgrade.sh backfills it; the chart and the Terraform composition generate it on a fresh install) and restart the pod." >&2
   fi
 
-  # Built as an array because two of the flags have to be omitted rather than
+  # Built as an array because three of the flags have to be omitted rather than
   # passed empty, which a single backslash-continued command line cannot do.
   local detector_args=(
     --project="${DRIFT_DETECTOR_PROJECT_ID:-}"
@@ -1204,6 +1205,12 @@ start_drift_detector() {
   # it reads like a manager named "".
   if [[ -n "${DRIFT_DETECTOR_GITOPS_MANAGERS:-}" ]]; then
     detector_args+=(--gitops-managers="${DRIFT_DETECTOR_GITOPS_MANAGERS}")
+  fi
+
+  # Empty when the PlatformAgent carries no Helm release annotations (a
+  # kustomize or hand install); omitted for the reason above.
+  if [[ -n "${DRIFT_DETECTOR_OWN_RELEASE:-}" ]]; then
+    detector_args+=(--own-release="${DRIFT_DETECTOR_OWN_RELEASE}")
   fi
 
   # A bare flag rather than a value, so it is appended or omitted rather than

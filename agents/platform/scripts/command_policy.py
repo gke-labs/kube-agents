@@ -549,7 +549,7 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # else can stand in for them: reservations list is the committed
         # capacity, regions describe is the quota headroom, machine-types
         # list is what the region can actually place. Missing, the job runs,
-        # reports, and silently skips most of its thirteen checks -- a clean
+        # reports, and silently skips most of its fifteen checks -- a clean
         # capacity report the agent never gathered is worse than a failed one.
         ("compute", "machine-types", "list"),
         ("compute", "regions", "describe"),

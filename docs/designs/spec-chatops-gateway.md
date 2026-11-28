@@ -167,9 +167,10 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   "non-detached" below mean exactly this state and its absence.
   One stop cancels the conversation's whole task tree (amended for fan-out, #5682):
   the task holding the conversation, the AgentProfile parents waiting open on it,
-  and, walking down from the chain's root through each task's children, every
-  other task of the tree the gateway hasn't seen end, a fan-out's children
-  included. Each gets a cancel on its own addressee's `…in`, is marked canceled on
+  and, walking down from the chain's root through each task's children and
+  from each child to the wake its end started (a wake may delegate again,
+  #6861), every other task of the tree the gateway hasn't seen end, a fan-out's
+  children included. The walk also starts at the stopped task itself. Each gets a cancel on its own addressee's `…in`, is marked canceled on
   its history entry, and gets its `DISPATCH_STOPS` record when it is a
   profile task; a task that keeps its own line on its history entry (a batch child,
   a delegating turn) has it closed on "🛑 stopped". A task that has already ended is
@@ -620,8 +621,8 @@ by the `chat` profile's own deadline, and the executors it delegates to run to t
 two do not nest. When the session delegates, its turn completes with a reply that says so
 ("delegated to `platform`, task `t_…`"), the gateway relays the child's events into the
 thread as it does for any task, and the child's terminal wakes the session for one more turn
-with the child's result as its input, so the session can synthesize it (the wake can't delegate
-again; below). A follow-up
+with the child's result as its input, so the session can synthesize it (whether the wake may delegate
+again is the gateway's call; below). A follow-up
 the human sends while the child runs steers the child, through the gateway, as follow-ups do
 today: the platform executor queues each one and answers it after the current turn (on its
 `api` executor; the `cli` executor refuses it `no-resume`), and
@@ -733,14 +734,7 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
-`A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
-off by its adapter for each task whose authority block carries `via`, which only a wake's does
-and only the gateway can publish. A wake that could delegate read an interim answer such as "still
-checking, the results will post here" as a reason to ask again, and each ask woke another pod
-until the depth bound refused, with nothing answered. A message the person sends while the wake
-runs steers the wake like any other running turn, so it is answered without the tool as well. A
-question sent after the wake answers is a new human turn and has the tool.
+running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. Since #6861 a session wake may delegate again, within the depth bound. The gateway grants it only when the wake is in a session's chain and not below a schedule, its depth is under `A2A_DELEGATION_DEPTH_MAX`, and no Cluster Agent card report is still to come. The grant is `delegate: true` on the wake's `via`, which only the gateway can publish. A pod spawned for a granted wake gets the delegate tool, and a pod that serves every turn keeps it for that task. The granted wake's guide says not to delegate again for anything the result says is still running or will follow, only for a different next step, such as a change the result didn't make. Every other wake runs without the tool: a pod spawned for one gets `A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn turns it off for any task whose `via` lacks the grant. Its guide says it can't delegate on this turn, and the gateway refuses a delegation from it anyway (`delegation.wake`). A wake that could delegate on any interim answer such as "still checking, the results will post here" asked again, and each ask woke another pod until the depth bound refused, with nothing answered (#2819). A wake's delegations are held to the depth and width bounds like any turn's. A message the person sends while the wake runs steers the wake like any other running turn. A question sent after the wake answers is a new human turn and has the tool.
 
 **To a program behind a door, the chain is one task.** A caller through the A2A door (or the
 inject door) submitted one task, so the gateway tells the adapter's task observers about the chain
@@ -947,9 +941,8 @@ chain's end, delegated or not. A stop while the child runs cancels the child and
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
 `{"v":1,"taskId":…}` on `a2a.stop.<profile>.<task>` in the `DISPATCH_STOPS` stream, for the
 dispatcher, which has no read on `.in`. The gateway is the record's one writer, and a task
-addressed to platform or a session gets none. The stream and the dispatcher's reader aren't
-built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
-queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
+addressed to platform or a session gets none. The dispatcher ends a task it still holds queued
+when it finds the record. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
@@ -1042,7 +1035,7 @@ the capability check, its own consumer on its own `…in` subject for steering a
 deadline and its own terminal. The harness is started again for each task with
 `--resume <session id>`, the id the previous run reported, so the model has the conversation
 without a primer; the primer goes to the first harness run only. The delegate tool is decided per
-task as well: off for a wake (see "The wake" above). SIGTERM while the shim is idle exits 0 with
+task as well: off for a wake the gateway didn't let delegate again, on for one it did (see "The wake" above). SIGTERM while the shim is idle exits 0 with
 nothing published; mid-task it is that task's eviction, as before. A harness run that reports no
 session, or a task that ended without its terminal reaching the bus, ends the process instead of
 waiting for the next task: the pod reaches a terminal phase, Sweep closes what is owed, and the
@@ -2454,10 +2447,12 @@ by the operator upgrade that brings the arm: the broker is no longer handed the 
 gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
 not exit: the console is the mux's essential backend, so the Slack backend is contained and
 retried on a backoff, the pod stays Running and Ready, and Slack has no consumer until the
-Secret holds one workspace's token or Slack is turned off. Nothing in the CR's
-`.status` says why, since no `A2AGateway` condition is written for a gateway the arm called
-configured; the gateway pod's log carries the cause, and its events do for a missing Secret
-or key. Reading the Secret in the arm would catch it, at the cost of a
+Secret holds one workspace's token or Slack is turned off. No `A2AGateway` condition is written
+for a gateway the arm called configured, though after two consecutive five-minute usage polls
+reading `kubeagents_a2a_gateway_slack_connected` as `0` the usage poller surfaces the outage in
+`.status` as `SlackConnected=False` (`ConnectionFailed`) and `Degraded=True`
+(`SlackConnectionFailed`) without changing `Ready` or `phase`; the gateway pod's log carries the
+specific `invalid_auth` cause, and its events carry a missing Secret or key. Reading the Secret in the arm would catch it, at the cost of a
 Secret read on every pass and an arm that turns on Secret contents rather than the CR; the
 CR-only arm was kept and the limitation documented instead (2026-10-06). The installer
 checks the applies it makes (#2812). `install.sh`, its menu's apply and a full `upgrade.sh`
@@ -2872,8 +2867,8 @@ nothing out. A result recovered by replaying the stream after a restart arrives 
 `PostMessage` and `EditMessage` with the text and the chat message, beside the string `Post`
 and `Edit`. Discord, the inject door, the console and the A2A door answer
 `ErrTextOnly`, and the relay posts the text through `Post`, chunked under the cap, so each of
-them posts exactly what it posted before chat messages existed; Slack and Google Chat lay the
-message out ("Chat messages on Google Chat" under the Google Chat adapter). The relay never hands the
+them posts exactly what it posted before chat messages existed; Slack, Google Chat and Teams lay the
+message out ("Chat messages on Google Chat" under the Google Chat adapter, "Chat messages on Teams" under the Teams adapter), and Teams with its cards off answers `ErrTextOnly` too. The relay never hands the
 adapter a chat message without its text, and a backend that cannot hold one, or whose API
 refuses it, gets the text instead, once. Every carrier's `mark`, the terminal's included, is
 the gateway's to apply (`mark.go`): only from the chain's newest task, with the terminal
@@ -3269,7 +3264,9 @@ press is (`isChatTypedStop`), so a line never keeps a live button beside a poste
 
 An answer the relay marked for feedback carries its rating controls on the same card
 (`teams_feedback.go`; "Answer feedback" above), and Teams answers whole on the task's line, so
-`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. 👍 is an `Action.Submit`
+`answerOnLine` hands the adapter `OutMessage.Feedback` with the answer. A post the agent made on
+its own (an alert, kept through the triage that edits it, or a report) carries them under the
+id the notifier marked it with, and a press on one is recorded under that id. 👍 is an `Action.Submit`
 like Stop's. 👎 is an `Action.ShowCard`: it unfolds a form in the card on the presser's screen
 alone, with the note box, the kept-for line and a Send button, and Send is the press, carrying
 the note as an input beside the rating. Teams has neither Slack's modal, which needs an answer to the press that the queue cannot
@@ -3279,11 +3276,41 @@ gateway checks a sender (`FeedbackRecorder.Admits`), records the rating off the 
 redraws the card with "Feedback recorded. Thank you.", which names neither the rater nor the
 rating because the card is the conversation's; a card the line would push past the activity
 budget is not redrawn (`teamsFitsCard`), since it would go out as text without its controls.
-The form's kept-for line is drawn before any press, so it always names the question. It remembers a bounded number of rated messages
+The form's kept-for line is drawn before any press, so on an answer it always names the
+question; on an alert or a report it says only the post is kept. It remembers a bounded number of rated messages
 (`teamsRatedCap`) in memory; a press on an older one, or on one from before a restart, is
 recorded without the answer's text and without the redraw, and a re-rating that carries no
-answer keeps the answer already kept. Alerts and reports on Teams carry no controls: `rates` refuses a mark that
-names a post (`postKindOf`), so an alert its triage edits stays as it was.
+answer keeps the answer already kept. A triage edit of a rated alert draws it without the
+recorded line, which the next rating adds again.
+
+**Chat messages on Teams.** With cards on, a `kube-agents.chat/v1` message is laid out as the
+same Adaptive Card text takes (`teams_chat.go`): the renderer writes the message's blocks in the
+schema's order as the markdown the card builder reads (headline in bold with the note, detail,
+the plan with a status mark per item and a tick or an open mark per step, or the rows as
+bullets with the severity in bold, the `after` lines, and the fold drawn open with its table as
+the card's table), and puts the buttons under it: a choice as an `Action.Submit` whose data
+carries its reply, its index and its label, a link as an `Action.OpenUrl`, then the running
+line's Stop button and the rating controls. A row's Retry and Drop are not drawn. A home post
+goes through `PostNotifyMessage`, laid out the same way. A card that fits one activity only
+without the rating controls is posted without them. A
+layout that draws nothing, or whose activity would pass `teamsMaxActivityBytes`, is refused
+(`ErrLayoutRefused`) and the gateway posts the text; with cards off the adapter answers
+`ErrTextOnly` as before. The shared cases lay out as the golden files in
+`a2a/gateway/testdata/teams-chat/` say (`TestTeamsChatGolden`).
+
+A press of a choice (`teams_clicks.go`) arrives as the Stop press does and becomes the turn its
+reply spells, marked a click, from the presser, so the allowlist decides as for a typed
+message. Teams acknowledges a Submit with nothing and leaves the buttons pressable, so the
+adapter keeps the Google Chat adapter's bookkeeping: one press waits on the gateway's verdict
+at a time, the first verified answer stands (`InboundVerified`), and the card is edited to its
+text with `✓ name: choice` under it, its choices gone and its other buttons kept. A typed reply
+in the conversation of an open question answers it the same way, unless it is a command; a
+next step takes no typed reply. The line stays through a later edit that lays out no choices,
+and an edit that lays choices out asks anew. An update replaces the whole card and a press
+carries none of it, so a question the adapter no longer remembers (posted before a restart, or
+past its `uxCap` remembered cards) is answered by a post of the line in the conversation, named by
+the label the button carried, unless the button is a next step's, which answered no question; the same post follows an edit that fails or a card the line
+would push past the budget.
 
 While card work is open in a conversation with nothing on screen that shows it, the adapter
 keeps Teams's typing indicator on there (`teams_typing.go`): a `typing` activity posted through

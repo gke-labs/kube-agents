@@ -1036,6 +1036,519 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.assertTrue(self.second_chunk_released)
         self.assertIn(b"event: done\n", rest)
 
+    def test_scope_route_requires_external_api_key(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request)
+        self.assertEqual(401, raised.exception.code)
+        self.assertEqual("", self.received_authorization)
+
+    def test_scope_route_returns_empty_defaults_when_snapshot_is_missing_or_corrupt(self):
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+        self.assertEqual("", self.received_authorization)
+        self.assertEqual("", data["resolved_at"])
+        self.assertEqual([], data["projects"])
+        self.assertEqual([], data["profile_identities"])
+        self.assertFalse(data["event_watcher"]["enabled"])
+
+        snapshot_path = Path(self.workspace_dir.name) / "fleet_scope.json"
+        snapshot_path.write_text("{not valid json", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            with urllib.request.urlopen(request) as response:
+                corrupt_data = json.loads(response.read())
+        self.assertEqual([], corrupt_data["projects"])
+
+    def test_scope_route_reads_snapshot_profiles_and_event_watcher_metrics(self):
+        root = Path(self.workspace_dir.name)
+        (root / "fleet_scope.json").write_text(
+            json.dumps(
+                {
+                    "resolvedAt": "2026-11-26T06:00:00Z",
+                    "present": True,
+                    "boundary": True,
+                    "maxProjects": 100,
+                    "resolver": "explicit",
+                    "projects": [
+                        {
+                            "id": "proj-host",
+                            "via": ["management"],
+                            "outcome": "ok",
+                            "state": "in-scope",
+                            "clusters": 1,
+                        },
+                        {
+                            "id": "proj-denied",
+                            "via": ["explicit"],
+                            "outcome": "denied",
+                            "state": "in-scope",
+                            "clusters": None,
+                        },
+                    ],
+                    "containers": [],
+                    "profiles": {"cluster-proj-host-c1-us-central1": "proj-host"},
+                    "unmanaged": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prof_ready = root / "profiles" / "cluster-proj-host-c1-us-central1"
+        prof_ready.mkdir(parents=True)
+        (prof_ready / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_ready / "profile.yaml").write_text("name: cluster-proj-host-c1-us-central1\n", encoding="utf-8")
+        (prof_ready / "USER.md").write_text("# Cluster Agent Context\n", encoding="utf-8")
+
+        # Profile with USER.md but missing profile.yaml (not registered with Hermes) must report ready=False.
+        prof_unready = root / "profiles" / "cluster-proj-host-c2-us-east1"
+        prof_unready.mkdir(parents=True)
+        (prof_unready / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c2\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        (prof_unready / "USER.md").write_text("# Unregistered skeleton\n", encoding="utf-8")
+
+        # Broken profile still present on disk with unparseable config.yaml must count as 1 active error.
+        prof_broken = root / "profiles" / "cluster-proj-host-c3-broken"
+        prof_broken.mkdir(parents=True)
+        (prof_broken / "config.yaml").write_text(":::not valid yaml\n", encoding="utf-8")
+
+        # Reserved profiles (platform, default, tse) are ignored even if they have config.yaml.
+        prof_reserved = root / "profiles" / "platform"
+        prof_reserved.mkdir(parents=True)
+        (prof_reserved / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (prof_reserved / "profile.yaml").write_text("name: platform\n", encoding="utf-8")
+        (prof_reserved / "USER.md").write_text("# Platform\n", encoding="utf-8")
+
+        filler_series = "".join(
+            f'k8s_event_watcher_events_seen_total{{cluster="c1",reason="BackOff_{i:05d}"}} 1\n'
+            for i in range(18000)
+        )
+        metrics_body = (
+            # Stale error for c2 (already recovered and present in cluster_up) and c4 (removed from disk)
+            # must be filtered out; only c3-broken (still on disk and unwatched) counts as active.
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c2-us-east1"} 5\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c3-broken"} 3\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c4-removed"} 2\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-host-c1-us-central1"} 0\n'
+            'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-host"} 1\n'
+            'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-host"} 0\n'
+            + filler_series
+            + "# HELP k8s_event_watcher_watch_set_ready ready\n"
+            + "# TYPE k8s_event_watcher_watch_set_ready gauge\n"
+            + "k8s_event_watcher_watch_set_ready 1\n"
+        ).encode("utf-8")
+        self.assertGreater(len(metrics_body), credential_proxy.AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES)
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(metrics_body)))
+                self.end_headers()
+                self.wfile.write(metrics_body)
+
+            def log_message(self, _message, *_args):
+                return
+
+        metrics_srv = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        threading.Thread(target=metrics_srv.serve_forever, daemon=True).start()
+        self.addCleanup(metrics_srv.server_close)
+        self.addCleanup(metrics_srv.shutdown)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "EVENT_WATCHER_ENABLED": "true",
+                "EVENT_WATCHER_METRICS_PORT": str(metrics_srv.server_port),
+            },
+            clear=False,
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+
+        self.assertEqual("", self.received_authorization)
+        self.assertEqual("2026-11-26T06:00:00Z", data["resolved_at"])
+        self.assertTrue(data["present"])
+        self.assertTrue(data["boundary"])
+        self.assertEqual(2, len(data["projects"]))
+        self.assertEqual(
+            [
+                {
+                    "profile": "cluster-proj-host-c1-us-central1",
+                    "project": "proj-host",
+                    "cluster": "c1",
+                    "location": "us-central1",
+                    "ready": True,
+                },
+                {
+                    "profile": "cluster-proj-host-c2-us-east1",
+                    "project": "proj-host",
+                    "cluster": "c2",
+                    "location": "us-east1",
+                    "ready": False,
+                },
+            ],
+            data["profile_identities"],
+        )
+        watcher = data["event_watcher"]
+        self.assertTrue(watcher["enabled"])
+        self.assertTrue(watcher["reachable"])
+        self.assertTrue(watcher["watch_set_ready"])
+        self.assertEqual(1, watcher["clusters_up"])
+        self.assertEqual(2, watcher["clusters_total"])
+        self.assertEqual(1, watcher["discovery_errors"])
+
+    def test_parse_event_watcher_metrics_counts_distinct_error_profiles_across_ticks(self):
+        # Cumulative rescan counter increments for one broken profile must count as 1 affected profile, not 7.
+        single_profile_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 7\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 0\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        single = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(single_profile_text)
+        self.assertEqual(1, single["discovery_errors"])
+
+        # Multiple distinct profiles with multi-tick counts plus a duplicate sample line count distinct profiles only.
+        multi_profile_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 4\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 5\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-b-c2-us-west1"} 9\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-c-c3-europe-west1"} 0\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        multi = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(multi_profile_text)
+        self.assertEqual(2, multi["discovery_errors"])
+
+    def test_parse_event_watcher_metrics_filters_recovered_and_removed_profiles(self):
+        # Transient skip that recovered (profile now maps to a watched cluster) and a profile
+        # later removed from disk must both drop to 0, while genuinely failing profiles stay counted.
+        identities = [
+            {
+                "profile": "cluster-proj-a-recovered-us-central1",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+            {
+                "profile": "cluster-proj-a-still-denied-us-east1",
+                "project": "proj-a",
+                "cluster": "still-denied",
+                "location": "us-east1",
+                "ready": True,
+            },
+        ]
+        present = {
+            "cluster-proj-a-recovered-us-central1",
+            "cluster-proj-a-still-denied-us-east1",
+        }
+
+        # Recovered + removed only => 0 active discovery errors.
+        stale_only_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-us-central1"} 1\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-deleted-us-west1"} 4\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="-"} 1\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        stale_only = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            stale_only_text,
+            profile_identities=identities,
+            present_profiles=present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(0, stale_only["discovery_errors"])
+
+        # Genuinely failing profile (valid identity on disk, still absent from cluster_up) stays 1.
+        still_failing_text = (
+            stale_only_text
+            + 'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-still-denied-us-east1"} 3\n'
+        )
+        still_failing = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            still_failing_text,
+            profile_identities=identities,
+            present_profiles=present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, still_failing["discovery_errors"])
+
+        # Duplicate on-disk profile claiming an already-watched cluster remains counted as 1 active error
+        # (even if both profiles carry historical counter increments), and clears once the duplicate is removed.
+        dup_identities = [
+            *identities,
+            {
+                "profile": "cluster-proj-a-recovered-copy",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+        ]
+        dup_present = present | {"cluster-proj-a-recovered-copy"}
+        dup_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-us-central1"} 1\n'
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-recovered-copy"} 2\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        dup_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            dup_text,
+            profile_identities=dup_identities,
+            present_profiles=dup_present,
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, dup_res["discovery_errors"])
+
+        # Reserved "direct" profile directory is always refused by the watcher while present on disk.
+        direct_identities = [
+            {
+                "profile": "direct",
+                "project": "proj-a",
+                "cluster": "recovered",
+                "location": "us-central1",
+                "ready": True,
+            },
+        ]
+        direct_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="direct"} 2\n'
+            'k8s_event_watcher_cluster_up{cluster="recovered",location="us-central1",project="proj-a"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        direct_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            direct_text,
+            profile_identities=direct_identities,
+            present_profiles={"direct"},
+            profiles_dir_unreadable=False,
+        )
+        self.assertEqual(1, direct_res["discovery_errors"])
+
+        # Unreadable profiles directory preserves the NoProfile ("-") discovery error.
+        unreadable_text = (
+            'k8s_event_watcher_cluster_discovery_errors_total{profile="-"} 1\n'
+            "k8s_event_watcher_watch_set_ready 1\n"
+        )
+        unreadable_res = credential_proxy.AgentAPIProxyHandler._parse_event_watcher_metrics(
+            unreadable_text,
+            profile_identities=[],
+            present_profiles=set(),
+            profiles_dir_unreadable=True,
+        )
+        self.assertEqual(1, unreadable_res["discovery_errors"])
+
+    def test_scope_route_clears_recovered_and_removed_discovery_errors_end_to_end(self):
+        root = Path(self.workspace_dir.name)
+        profiles_dir = root / "profiles"
+
+        recovered = profiles_dir / "cluster-proj-a-c1-us-central1"
+        recovered.mkdir(parents=True)
+        (recovered / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-a\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (recovered / "profile.yaml").write_text("name: cluster-proj-a-c1-us-central1\n", encoding="utf-8")
+        (recovered / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        failing = profiles_dir / "cluster-proj-a-c2-us-east1"
+        failing.mkdir(parents=True)
+        (failing / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-a\n  cluster: c2\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        (failing / "profile.yaml").write_text("name: cluster-proj-a-c2-us-east1\n", encoding="utf-8")
+        (failing / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        # c1 transiently failed then recovered (cluster_up=1); c3 was removed from disk; c2 is still failing.
+        metrics_state = {
+            "body": (
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 1\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 2\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c3-removed"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-a"} 1\n'
+                "k8s_event_watcher_watch_set_ready 1\n"
+            ).encode("utf-8")
+        }
+
+        class MetricsHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = metrics_state["body"]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _message, *_args):
+                return
+
+        metrics_srv = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+        threading.Thread(target=metrics_srv.serve_forever, daemon=True).start()
+        self.addCleanup(metrics_srv.server_close)
+        self.addCleanup(metrics_srv.shutdown)
+
+        env = {
+            "EVENT_WATCHER_ENABLED": "true",
+            "EVENT_WATCHER_METRICS_PORT": str(metrics_srv.server_port),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                first = json.loads(resp.read())
+            self.assertEqual(1, first["event_watcher"]["discovery_errors"])
+
+            # Once c2 also recovers (now in cluster_up) while all cumulative counters stay >= 1,
+            # /api/scope reports 0 active discovery errors without a watcher pod restart.
+            metrics_state["body"] = (
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c1-us-central1"} 1\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c2-us-east1"} 2\n'
+                'k8s_event_watcher_cluster_discovery_errors_total{profile="cluster-proj-a-c3-removed"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c1",location="us-central1",project="proj-a"} 1\n'
+                'k8s_event_watcher_cluster_up{cluster="c2",location="us-east1",project="proj-a"} 1\n'
+                "k8s_event_watcher_watch_set_ready 1\n"
+            ).encode("utf-8")
+            with urllib.request.urlopen(req) as resp:
+                second = json.loads(resp.read())
+            self.assertEqual(0, second["event_watcher"]["discovery_errors"])
+
+    def test_scope_route_skips_unreadable_profile_and_coerces_bool_max_projects(self):
+        root = Path(self.workspace_dir.name)
+        (root / "fleet_scope.json").write_text(
+            json.dumps(
+                {
+                    "resolvedAt": "2026-11-26T06:00:00Z",
+                    "present": True,
+                    "boundary": True,
+                    "maxProjects": True,
+                    "projects": [{"id": "proj-host", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        good = root / "profiles" / "cluster-proj-host-good-us-central1"
+        good.mkdir(parents=True)
+        (good / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-host\n  cluster: good\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (good / "profile.yaml").write_text("name: cluster-proj-host-good-us-central1\n", encoding="utf-8")
+        (good / "USER.md").write_text("# Cluster Agent\n", encoding="utf-8")
+
+        blocked = root / "profiles" / "cluster-proj-host-blocked-us-east1"
+        blocked.mkdir(parents=True)
+        blocked_cfg = blocked / "config.yaml"
+        blocked_cfg.write_text("cluster_identity:\n  project: proj-host\n", encoding="utf-8")
+
+        orig_is_file = Path.is_file
+
+        def flaky_is_file(self_path):
+            if self_path == blocked_cfg:
+                raise PermissionError("simulated EACCES on profile directory")
+            return orig_is_file(self_path)
+
+        with (
+            mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False),
+            mock.patch.object(Path, "is_file", flaky_is_file),
+        ):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                data = json.loads(response.read())
+
+        self.assertEqual(0, data["max_projects"])
+        self.assertEqual(["cluster-proj-host-good-us-central1"], [p["profile"] for p in data["profile_identities"]])
+
+    def test_parse_cluster_identity_caches_by_stat_and_invalidates_on_change(self):
+        import yaml
+
+        root = Path(self.workspace_dir.name)
+        cfg = root / "cached-config.yaml"
+        cfg.write_text(
+            "cluster_identity:\n  project: proj-cache\n  cluster: c1\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        with credential_proxy._PROFILE_IDENTITY_CACHE_LOCK:
+            credential_proxy._PROFILE_IDENTITY_CACHE.clear()
+
+        with mock.patch.object(yaml, "load", wraps=yaml.load) as spy_load:
+            first = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            second = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            self.assertEqual({"project": "proj-cache", "cluster": "c1", "location": "us-central1"}, first)
+            self.assertEqual(first, second)
+            self.assertEqual(1, spy_load.call_count)
+
+            # Mutating content (size/mtime change) must invalidate the cache entry.
+            cfg.write_text(
+                "cluster_identity:\n  project: proj-cache\n  cluster: c1-updated\n  location: europe-west1\n",
+                encoding="utf-8",
+            )
+            third = credential_proxy.AgentAPIProxyHandler._parse_cluster_identity(cfg, yaml)
+            self.assertEqual({"project": "proj-cache", "cluster": "c1-updated", "location": "europe-west1"}, third)
+            self.assertEqual(2, spy_load.call_count)
+
+    def test_scope_route_skips_non_utf8_and_symlink_escape_profile_configs(self):
+        root = Path(self.workspace_dir.name)
+        profiles_dir = root / "profiles"
+
+        good_dir = profiles_dir / "cluster-proj-good-us-central1"
+        good_dir.mkdir(parents=True)
+        (good_dir / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-good\n  cluster: good\n  location: us-central1\n",
+            encoding="utf-8",
+        )
+        (good_dir / "profile.yaml").write_text("name: good\n", encoding="utf-8")
+        (good_dir / "USER.md").write_text("# user\n", encoding="utf-8")
+
+        # Invalid UTF-8 bytes must be skipped rather than crashing GET /api/scope.
+        bad_utf8_dir = profiles_dir / "cluster-proj-bad-utf8-us-central1"
+        bad_utf8_dir.mkdir(parents=True)
+        (bad_utf8_dir / "config.yaml").write_bytes(b"\xff\xfe\x00invalid-utf8")
+
+        # Symlink escaping profiles_dir must be ignored by containment guard.
+        outside_file = root / "outside-config.yaml"
+        outside_file.write_text(
+            "cluster_identity:\n  project: proj-outside\n  cluster: leaked\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        escape_dir = profiles_dir / "cluster-proj-escape-us-east1"
+        escape_dir.mkdir(parents=True)
+        (escape_dir / "config.yaml").symlink_to(outside_file)
+
+        with mock.patch.dict(os.environ, {"EVENT_WATCHER_ENABLED": "false"}, clear=False):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{self.proxy.server_port}/api/scope",
+                headers={"Authorization": "Bearer external-secret"},
+            )
+            with urllib.request.urlopen(request) as response:
+                self.assertEqual(200, response.status)
+                data = json.loads(response.read())
+
+        self.assertEqual(
+            ["cluster-proj-good-us-central1"],
+            [p["profile"] for p in data["profile_identities"]],
+        )
+
 
 class PolicyTest(unittest.TestCase):
     def setUp(self):
@@ -4208,6 +4721,240 @@ class ExecRouteTruncationReplyTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual((0, False, False), (body["exitCode"], body["truncated"], body["stdoutTruncated"]))
         self.assertEqual((len("pods\n"), 4096), (body["bytesWritten"], body["limit"]))
+
+
+# Synthetic tokens of shapes credential_shapes redacts, for the exec output tests.
+_REDACT_GITHUB_TOKEN = "ghp_SyntheticExecOutput0123456789abcdefGH"
+_REDACT_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMtZXhlYyJ9.c3ludGhldGljLWV4ZWMtc2ln"
+# The fragment length no part of a redacted token may survive at.
+_REDACT_FRAGMENT_CHARS = 8
+# The cap the exec output tests run under, small enough to cut cheaply.
+_REDACT_OUTPUT_CAP = 4096
+
+
+def _fragments(token):
+    return {token[start:start + _REDACT_FRAGMENT_CHARS] for start in range(len(token) - _REDACT_FRAGMENT_CHARS + 1)}
+
+
+class ExecOutputRedactionTest(unittest.TestCase):
+    """A session caller's exec output loses its credential shapes; the shell's is as captured.
+
+    A real CommandExecutor runs a stub kubectl, so the capture, the cap and the
+    decoding are the broker's own and only the redaction is under test.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=_REDACT_OUTPUT_CAP,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        # Both roles run kubectl here, so one stub serves the comparison.
+        roles = mock.patch.dict(
+            credential_proxy.ROLE_EXECUTABLES,
+            {
+                credential_proxy.CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
+                credential_proxy.CALLER_ROLE_SHELL: frozenset({"kubectl", "gcloud"}),
+            },
+        )
+        roles.start()
+        self.addCleanup(roles.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def kubectl_that(self, body):
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+
+    def post_as(self, role):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-a2a-session", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps({"argv": ["kubectl", "get", "configmap", "app"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+
+    def test_a_session_callers_stdout_and_stderr_are_redacted(self):
+        self.kubectl_that(
+            f"printf 'data:\\n  token: {_REDACT_GITHUB_TOKEN}\\n  id: {_REDACT_JWT}\\n'; "
+            f"printf 'warning: {_REDACT_GITHUB_TOKEN}\\n' >&2"
+        )
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(200, status, body)
+        self.assertEqual("data:\n  token: [REDACTED]\n  id: [REDACTED]\n", body["stdout"])
+        self.assertEqual("warning: [REDACTED]\n", body["stderr"])
+        # The log says how many, never what.
+        self.assertTrue(any("command output redacted" in line and "shapes=3" in line for line in logs.output), logs.output)
+        for token in (_REDACT_GITHUB_TOKEN, _REDACT_JWT):
+            self.assertFalse(any(token in line for line in logs.output), logs.output)
+
+    def test_the_shells_output_is_returned_as_captured(self):
+        self.kubectl_that(f"printf 'token: {_REDACT_GITHUB_TOKEN}\\n'; printf '{_REDACT_JWT}' >&2")
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        self.assertEqual(200, status, body)
+        self.assertEqual(f"token: {_REDACT_GITHUB_TOKEN}\n", body["stdout"])
+        self.assertEqual(_REDACT_JWT, body["stderr"])
+
+    def test_the_exit_code_and_the_reply_shape_are_kept(self):
+        self.kubectl_that(f"printf '{_REDACT_GITHUB_TOKEN}\\n'; exit 3")
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        _, session = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((3, 3), (shell["exitCode"], session["exitCode"]))
+        self.assertEqual(sorted(shell), sorted(session))
+        # bytesWritten counts the command's own bytes, not the redacted text.
+        self.assertEqual(shell["bytesWritten"], session["bytesWritten"])
+        self.assertEqual("[REDACTED]\n", session["stdout"])
+
+    def test_a_token_the_cap_cuts_leaves_no_prefix_behind(self):
+        # The cap is applied as the command writes, so the bytes past it are
+        # never held and the redaction is carried across the cut instead: at
+        # every length the cap can leave of a token, nothing of it as long as
+        # a fragment survives.
+        for token in (_REDACT_GITHUB_TOKEN, _REDACT_JWT):
+            for kept in (_REDACT_FRAGMENT_CHARS, 12, 19, 30, len(token) - 1):
+                filler = _REDACT_OUTPUT_CAP - kept - 1
+                with self.subTest(token=token[:4], kept=kept):
+                    self.kubectl_that(
+                        f"head -c {filler} /dev/zero | tr '\\0' a; printf ' {token}\\n'; "
+                        f"head -c {filler} /dev/zero | tr '\\0' e >&2; printf ' {token}\\n' >&2"
+                    )
+                    _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+                    self.assertTrue(shell["stdout"].endswith(" " + token[:kept]), shell["stdout"][-40:])
+                    _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+                    self.assertEqual((True, True), (body["truncated"], body["stdoutTruncated"]))
+                    self.assertEqual(_REDACT_OUTPUT_CAP, body["bytesWritten"])
+                    for stream in ("stdout", "stderr"):
+                        self.assertTrue(body[stream].endswith(" [REDACTED]"), body[stream][-40:])
+                        self.assertEqual([], sorted(f for f in _fragments(token) if f in body[stream]))
+
+    def assert_cut_tokens_redacted(self, body, kept):
+        # A command killed mid-write ends mid-token, as a capped one does: the
+        # prefix left is shorter than the shape and must not pass.
+        prefix = _REDACT_GITHUB_TOKEN[:kept]
+        for stream in ("stdout", "stderr"):
+            self.assertNotIn(prefix, body[stream], body[stream][-120:])
+        self.assertTrue(body["stdout"].endswith("token: [REDACTED]"), body["stdout"][-40:])
+        self.assertTrue(body["stderr"].startswith("warning: [REDACTED]"), body["stderr"][:80])
+
+    def test_a_token_a_timeout_cuts_leaves_no_prefix_behind(self):
+        kept = 12
+        CredentialProxyHandler.executor.timeout_seconds = 1
+        self.kubectl_that(
+            f"printf 'token: {_REDACT_GITHUB_TOKEN[:kept]}'; printf 'warning: {_REDACT_GITHUB_TOKEN[:kept]}' >&2; "
+            "exec sleep 30"
+        )
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        self.assertTrue(shell["timedOut"], shell)
+        self.assertTrue(shell["stdout"].endswith(_REDACT_GITHUB_TOKEN[:kept]), shell["stdout"][-40:])
+        _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((True, 124), (body["timedOut"], body["exitCode"]), body)
+        self.assert_cut_tokens_redacted(body, kept)
+        # The broker's timeout note comes after the cut and is kept whole.
+        self.assertIn("[credential-proxy] kubectl command timed out", body["stderr"])
+
+    def test_a_token_a_drain_stop_cuts_leaves_no_prefix_behind(self):
+        kept = 12
+        executor = CredentialProxyHandler.executor
+        self.kubectl_that(
+            f"printf 'token: {_REDACT_GITHUB_TOKEN[:kept]}'; printf 'warning: {_REDACT_GITHUB_TOKEN[:kept]}' >&2; "
+            "exec sleep 30"
+        )
+        timer = threading.Timer(1.0, executor.end_commands.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        _, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, body["exitCode"], body)
+        self.assert_cut_tokens_redacted(body, kept)
+        self.assertIn(credential_proxy.DRAINED_COMMAND_NOTE, body["stderr"])
+
+    def test_output_that_is_not_utf8_keeps_its_decoding_and_is_redacted(self):
+        self.kubectl_that(f"printf '\\xff\\xfe token {_REDACT_GITHUB_TOKEN}\\n'")
+        _, shell = self.post_as(credential_proxy.CALLER_ROLE_SHELL)
+        _, session = self.post_as(credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(f"\ufffd\ufffd token {_REDACT_GITHUB_TOKEN}\n", shell["stdout"])
+        self.assertEqual("\ufffd\ufffd token [REDACTED]\n", session["stdout"])
+        self.assertEqual(0, session["exitCode"])
+
+
+class ExecResponseRedactionTest(unittest.TestCase):
+    """`exec_response` and `redact_tool_output`, without a command behind them."""
+
+    def result(self, **fields):
+        values = dict(exit_code=0, stdout="", stderr="", duration_ms=1, truncated=False, timed_out=False)
+        values.update(fields)
+        return credential_proxy.ExecutionResult(**values)
+
+    def test_the_redacted_roles_are_the_profile_and_the_session(self):
+        self.assertEqual(
+            frozenset({credential_proxy.CALLER_ROLE_PROFILE, credential_proxy.CALLER_ROLE_SESSION}),
+            credential_proxy.REDACTED_OUTPUT_ROLES,
+        )
+
+    def test_a_stderr_cut_is_redacted_across_before_the_brokers_note(self):
+        # A kubectl timeout appends its note after the bound, so the cut sits
+        # inside stderr, not at its end.
+        cut = "error from server: " + _REDACT_GITHUB_TOKEN[:15]
+        note = "\n[credential-proxy] kubectl command timed out after 5s (ambient cluster target)\n"
+        result = self.result(exit_code=124, stderr=cut + note, truncated=True, stderr_cut_at=len(cut), timed_out=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertEqual("error from server: [REDACTED]" + note, response["stderr"])
+        self.assertEqual((1, 124, True), (redacted, response["exitCode"], response["timedOut"]))
+        shell, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_SHELL)
+        self.assertEqual((cut + note, 0), (shell["stderr"], redacted))
+
+    def test_a_timed_out_stdout_is_redacted_across_its_end(self):
+        # A timeout kills the command mid-write: its stdout's end is a cut even
+        # when the cap was not reached and no explicit offset was recorded.
+        cut = "token: " + _REDACT_GITHUB_TOKEN[:12]
+        result = self.result(exit_code=124, stdout=cut, timed_out=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual(("token: [REDACTED]", 1), (response["stdout"], redacted))
+        explicit = self.result(exit_code=124, stdout=cut, timed_out=True, stdout_cut_at=len(cut))
+        self.assertEqual("token: [REDACTED]", credential_proxy.exec_response(explicit, credential_proxy.CALLER_ROLE_SESSION)[0]["stdout"])
+
+    def test_a_private_key_the_cap_cut_goes_from_its_begin_line_to_the_cut(self):
+        # The cut took its END line; the key body past the 16 KiB span goes too.
+        cut = "tls.key: -----BEGIN PRIVATE KEY-----\n" + "MIIEsyntheticCutKeyBody0123\n" * 1000
+        result = self.result(stdout=cut, truncated=True, stdout_truncated=True)
+        response, redacted = credential_proxy.exec_response(result, credential_proxy.CALLER_ROLE_PROFILE)
+        self.assertEqual(("tls.key: [REDACTED]", 1), (response["stdout"], redacted))
+
+    def test_an_uncut_stream_keeps_a_short_shape_lookalike_at_its_end(self):
+        # The cut-tail pass runs only where the cap cut: a whole output ending
+        # in `sk-short` is not a token cut short.
+        text = "flag: sk-short"
+        response, redacted = credential_proxy.exec_response(self.result(stdout=text), credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((text, 0), (response["stdout"], redacted))
+
+    def test_the_reply_keys_are_the_same_for_every_role(self):
+        result = self.result(stdout="ok", kubeconfig="apiVersion: v1\n")
+        keys = {
+            role: sorted(credential_proxy.exec_response(result, role)[0])
+            for role in (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE,
+                         credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_SCOPE)
+        }
+        self.assertEqual(1, len({tuple(value) for value in keys.values()}), keys)
 
 
 class ExecRouteCapacityTest(unittest.TestCase):
@@ -10766,6 +11513,109 @@ class GoogleChatRelayTest(unittest.TestCase):
         )
         self.assertIn("type=RuntimeError status=none", "\n".join(captured["logs"]))
 
+    def _init_relay_with_mock_google_modules(self, service_account_email: str = ""):
+        ambient_creds = object()
+        impersonated_creds = object()
+        impersonate_calls = []
+        subscriber_calls = []
+        build_calls = []
+
+        class FakeSubscriberClient:
+            def __init__(self, credentials=None):
+                subscriber_calls.append(credentials)
+
+            def subscription_path(self, project_id, subscription_name):
+                return f"projects/{project_id}/subscriptions/{subscription_name}"
+
+        def fake_impersonated_credentials(**kwargs):
+            impersonate_calls.append(kwargs)
+            return impersonated_creds
+
+        def fake_build(service, version, credentials=None, cache_discovery=None):
+            build_calls.append((service, version, credentials, cache_discovery))
+            return "chat-discovery-client"
+
+        google_pkg = types.ModuleType("google")
+        google_auth = types.ModuleType("google.auth")
+        google_auth.default = lambda scopes=None: (ambient_creds, "ambient-proj")
+        google_impersonated = types.ModuleType("google.auth.impersonated_credentials")
+        google_impersonated.Credentials = fake_impersonated_credentials
+        google_auth.impersonated_credentials = google_impersonated
+        google_cloud = types.ModuleType("google.cloud")
+        google_pubsub = types.ModuleType("google.cloud.pubsub_v1")
+        google_pubsub.SubscriberClient = FakeSubscriberClient
+        google_cloud.pubsub_v1 = google_pubsub
+        google_pkg.auth = google_auth
+        google_pkg.cloud = google_cloud
+        googleapiclient_pkg = types.ModuleType("googleapiclient")
+        googleapiclient_discovery = types.ModuleType("googleapiclient.discovery")
+        googleapiclient_discovery.build = fake_build
+        googleapiclient_pkg.discovery = googleapiclient_discovery
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "google": google_pkg,
+                "google.auth": google_auth,
+                "google.auth.impersonated_credentials": google_impersonated,
+                "google.cloud": google_cloud,
+                "google.cloud.pubsub_v1": google_pubsub,
+                "googleapiclient": googleapiclient_pkg,
+                "googleapiclient.discovery": googleapiclient_discovery,
+            },
+        ):
+            relay = GoogleChatRelay(
+                "workspace-chat-proj",
+                "platform-agent-chat-events-sub",
+                service_account_email=service_account_email,
+            )
+        return (
+            relay,
+            ambient_creds,
+            impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        )
+
+    def test_init_without_service_account_uses_ambient_credentials(self):
+        (
+            relay,
+            ambient_creds,
+            _impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        ) = self._init_relay_with_mock_google_modules()
+        self.assertEqual([], impersonate_calls)
+        self.assertEqual([ambient_creds], subscriber_calls)
+        self.assertEqual([("chat", "v1", ambient_creds, False)], build_calls)
+        self.assertIs(ambient_creds, relay._credentials)
+
+    def test_init_with_service_account_wraps_ambient_credentials_in_impersonated_credentials(self):
+        target_sa = "kubeagents-chat-gsa@workspace-chat-proj.iam.gserviceaccount.com"
+        (
+            relay,
+            ambient_creds,
+            impersonated_creds,
+            impersonate_calls,
+            subscriber_calls,
+            build_calls,
+        ) = self._init_relay_with_mock_google_modules(service_account_email=f"  {target_sa}  ")
+        self.assertEqual(
+            [
+                {
+                    "source_credentials": ambient_creds,
+                    "target_principal": target_sa,
+                    "target_scopes": list(GoogleChatRelay.SCOPES),
+                }
+            ],
+            impersonate_calls,
+        )
+        self.assertEqual([impersonated_creds], subscriber_calls)
+        self.assertEqual([("chat", "v1", impersonated_creds, False)], build_calls)
+        self.assertIs(impersonated_creds, relay._credentials)
+
 
 class ChatEventPullLegibilityTest(unittest.TestCase):
     """A Chat event pull says which subscription it reads and what refused it.
@@ -16221,6 +17071,19 @@ class MCPVcsVerbGateTest(unittest.TestCase):
         self.assertEqual("REPOSITORY_NOT_MANAGED", payload["code"])
         route.assert_not_called()
 
+    def test_proposal_view_for_mcp_is_redacted(self):
+        # The A2A MCP server answers clients outside the cluster, whose model
+        # reads the proposal's text as the install's forge credential fetched it.
+        token_shape = "ghp_SyntheticMcpProposalView0123456789ab"
+        route = mock.Mock(return_value={"body": f"rotated {token_shape}", "number": 7})
+        handler = self._handler("proposal-view", credential_proxy.CALLER_ROLE_MCP)
+        with mock.patch.object(
+            credential_proxy.vcs_broker, "route_table", return_value={"proposal-view": route}
+        ), mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            handler._handle_vcs_post()
+        self.assertEqual((HTTPStatus.OK, {"body": "rotated [REDACTED]", "number": 7}), handler.replies[0])
+        self.assertIn(credential_proxy.CALLER_ROLE_MCP, credential_proxy.REDACTED_VCS_READ_ROLES)
+
     def test_curator_reaches_snapshot_only_on_a_managed_repository(self):
         route = mock.Mock(return_value={"archiveBase64": ""})
         handler = self._handler("snapshot", credential_proxy.CALLER_ROLE_CURATOR, {"repository": "acme/infra", "paths": ["knowledge"]})
@@ -19950,6 +20813,36 @@ class SweepTransportTest(unittest.TestCase):
 
         return Opener(*answers)
 
+    def test_a_failed_sweep_mint_reads_as_no_credential_and_never_reaches_the_forge(self):
+        """The readings sweep reports the cause by this code: `unauthorized`, not a fault of the forge's."""
+        import vcs_readings
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        for failure in (RuntimeError("sweep credential mint failed"), TimeoutError("sweep credential mint timed out")):
+            with self.subTest(failure=type(failure).__name__):
+                executor = _SweepExecutor()
+                executor.mint_sweep_credential = mock.Mock(side_effect=failure)
+                opener = self._opener({"items": []})
+                transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=opener)
+                with self.assertRaises(providers.WorkspaceError) as raised:
+                    transport.api("GET", "search/issues")
+                self.assertEqual("FORGE_CREDENTIAL_UNAVAILABLE", raised.exception.fields.get("code"))
+                self.assertIs(failure, raised.exception.__cause__)
+                self.assertEqual([], opener.requests, "the forge is not asked without a token")
+                self.assertEqual("unauthorized", vcs_readings.connection_state(raised.exception))
+                self.assertNotIn(str(failure), str(raised.exception), "the helper's text stays out of the refusal")
+
+    def test_a_repository_that_is_not_managed_keeps_its_own_refusal(self):
+        import vcs_readings
+
+        forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        executor = _SweepExecutor()
+        executor.mint_sweep_credential = mock.Mock(side_effect=PermissionError("acme/gitops is not a repository this install manages"))
+        transport = credential_proxy.sweep_transport_for(executor, forge, "acme/gitops", opener=self._opener({"items": []}))
+        with self.assertRaises(PermissionError) as raised:
+            transport.api("GET", "search/issues")
+        self.assertEqual("unauthorized", vcs_readings.connection_state(raised.exception))
+
     def test_github_com_gets_an_http_transport_at_api_github_com(self):
         forge = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
         executor = _SweepExecutor()
@@ -23444,6 +24337,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
             "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
             "WATCHER_PUBSUB_SUBSCRIPTION": "projects/p/subscriptions/drift",
             "GOOGLE_CHAT_PROJECT_ID": "p",
+            "GOOGLE_CHAT_SERVICE_ACCOUNT": "kubeagents-chat-gsa@p.iam.gserviceaccount.com",
             "GOOGLE_CHAT_SUBSCRIPTION_NAME": "chat",
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "a2a-chat",
             "SLACK_BOT_TOKEN": "xoxb-test",
@@ -23488,6 +24382,20 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
     def test_the_stateful_broker_starts_them(self):
         relays, pubsub, metrics_listener, thread_targets = self._serve("broker")
         self.assertEqual(2, relays["GoogleChatRelay"].call_count)
+        relays["GoogleChatRelay"].assert_has_calls(
+            [
+                mock.call(
+                    "p",
+                    "chat",
+                    service_account_email="kubeagents-chat-gsa@p.iam.gserviceaccount.com",
+                ),
+                mock.call(
+                    "p",
+                    "a2a-chat",
+                    service_account_email="kubeagents-chat-gsa@p.iam.gserviceaccount.com",
+                ),
+            ]
+        )
         relays["TeamsRelay"].assert_called_once()
         pubsub.assert_called_once()
         self.assertIn("initialize_slack_relay", thread_targets)

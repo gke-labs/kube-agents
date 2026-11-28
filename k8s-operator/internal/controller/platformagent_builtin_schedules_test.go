@@ -239,6 +239,64 @@ func TestABuiltinsSpecIsPutBackAndItsSuspendFollowsTheOverride(t *testing.T) {
 	}
 }
 
+// suspendAll suspends every row no override names, a directly unsuspended one included; an
+// override of suspend: false turns one back on; and clearing suspendAll returns a row to its
+// default.
+func TestSuspendAllSuspendsEveryRowButAnOverriddenOne(t *testing.T) {
+	agent := builtinTestAgent(agentv1alpha1.AgentScheduleOverride{Name: "stockout-prevention", Suspend: false})
+	rows := []builtinSchedule{builtinTestRow("compliance-audit", nil), builtinTestRow("stockout-prevention", nil)}
+	g := newBuiltinRig(t, agent, rows)
+	g.pass(t)
+	agent.Spec.Schedules.SuspendAll = true
+	if cond, _ := g.pass(t); cond != nil {
+		t.Fatalf("condition = %+v", cond)
+	}
+	if s, _ := g.get(t, "compliance-audit"); !s.Spec.Suspend {
+		t.Fatal("suspendAll left a row with no override running")
+	}
+	if s, _ := g.get(t, "stockout-prevention"); s.Spec.Suspend {
+		t.Fatal("suspendAll suspended a row whose override says suspend: false")
+	}
+	s, _ := g.get(t, "compliance-audit")
+	s.Spec.Suspend = false
+	if err := g.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	g.pass(t)
+	if s, _ = g.get(t, "compliance-audit"); !s.Spec.Suspend {
+		t.Fatal("a suspend set directly on the schedule outranked suspendAll")
+	}
+	agent.Spec.Schedules.SuspendAll = false
+	g.pass(t)
+	if s, _ = g.get(t, "compliance-audit"); s.Spec.Suspend {
+		t.Fatal("clearing suspendAll left the row suspended")
+	}
+}
+
+// suspendAll leaves a run-now-only row to its override: it doesn't stop the run-now.
+func TestSuspendAllDoesNotStopARunNowOnlyRow(t *testing.T) {
+	row := builtinTestRow("onboarding", func(r *builtinSchedule) { r.RunNowOnly = true })
+	agent := builtinTestAgent()
+	agent.Spec.Schedules = &agentv1alpha1.PlatformAgentSchedulesSpec{SuspendAll: true}
+	if builtinRunNowSuspended(agent, row) {
+		t.Fatal("suspendAll stopped a run-now-only row's run-now")
+	}
+}
+
+// An override naming a job in the image's cron roster names something, so it isn't reported;
+// one naming neither a row nor a roster job still is.
+func TestAnOverrideNamingAnImageCronJobIsNotReported(t *testing.T) {
+	agent := builtinTestAgent(
+		agentv1alpha1.AgentScheduleOverride{Name: "stall-watch", Suspend: true},
+		agentv1alpha1.AgentScheduleOverride{Name: "stall-wach", Suspend: true},
+	)
+	g := newBuiltinRig(t, agent, []builtinSchedule{builtinTestRow("compliance-audit", nil)})
+	cond, _ := g.pass(t)
+	if cond == nil || cond.Reason != builtinSchedulesReasonOverrideUnknown || strings.Contains(cond.Message, "stall-watch") || !strings.Contains(cond.Message, "stall-wach") {
+		t.Fatalf("condition = %+v", cond)
+	}
+}
+
 // A run-now-only row renders suspended whatever an override says: suspend:
 // true is taken (and stops the operator setting its run-now), suspend: false
 // is refused and reported, since it would put the row on its nominal cron.

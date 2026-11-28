@@ -253,8 +253,19 @@ type TeamsAdapter struct {
 	// so a rating and the redraw it causes are never interleaved with
 	// another's. It does not order two presses pulled back to back.
 	rateMu sync.Mutex
+	// editing is the lock each message's edits hold, by message id, from
+	// reading what the message shows to writing it back: the gateway's
+	// edit, a rating's redraw and an answered question's (lockEdit). An
+	// entry lives only while an edit holds or waits on it.
+	editing map[string]*teamsEditLock
 	// rating counts the ratings in flight, for a test to wait on.
 	rating sync.WaitGroup
+	// ux is the adapter's record of its laid-out messages: the questions
+	// open, the answers waiting on the gateway's verdict, and what each
+	// card shows (teams_clicks.go). rewrites counts the answered
+	// questions being drawn again, for a test to wait on.
+	ux       *teamsUX
+	rewrites sync.WaitGroup
 
 	// countInterval paces the received-events summary line (tests shorten
 	// it). Read and written by Run's goroutine only.
@@ -283,11 +294,12 @@ func NewTeamsAdapter(relayURL, tokenPath, tenantID string, adaptiveCards bool, l
 		tokenPath:      tokenPath,
 		tenantID:       strings.TrimSpace(tenantID),
 		adaptiveCards:  adaptiveCards,
-		client:         &http.Client{Timeout: teamsRelayTimeout},
+		client:         newRelayHTTPClient(teamsRelayTimeout),
 		log:            log,
 		seen:           map[string]bool{},
 		serviceURLs:    map[string]string{},
 		rated:          map[string]teamsRated{},
+		editing:        map[string]*teamsEditLock{},
 		allowed:        map[string]bool{},
 		countInterval:  teamsEventCountInterval,
 		typing:         map[string]*teamsTyping{},
@@ -419,6 +431,7 @@ func (a *TeamsAdapter) classify(act *teamsActivity) (InboundMessage, string) {
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + act.ID
 	}
+	a.noteTypedAnswer(teamsConversationID(conversation), act.ID, text, act.From.Name)
 	return InboundMessage{
 		Conversation: teamsConversationID(conversation),
 		Kind:         kind,
@@ -744,16 +757,46 @@ func (a *TeamsAdapter) PostNotify(space, thread, text string) (message, landed s
 	if err != nil {
 		return "", "", err
 	}
-	// A top-level post in a channel starts a thread Teams addresses as the
-	// channel id with the post's activity id; later chunks and a person's
-	// reply under it key that thread, so that is where it landed. A thread
-	// post, a post into a home that is itself a thread, and a post in a group
-	// or personal chat (which Teams does not thread) landed where they were
-	// sent.
-	if strings.TrimSpace(thread) == "" && message != "" && teamsIsChannelID(conversation) {
-		return message, conversation + teamsThreadToken + message, nil
+	return message, teamsNotifyLanded(conversation, thread, message), nil
+}
+
+// PostNotifyMessage is PostMessage for the chat.notify route's home posts
+// (notifyChatPoster): the message laid out as a card when it carries a
+// chat message, with the rating controls when the notifier marked it for
+// rating (an alert or a report the agent posted on its own), into the same
+// conversation PostNotify posts into, and where it landed back.
+func (a *TeamsAdapter) PostNotifyMessage(home, thread string, m OutMessage) (message, landed string, err error) {
+	conversation := strings.TrimSpace(thread)
+	if conversation == "" {
+		conversation = strings.TrimSpace(home)
 	}
-	return message, conversation, nil
+	if !teamsIsConversationID(conversation) {
+		return "", "", fmt.Errorf("teams: not a conversation id: %q", conversation)
+	}
+	message, err = a.PostMessage(teamsConversationID(conversation), m)
+	if err != nil {
+		return "", "", err
+	}
+	landed = teamsNotifyLanded(conversation, thread, message)
+	if landed != conversation {
+		// A press on the post, and a reply typed under it, arrive keyed by
+		// the thread the post started, so its question is filed there.
+		a.rehomeQuestion(message, teamsConversationID(conversation), teamsConversationID(landed))
+	}
+	return message, landed, nil
+}
+
+// teamsNotifyLanded is where a home post landed. A top-level post in a
+// channel starts a thread Teams addresses as the channel id with the
+// post's activity id; later chunks and a person's reply under it key that
+// thread, so that is where it landed. A thread post, a post into a home
+// that is itself a thread, and a post in a group or personal chat (which
+// Teams does not thread) landed where they were sent.
+func teamsNotifyLanded(conversation, thread, message string) string {
+	if strings.TrimSpace(thread) == "" && message != "" && teamsIsChannelID(conversation) {
+		return conversation + teamsThreadToken + message
+	}
+	return conversation
 }
 
 // teamsIsConversationID reports a Teams conversation id: one token with no
@@ -857,14 +900,18 @@ func (a *TeamsAdapter) edit(conversation, messageID, text string, actions []map[
 	return nil
 }
 
-// PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly), rendered as an Adaptive Card by Post. A running
+// PostMessage and EditMessage lay a chat message out as an Adaptive Card
+// with its buttons (teams_chat.go), or refuse the layout (ErrLayoutRefused)
+// so the gateway posts its text; with cards off a chat message falls back
+// to its text (ErrTextOnly). Text is rendered as a card by Post. A running
 // task's line (m.Stop) carries the Stop button on that card
-// (teams_press.go); an edit that names no task removes it. An answer marked
+// (teams_press.go); an edit that names no task removes it. A message marked
 // for feedback (m.Feedback) carries the rating controls on its card, once
 // the gateway has handed the adapter its recorder (teams_feedback.go).
 func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
 	switch {
+	case m.Chat != nil && a.adaptiveCards:
+		return a.postChat(conversation, m)
 	case m.Chat == nil && m.Stop != "":
 		return a.post(conversation, m.Text, teamsStopActions(m.Stop))
 	case a.rates(m):
@@ -874,19 +921,43 @@ func (a *TeamsAdapter) PostMessage(conversation string, m OutMessage) (string, e
 }
 
 func (a *TeamsAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
-	switch {
-	case m.Chat == nil && m.Stop != "":
-		return a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
-	case a.rates(m):
-		return a.editRated(conversation, messageID, m)
+	// One edit of a message at a time, in step with the redraws a rating
+	// and an answered question cause (teams_feedback.go, teams_clicks.go):
+	// each reads what the message shows and writes it back, and two of
+	// them interleaved would leave the older text or lose the answered
+	// line. The lock is the message's own, so a slow call on one message
+	// holds up no other.
+	defer a.lockEdit(messageID)()
+	if m.Chat != nil && a.adaptiveCards {
+		return a.editChat(conversation, messageID, m)
 	}
-	return editTextOnly(a.Edit, conversation, messageID, m)
+	if m.Chat != nil {
+		return ErrTextOnly
+	}
+	// The message is text from here: an answered question keeps its line,
+	// and once the edit has landed it asks nothing any more
+	// (teams_clicks.go).
+	m.Text = a.withAnsweredLine(messageID, m.Text)
+	var err error
+	switch {
+	case m.Stop != "":
+		err = a.edit(conversation, messageID, m.Text, teamsStopActions(m.Stop))
+	case a.rates(m):
+		err = a.editRated(conversation, messageID, m)
+	default:
+		err = a.Edit(conversation, messageID, m.Text)
+	}
+	if err == nil {
+		a.trackQuestion(messageID, conversation, nil, nil)
+	}
+	return err
 }
 
 // EditNotifyMessage is EditMessage for the chat.notify route's home posts
 // (notifyChatEditor): the activity messageID in the thread when one is
 // named, else in home, edited in place, so a keyed home post (an alert its
-// triage updates) stays one message rather than one per update.
+// triage updates) stays one message rather than one per update, and keeps
+// its rating controls.
 func (a *TeamsAdapter) EditNotifyMessage(home, thread, messageID string, m OutMessage) error {
 	conversation := strings.TrimSpace(thread)
 	if conversation == "" {

@@ -49,18 +49,32 @@ func newExtraCallerHeaders(names []string) (map[string]struct{}, error) {
 	if len(names) == 0 {
 		return nil, nil
 	}
+	if err := ValidateCallerHeaderNames(names); err != nil {
+		return nil, fmt.Errorf("k8sapiproxy: Config.ExtraCallerHeaders %w", err)
+	}
 	extra := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		if !validHeaderName(name) {
-			return nil, fmt.Errorf("k8sapiproxy: Config.ExtraCallerHeaders entry %q is not an HTTP header name", name)
-		}
-		lower := strings.ToLower(name)
-		if _, reserved := reservedCallerHeaders[lower]; reserved {
-			return nil, fmt.Errorf("k8sapiproxy: Config.ExtraCallerHeaders entry %q cannot be stripped: the proxy needs it to forward the request", name)
-		}
-		extra[lower] = struct{}{}
+		extra[strings.ToLower(name)] = struct{}{}
 	}
 	return extra, nil
+}
+
+// ValidateCallerHeaderNames reports the first of names that Config.ExtraCallerHeaders
+// would not take: one that is not an HTTP header name, or one the proxy needs to forward
+// the request (Host, Content-Length, Transfer-Encoding, Connection, Upgrade). An
+// authenticator that reads a caller's identity from configured headers checks them with
+// it, so every name it accepts can be stripped. The error starts with "entry", for the
+// caller to put the name of its own field in front.
+func ValidateCallerHeaderNames(names []string) error {
+	for _, name := range names {
+		if !validHeaderName(name) {
+			return fmt.Errorf("entry %q is not an HTTP header name", name)
+		}
+		if _, reserved := reservedCallerHeaders[strings.ToLower(name)]; reserved {
+			return fmt.Errorf("entry %q cannot be stripped: the proxy needs it to forward the request", name)
+		}
+	}
+	return nil
 }
 
 // validHeaderName reports whether name is a non-empty HTTP field name: letters, digits and

@@ -15,8 +15,11 @@ crashed run left.
              burst window (the first-run flow and every audit) and the soak window,
              and write the verdict; exit 1 when it is red
   install    upgrade the host cluster's install to the newest `main` commit whose
-             images are published, at the size's tier (the release's other values
-             are kept, so no secret is needed)
+             images are published, at the size's tier, from the registry
+             REGISTRY_PREFIX names (unset, GHCR); the release's secrets and other
+             values are kept
+  usage      tokens by capability for any period (--since, --until), from the live install or a
+             kept archive (--stores), checked against Vertex AI's own count
   sweep      delete any sized fleet older than --max-age-hours, whatever its size:
              what an aborted run left
   down       destroy the stack
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -41,7 +45,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -51,7 +55,7 @@ sys.path.insert(0, str(REPO / "bench"))
 
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
-from kube_agents_bench.scale import operations, runner, sized_records, sized_run  # noqa: E402
+from kube_agents_bench.scale import attribution, model_counters, operations, runner, sized_records, sized_run  # noqa: E402
 
 LOG = logging.getLogger("sized-fleet")
 STACK_DIR = REPO / "bench" / "tf" / "sized-fleet"
@@ -67,7 +71,16 @@ DEFAULT_NAMESPACE = "kubeagents-system"
 RELEASE = "kube-agents"
 CHART_DIR = REPO / "charts" / "kube-agents"
 CRD_DIR = CHART_DIR / "crds"
-REGISTRY = "ghcr.io"
+# Where a commit's published images are looked up and installed from: REGISTRY_PREFIX, the
+# variable the release scripts and hack/ci-deploy.sh read, else the public default.
+REGISTRY_PREFIX_ENV = "REGISTRY_PREFIX"
+DEFAULT_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
+GHCR_HOST = "ghcr.io"
+# An Artifact Registry Docker host answers the caller's Google access token, not an anonymous one.
+ARTIFACT_REGISTRY_HOST = re.compile(r"^[a-z0-9-]+-docker\.pkg\.dev$")
+ACCESS_TOKEN_COMMAND = [kube.GCLOUD, "auth", "print-access-token"]
+# The chart value that puts every first-party image on one registry prefix; empty is the default.
+IMAGE_REGISTRY_KEY = "global.imageRegistry"
 IMAGES_FILE = REPO / "images.json"
 FIRST_PARTY = "first-party"
 RELEASE_TAG_POLICY = "release"
@@ -106,6 +119,15 @@ JUDGE_MODEL = "gemini-3.1-pro-preview"
 RESULTS_LINE = re.compile(r"results: (\S+results\.json)")
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 VERDICT_FILE = "scale-verdict.json"
+USAGE_FILE = "capability-usage.json"
+USAGE_REPORT = "capability-usage.md"
+# The install's whole session records, kept before the reset deletes them and after the run.
+STORES_BEFORE = "session-records-before-reset.json.gz"
+STORES_AFTER = "session-records-after-run.json.gz"
+# The model the install's gateway serves; Vertex AI's count for it is the sessions' check.
+INSTALL_MODEL = "gemini-3.5-flash"
+# How far into the first window the containers' idle memory is read.
+MEMORY_BASE_SECONDS = 180
 # The label a host cluster carries when its install exists to be measured: a run resets the
 # install's state volumes, and refuses a host without it, as the scale runner does.
 HOST_LABEL = "purpose=harness-scale"
@@ -523,6 +545,60 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
     return summary
 
 
+def measure_period(stores: dict, project: str, start: float, end: float, litellm: dict | None = None,
+                   install: collect.Install | None = None, base: dict | None = None) -> dict:
+    """One period's tokens and memory by capability, checked against Vertex AI's count, with the calls by account."""
+    usage = attribution.attribute(stores, start, end, litellm=litellm)
+    if install is not None:
+        usage["memory"] = sized_records.safe(
+            lambda: attribution.memory_by_capability(attribution.container_memory(install, start, end), stores,
+                                                     start, end, base=base),
+            usage.setdefault("errors", []), "memory by capability")
+    vertex = model_counters.vertex_tokens(project, start, end)
+    usage["vertex"] = model_counters.against_sessions(vertex, usage["recorded"], INSTALL_MODEL)
+    # Who made the calls is a note on the window, not one of its checks: an unread list costs only itself.
+    usage["requests_by_account"] = sized_records.safe(lambda: model_counters.requests_by_account(project, start, end),
+                                                      usage["errors"], "requests by account")
+    if litellm is None:
+        # No LiteLLM counters for an arbitrary period: Vertex AI's own count is the sum check.
+        ratio = usage["vertex"]["ratio"]
+        usage["checks"]["sum"] = {"source": "vertex", "ratio": ratio,
+                                  "passed": all(r is not None and abs(r - 1) <= attribution.SUM_TOLERANCE
+                                                for r in ratio.values())}
+    return usage
+
+
+def capability_usage(host_context: str, namespace: str, windows: dict[str, dict], project: str = "",
+                     stores: dict | None = None, install: collect.Install | None = None) -> dict[str, dict]:
+    """Each window's tokens by capability (docs/designs/capability-usage-attribution.md), from one read."""
+    starts = [datetime.fromisoformat(w["start"]).timestamp() for w in windows.values() if "start" in w]
+    if stores is None:
+        stores = attribution.read_stores(host_context, namespace, since=min(starts, default=0.0))
+    usage = {}
+    # The platform base is each container's idle memory at the run's first window, held for the run.
+    # An unread base is a note on every window; each container then starts from its first sample.
+    base, base_errors = None, []
+    if install is not None and starts:
+        first = sized_records.safe(
+            lambda: attribution.container_memory(install, min(starts), min(starts) + MEMORY_BASE_SECONDS),
+            base_errors, "memory base")
+        base = {c: points[0][1] for c, points in first.items() if points}
+    for name, window in windows.items():
+        try:
+            start = datetime.fromisoformat(window["start"]).timestamp()
+            end = start + window["seconds"]
+            if project:
+                usage[name] = measure_period(stores, project, start, end, litellm=window.get("tokens"),
+                                             install=install, base=base)
+            else:
+                usage[name] = attribution.attribute(stores, start, end, litellm=window.get("tokens"))
+        except (KeyError, ValueError, OSError, kube.CommandError) as exc:
+            # A window whose measurements were not read costs only its own record.
+            usage[name] = {"error": f"window not attributed: {exc!r}"}
+        usage[name].setdefault("errors", []).extend(base_errors)
+    return usage
+
+
 def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     fleet = sf.fleet(args.size)
     credentials(args, fleet)
@@ -539,15 +615,26 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     def chat_questions() -> None:
         evals.update(run_evals(args, host_context, out))
 
+    def keep_stores_before_reset() -> None:
+        attribution.archive(attribution.read_stores(host_context, args.namespace), out / STORES_BEFORE)
+
     install = collect.Install(args.project, host_context, args.namespace, args.host_cluster, args.host_location)
     record, result = sized_run.run(project=args.project, host_cluster=args.host_cluster, host_context=host_context,
                                    namespace=args.namespace, check_fleet=check_fleet, install=install,
                                    soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE,
-                                   during_soak=chat_questions if args.eval_cases else None)
+                                   during_soak=chat_questions if args.eval_cases else None,
+                                   before_reset=keep_stores_before_reset)
     # Before `down`: the cost record reads the fleet's own instances and clusters.
     cost = sized_records.safe(
         lambda: sized_records.cost_record(args.project, args.run_id, record.windows, region=region_of(args.zone)),
         record.errors, "cost record")
+    stores_after = sized_records.safe(lambda: attribution.read_stores(host_context, args.namespace),
+                                      record.errors, "the session records after the run") or None
+    if stores_after:
+        attribution.archive(stores_after, out / STORES_AFTER)
+    usage = sized_records.safe(lambda: capability_usage(host_context, args.namespace, record.windows, args.project,
+                                                        stores=stores_after, install=install),
+                               record.errors, "capability usage") or {}
     result["errors"] = list(record.errors)
     records = {
         # The chat questions are eval records beside the verdict; they do not change it.
@@ -555,12 +642,16 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
                        "evals": evals},
         MEASUREMENTS_FILE: {"size": args.size, "run_id": args.run_id, "windows": record.windows},
         COST_FILE: cost,
+        USAGE_FILE: usage,
     }
     for name, body in records.items():
         (out / name).write_text(json.dumps(body, indent=2) + "\n")
         LOG.info("%s: %s", name, summary(name, body))
+    (out / USAGE_REPORT).write_text(attribution.markdown(usage) if usage else "No capability usage was read.\n")
     if args.results_bucket:
-        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in records], results_prefix(args)])
+        kept = [n for n in (STORES_BEFORE, STORES_AFTER) if (out / n).exists()]
+        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in (*records, USAGE_REPORT, *kept)],
+                  results_prefix(args)])
         if (out / EVALS_DIR).is_dir():
             kube.run([kube.GCLOUD, "storage", "cp", "--recursive", str(out / EVALS_DIR), results_prefix(args)])
     print(json.dumps(records[VERDICT_FILE], indent=2))
@@ -573,6 +664,10 @@ def summary(name: str, body: dict) -> str:
     if name == VERDICT_FILE:
         failed = [c for c, v in body.get("checks", {}).items() if not v["passed"]]
         return f"{'green' if body.get('green') else 'red'}; failed: {', '.join(failed) or 'none'}"
+    if name == USAGE_FILE:
+        return "; ".join(f"{w}: {v['error']}" if "error" in v else
+                         f"{w}: unattributed {v['checks']['unattributed']['share']:.1%}, "
+                         f"sum {'sound' if v['checks']['sum']['passed'] else 'unsound'}" for w, v in body.items())
     if name == COST_FILE:
         return f"${body.get('usd', '?')} (infrastructure ${body.get('infrastructure', {}).get('usd', '?')})"
     windows = body.get("windows", {})
@@ -580,15 +675,22 @@ def summary(name: str, body: dict) -> str:
                      for w, v in windows.items())
 
 
+def registry_prefix() -> str:
+    """The registry prefix a commit's published images are under, without a trailing slash."""
+    return (os.environ.get(REGISTRY_PREFIX_ENV) or DEFAULT_REGISTRY_PREFIX).rstrip("/")
+
+
 def image_repositories() -> list[str]:
     """The registry path of every first-party image an install pulls at the release's tag.
 
     images.json is the inventory of what an install pulls. The chart's tag keys name only
     five; the operator renders the agent bus's images (a2a-*, hermes-bridge, web-console)
-    at its own tag, and the release pushes them last.
+    at its own tag, and the release pushes them last. Each keeps its trailing name under
+    the registry prefix, the layout the chart's global.imageRegistry assumes.
     """
+    path = registry_prefix().partition("/")[2]
     images = json.loads(IMAGES_FILE.read_text())["images"]
-    return sorted(i["repository"].removeprefix(f"{REGISTRY}/") for i in images
+    return sorted(f"{path}/{i['repository'].rsplit('/', 1)[-1]}" for i in images
                   if i.get("origin") == FIRST_PARTY and i.get("tagPolicy") == RELEASE_TAG_POLICY)
 
 
@@ -601,12 +703,36 @@ def image_published(sha: str) -> bool:
     return all(manifest_exists(repo, sha) for repo in image_repositories())
 
 
+@functools.cache
+def google_access_token() -> str:
+    """The caller's Google access token, asked for once a run.
+
+    Through kube.run, as every other gcloud call here: a credential blip is retried, and a
+    failure carries gcloud's own message.
+    """
+    return kube.run(ACCESS_TOKEN_COMMAND, timeout=REGISTRY_TIMEOUT_SECONDS).strip()
+
+
+def registry_token(host: str, repo: str) -> str:
+    """A token ``host`` accepts for reading ``repo``: the caller's Google one for Artifact Registry, GHCR's anonymous one.
+
+    The Google token goes to an Artifact Registry host and no other; a host that is neither is refused.
+    """
+    if ARTIFACT_REGISTRY_HOST.match(host):
+        return google_access_token()
+    if host != GHCR_HOST:
+        raise SystemExit(f"{REGISTRY_PREFIX_ENV} names {host}, which this lookup cannot ask: "
+                         f"it reads {GHCR_HOST} and Artifact Registry (<location>-docker.pkg.dev)")
+    token_url = f"https://{GHCR_HOST}/token?scope=repository:{repo}:pull&service={GHCR_HOST}"
+    with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed host
+        return json.loads(response.read())["token"]
+
+
 def manifest_exists(repo: str, sha: str) -> bool:
-    """Whether ``repo`` has a manifest tagged ``sha``, read anonymously."""
-    token_url = f"https://{REGISTRY}/token?scope=repository:{repo}:pull&service={REGISTRY}"
-    with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed URL
-        token = json.loads(response.read())["token"]
-    request = urllib.request.Request(f"https://{REGISTRY}/v2/{repo}/manifests/{sha}",
+    """Whether ``repo`` has a manifest tagged ``sha`` in the registry the prefix names."""
+    host = registry_prefix().partition("/")[0]
+    token = registry_token(host, repo)
+    request = urllib.request.Request(f"https://{host}/v2/{repo}/manifests/{sha}",
                                      headers={"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT})
     try:
         with urllib.request.urlopen(request, timeout=REGISTRY_TIMEOUT_SECONDS):  # noqa: S310
@@ -664,14 +790,24 @@ def cmd_install(args: argparse.Namespace) -> int:
         kube.run(["kubectl", "--context", host_context, "apply", "--server-side", "--force-conflicts", "-f",
                   str(chart / CRD_DIR.name)], timeout=HELM_TIMEOUT_SECONDS)
         sets = [f"--set={key}={sha}" for key in IMAGE_TAG_KEYS] + [f"--set={SIZING_KEY}={tier}"]
+        # The images built from this repository are pulled from the registry the commit was
+        # looked up in. Said on every run, the default as the chart's own empty value, so a
+        # release that kept another run's registry does not pull from one this run never asked.
+        prefix = registry_prefix()
+        sets.append(f"--set-string={IMAGE_REGISTRY_KEY}={'' if prefix == DEFAULT_REGISTRY_PREFIX else prefix}")
         overrides = Path(tree) / "test-bed-values.json"
         overrides.write_text(json.dumps({"platformAgent": {"deployment": {"env": env}}}))
         sets += ["-f", str(overrides)]
         # --reset-then-reuse-values: the chart's own defaults, then the release's values on top,
         # so a key the newer chart adds gets its default rather than nothing.
-        kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(chart),
-                  "--reset-then-reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"],
-                 timeout=HELM_TIMEOUT_SECONDS)
+        # Not kube.run: its transient pattern takes Helm's "context deadline exceeded", the message of
+        # a --wait that ran out because a Pod never became ready, and would retry a release that
+        # cannot fit for hours. A failed upgrade is the install's answer.
+        helm = subprocess.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE,
+                               str(chart), "--reset-then-reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"],
+                              capture_output=True, text=True, timeout=HELM_TIMEOUT_SECONDS, check=False)
+        if helm.returncode != 0:
+            raise SystemExit(f"helm upgrade failed ({helm.returncode}): {helm.stderr.strip()[-STDERR_TAIL_CHARS:]}")
     LOG.info("installed %s", sha)
     return 0
 
@@ -702,6 +838,36 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return EXIT_UNSOUND if failed else 0
 
 
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Tokens by capability for any period, from the live install or a kept archive, checked against Vertex AI."""
+    if not args.since:
+        raise SystemExit("usage needs --since: the period's start, ISO 8601 with a zone")
+    until = datetime.fromisoformat(args.until).timestamp() if args.until else time.time()
+    since = datetime.fromisoformat(args.since).timestamp()
+    if args.stores:
+        stores = attribution.load_archive(Path(args.stores))
+    else:
+        host_context = kube.context_name(args.project, args.host_location, args.host_cluster)
+        kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
+                    project=args.project)
+        stores = attribution.read_stores(host_context, args.namespace, since=since)
+    period = f"{datetime.fromtimestamp(since, timezone.utc):%Y%m%dT%H%M}-{datetime.fromtimestamp(until, timezone.utc):%Y%m%dT%H%M}"
+    install = collect.Install(args.project, kube.context_name(args.project, args.host_location, args.host_cluster),
+                              args.namespace, args.host_cluster, args.host_location)
+    out = Path(args.out or tempfile.mkdtemp(prefix="sized-usage-"))
+    out.mkdir(parents=True, exist_ok=True)
+    # Kept before measuring: a live read cannot be made again once the install moves on.
+    if not args.stores:
+        attribution.archive(stores, out / f"session-records-{period}.json.gz")
+    usage = {period: measure_period(stores, args.project, since, until, install=install)}
+    (out / f"usage-{period}.json").write_text(json.dumps(usage, indent=2) + "\n")
+    (out / f"usage-{period}.md").write_text(attribution.markdown(usage))
+    body = usage[period]
+    LOG.info("usage %s: %s tokens, unattributed %.1f%%, sessions against Vertex AI %s; records in %s", period,
+             f"{body['total_tokens']:,}", 100 * body["checks"]["unattributed"]["share"], body["vertex"]["ratio"], out)
+    return 0
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     started = time.time()
     init(args.project, args.size)
@@ -712,7 +878,7 @@ def cmd_down(args: argparse.Namespace) -> int:
 
 
 COMMANDS = {"plan": cmd_plan, "up": cmd_up, "workloads": cmd_workloads, "verify": cmd_verify, "run": cmd_run,
-            "down": cmd_down, "install": cmd_install, "sweep": cmd_sweep}
+            "down": cmd_down, "install": cmd_install, "sweep": cmd_sweep, "usage": cmd_usage}
 
 
 def use_ca_bundle() -> None:
@@ -749,6 +915,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--soak-minutes", type=int, default=sized_run.SOAK_SECONDS // SECONDS_PER_MINUTE)
     parser.add_argument("--out", help="run: the folder for the records; default a new temp folder")
     parser.add_argument("--results-bucket", help="run: also copy the records to <bucket>/<size>/<run id>/")
+    parser.add_argument("--since", help="usage: the period's start, ISO 8601 with a zone")
+    parser.add_argument("--until", help="usage: the period's end, ISO 8601 with a zone; default now")
+    parser.add_argument("--stores", help="usage: read a kept session-records archive instead of the live install")
     parser.add_argument("--eval-cases", nargs="?", const=str(EVAL_CASES_FILE), default=None,
                         help="run: run the cases this file lists in the soak window "
                              f"(default file {EVAL_CASES_FILE.relative_to(REPO)})")

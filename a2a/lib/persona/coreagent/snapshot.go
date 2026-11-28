@@ -36,8 +36,8 @@ type Rendering struct {
 // through an os.Root, so nothing outside root is read even if an entry
 // changes under the walk.
 //
-// It doesn't check who can write root: the persona directory's own check,
-// run before the harness starts, refuses one the harness's user could write.
+// It doesn't check who can write root: VerifyRendering does, for a worker
+// that requires its persona, before the harness reads it.
 func Snapshot(root string) (Rendering, error) {
 	r, err := os.OpenRoot(root)
 	if err != nil {

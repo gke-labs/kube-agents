@@ -612,9 +612,9 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   cap: the storage, networking and certificate audits (125 s on a one-shot `kubectl`), the
   reconciler's and the scope publisher's project lookups and the stall watch's hops (120 s on a
   `gcloud` the broker bounds at 300 s), and the scaffold's connectivity probe (45 s); under every
-  one of them the deadline admits no retry. The fleet-audit collectors (the upgrade retrospective
-  and the seven scripts that bind the same `collector_run.default_run`, at caps of 60 to 240 s)
-  get it from that one entry point: it hands every child the cap it was called with less the
+  one of them the deadline admits no retry. The fleet-audit collectors and scanners (the upgrade
+  retrospective and the scripts that bind the same `collector_run.default_run`, at caps of 60 to
+  240 s) get it from that one entry point: it hands every child the cap it was called with less the
   300 s `gcloud` run bound, 0 under every cap a collector binds, unless the environment the
   caller passed already names a deadline, so no collector sets the variable itself. A script that
   caps the shim at or under one admission wait is outside a held refusal's reach, but not the

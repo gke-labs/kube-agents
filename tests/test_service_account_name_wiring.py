@@ -88,6 +88,19 @@ class ServiceAccountNameWiringTest(unittest.TestCase):
             r"var\.enable_github_minter\s*\?\s*\{\s*gsaName\s*=",
         )
 
+    def test_chat_service_account_id_reaches_chat_pubsub_and_chart(self):
+        self.assertRegex(
+            self.main_tf,
+            r"(?m)^\s*chat_service_account_id\s*=\s*local\.chat_cross_project\s*\?\s*var\.chat_service_account_id\s*:\s*\"\"\s*$",
+        )
+        self.assertRegex(
+            _module_block(self.main_tf, "chat_pubsub"),
+            r"(?m)^\s*chat_service_account_id\s*=\s*local\.chat_service_account_id\s*$",
+        )
+        self.assertIn(
+            "module.chat_pubsub[0].chat_service_account_email", self.main_tf
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

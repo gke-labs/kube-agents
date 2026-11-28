@@ -1966,6 +1966,9 @@
         "networkPolicy": {
           "type": "object"
         },
+        "schedules": {
+          "type": "object"
+        },
         "integration": {
           "type": "object",
           "additionalProperties": false,
@@ -2074,6 +2077,12 @@
               "properties": {
                 "enabled": {
                   "type": "boolean"
+                },
+                "projectId": {
+                  "type": "string"
+                },
+                "serviceAccountEmail": {
+                  "type": "string"
                 },
                 "topicName": {
                   "type": "string"

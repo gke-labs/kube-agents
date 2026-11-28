@@ -9,7 +9,8 @@ caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), imp
 the cluster's API server through `pkg/upstream` with credentials the sandbox never holds, and emits
 structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
-`cmd/k8s-api-proxy` builds the production server binary.
+`cmd/k8s-api-proxy` builds the standalone server binary from `pkg/proxyserver`, which holds its
+flags, environment variables and lifecycle.
 
 `tokenreview.NewAuthenticator` (`pkg/tokenreview`) is the binary's default `CallerAuthenticator` (`--auth-mode=token-review`): it accepts a bearer token
 that a TokenReview on the host cluster finds valid for any configured audience (`Audience`, `Audiences`, or `AudienceCallers`), from a username in that audience's allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
@@ -60,6 +61,105 @@ followed only on `https://` to the host and port being fetched, a configured `Ke
 verified against instead of the system roots; it is re-read when it changes, like the server
 certificate below, and the fetch then speaks HTTP/1.1 only and uses no HTTP proxy.
 
+`pkg/mtlsauth` holds two authenticators for an embedder whose callers arrive over mutual TLS. The
+binary has no `--auth-mode` for them. Neither imports `client-go`.
+
+```go
+// The caller is the certificate: a workload's SPIFFE X.509-SVID, for example.
+workloads, err := mtlsauth.NewClientCertAuthenticator(mtlsauth.ClientCertConfig{
+	ClientCAFile:      "/etc/proxy/workload-ca.crt",
+	IdentitySource:    mtlsauth.SourceURI, // or SourceDNS, SourceCN
+	RequiredURIPrefix: "spiffe://example.org/ns/agents/",
+})
+
+// The caller is whoever an allowed front proxy names in request headers.
+gateway, err := mtlsauth.NewFrontProxyAuthenticator(mtlsauth.FrontProxyConfig{
+	ClientCAFile:     "/etc/proxy/gateway-ca.crt",
+	NameSource:       mtlsauth.SourceURI,
+	AllowedNames:     []string{"spiffe://example.org/ns/gateways/sa/egress"},
+	UsernameHeaders:  []string{"X-Caller-User"},
+	GroupHeaders:     []string{"X-Caller-Group"},
+	PartitionHeaders: []string{"X-Caller-Tenant"},
+})
+
+handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
+	Authenticator:      gateway,
+	ExtraCallerHeaders: gateway.HeaderNames(), // the identity headers stop at the proxy
+	// ...
+})
+```
+
+Both read the client certificate from `Request.TLS`, and the listener must verify it when the
+connection opens: `tls.VerifyClientCertIfGiven` (which keeps certificate-less requests such as
+health probes working) or `tls.RequireAndVerifyClientCert`, with `ClientCAs` from
+`certreload.NewCAPoolUnion` over every authenticator's bundle, set per handshake through
+`GetConfigForClient` so a rotated bundle is advertised. Do not use `tls.RequestClientCert` or
+`tls.RequireAnyClientCert`: a peer no CA vouches for could then make every request pay for a
+chain search. In addition to the handshake, each authenticator verifies the certificate on every
+request, against its own bundle only, for client authentication, at the current time: a
+certificate that expired or whose CA left the bundle is refused on the next request of a
+connection that is already open, HTTP/2 included, and a certificate issued under one
+authenticator's CA is nothing to the other. A peer that presented more than eight certificates
+is refused before any verification. A certificate with no
+extended key usage extension is accepted, as `crypto/x509` accepts it; one that lists usages
+without client authentication is refused. Revocation (CRL, OCSP) is not checked. The bundle is
+reloaded like `Config.CAFile` above (`Reload` takes the `certreload.Options`); one that stops
+loading is reported and the last good one keeps verifying, so neither authenticator ever answers 503.
+
+The peer's name comes from the one certificate field the configuration names (`uri`, `dns` or
+`cn`). No other field is tried when it is missing, and a certificate with two values there (two
+URI SANs, two DNS SANs, two common names) is refused. Names are compared exactly, with no case
+folding or pattern. A URI name is the certificate's own text with the scheme in lower case and
+nothing else changed, and it must have one spelling only: a scheme, no userinfo, query or
+fragment (not even an empty one), no percent-encoding, no `.` or `..` path segment, and the form
+Go's `net/url` writes it back in (so no space, which it would escape). A certificate whose URI
+is anything else is refused, and a configuration entry that is (`AllowedIdentities`,
+`AllowedNames`, `RequiredURIPrefix`) is a constructor error. X.509
+name constraints do not apply to the subject common name, so with `cn` a name-constrained CA in
+the bundle can still issue any name.
+`ClientCertAuthenticator` uses the name as `CallerIdentity.Username` and fills nothing else;
+`AllowedIdentities` admits only the listed names and `RequiredURIPrefix` (with `uri` only) only
+names that start with it; the prefix must be a URI with a scheme and a host, written as a name
+is, and end in `/`, so that it cannot match a longer trust domain or path segment or every trust
+domain. Without either, every client certificate
+the CA issues is a caller.
+
+`FrontProxyAuthenticator` requires the peer's name in `AllowedNames` and then believes the
+request's headers. Each of `UsernameHeaders`, `UIDHeaders` and `PartitionHeaders` is an ordered
+list: the first header present in the request is read and must hold exactly one non-empty value,
+with no fallback to a later name. The username is always required, and the UID and the partition
+are required once their headers are configured, so a caller never lands in the empty partition.
+Every value of every `GroupHeaders` header is a group, not split at commas. `AllowedPartitions`
+admits only the listed partitions, with the rules of `jwtauth`'s. A header name may appear in one
+list only and must pass `k8sapiproxy.ValidateCallerHeaderNames`, the check
+`Config.ExtraCallerHeaders` applies. Every peer in `AllowedNames` can name any caller, so give front proxies a CA of their
+own and list only the proxies that authenticate their callers and overwrite these headers.
+
+In a chain of authenticators the two refuse differently. No client certificate, a certificate
+that does not verify against the authenticator's bundle, one without a single name in the
+configured field, and a name the allowlist or prefix does not admit are plain errors: the next
+authenticator is tried, which is how a workload's certificate passes the front-proxy
+authenticator and reaches its own. An allowed front proxy whose headers are missing, empty,
+repeated or name a partition that is not allowed is refused with an error wrapping
+`k8sapiproxy.ErrCallerRefused`, which ends the chain: no later authenticator admits the request
+on a credential the proxy only forwarded. That holds only for the authenticators after it, so
+the front-proxy authenticator must come first: with a bearer-token authenticator ahead of it, a
+request from an allowed proxy that forwards a token is admitted under the token's identity and
+the empty partition, and the headers are never read. The binary's chain is not exported and has
+no mode for these authenticators, so an embedder that combines them writes its own chain, which
+must stop at an error wrapping `ErrCallerRefused`.
+
+Only the header failures of a front proxy that verifies now are final. A proxy whose certificate
+expired, or whose CA was rotated out of the bundle, is a peer like any other to the
+authenticator, and its requests fall through. With a bearer-token authenticator behind it, a
+request such a proxy forwards with the caller's own `Authorization` header is then admitted
+under the token's identity and that authenticator's partition. Do not chain a bearer-token
+authenticator behind the front-proxy authenticator on a listener where the proxy forwards
+callers' `Authorization`, or have the proxy strip it. A certificate that verified but whose name
+`AllowedIdentities`, `RequiredURIPrefix` or `AllowedNames` does not admit is the authenticator's
+to judge, and is still a plain error by choice, so a chain can admit the caller another way, as
+`jwtauth`'s filters do.
+
 `upstream.Transport` (`upstream.New`, distinct from `upstream.StaticTransport` below) sends `in-cluster`, and the proxy's `--host-cluster-id` `gke_` cluster, to the API server through the pod's service account. Any other
 `gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
 Application Default Credentials): it describes the cluster through the Container API and picks its
@@ -83,8 +183,8 @@ ends, so a watch or an `exec` session is recorded when it closes. The event hold
 authenticator names them), the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
 `unauthenticated`, `auth_unavailable` when the TokenReview or a key set fetch fails, `refused` with its reason,
-`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap
-answered 429, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
+`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap or a caller's own limit
+answered 429 (only the caller's limit sets a reason), or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
 written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
@@ -131,6 +231,60 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+The handler bounds what it forwards at once. `--max-in-flight` (`KUBE_PROXY_MAX_IN_FLIGHT`,
+`Config.MaxInFlight`; 24 in the binary, `0` for no cap) is one cap every caller shares: a request
+over it is answered `429 Too Many Requests` with `Retry-After: 1`, which client-go, and so
+`kubectl`, waits out and retries up to ten times. A watch and the `log`, `exec`, `attach`,
+`portforward` and `proxy` subresources stay open for as long as the caller follows them, and take
+no slot.
+
+That cap does not stop one caller from holding all of it, or from opening watches without end.
+`Config.CallerLimits` does. It returns, for a caller, a `CallerLimits`: `MaxInFlight`, the most
+requests of the kind the shared cap counts that the caller may have in flight, and
+`MaxLongRunning`, the most watches and long-running subresource requests it may have open (a `log`
+request counts as one whether or not it follows). The two are counted apart, so a caller that
+follows a watch for an hour keeps its whole in-flight limit, and a zero or negative field is no
+limit. The binary has one pair of limits, for every caller an embedder's func does not give limits
+of its own:
+
+| Flag                            | Environment variable                     | Meaning                                                                                               |
+| ------------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `--max-in-flight-per-caller`    | `KUBE_PROXY_MAX_IN_FLIGHT_PER_CALLER`    | `CallerLimits.MaxInFlight` for a caller the embedder sets none for. `0`, the default, is no limit.    |
+| `--max-long-running-per-caller` | `KUBE_PROXY_MAX_LONG_RUNNING_PER_CALLER` | `CallerLimits.MaxLongRunning` for a caller the embedder sets none for. `0`, the default, is no limit. |
+
+A `CallerLimits` can also put the caller in a group: `Group` names it, and `GroupMaxInFlight` and
+`GroupMaxLongRunning` are the same two limits for every caller that returns that name, counted
+together. A request is admitted only when its caller and its group both have room, counts for both,
+and gives both back when it ends. That bounds a set of callers in aggregate, which per-caller
+limits cannot: enough callers, each under its own limit, still fill the shared cap. When callers of
+one group return different limits, each request is held to the limits its own caller returned,
+against the one count. No flag sets a group. A group whose `GroupMaxInFlight` is not below a
+non-zero `--max-in-flight` can take every shared slot, so it reserves nothing for other callers;
+the handler logs a warning once for each such group name, on `Config.Logger`. A key the func sets
+and a username are separate namespaces, as group names are, so a caller whose username equals
+another caller's key is still counted on its own.
+
+A caller at a limit gets the shared cap's answer, the same `429` with `Retry-After`, audited as
+`throttled` with one of four values of `rejection_reason` and counted under it in
+`kubeagents_kube_proxy_rejected_requests_total`: `caller_in_flight_limit` or
+`caller_long_running_limit` for the caller's own limit, which is checked first, and
+`caller_group_in_flight_limit` or `caller_group_long_running_limit` for its group's. The shared
+cap's `429` has no reason. The check runs after `Config.Authorize` and the policy, so a request
+they refuse counts for nothing, and before the shared slot is taken, so a caller at a limit never
+holds one. A request counts until the handler has finished it: when the response is copied, when a
+watch or a log follow ends or its caller disconnects, and when an upgraded connection closes. A
+request answered from the response cache, or joined to another caller's fetch, counts like any
+other, as it does for the shared cap.
+
+A caller's own limits are counted under `CallerLimits.Key`, which is the username unless the func
+sets it; the partition is not part of it. With the default, pods that share a ServiceAccount share
+its limits, and an embedder that wants a count per pod puts the pod in the key. Under
+`--auth-mode=none` every caller is `unauthenticated`, so the flags' limits are then one more
+shared cap. Each replica counts for itself. Set an in-flight limit well under `--max-in-flight`,
+and know what a low one costs: against an API server without aggregated discovery a cold `kubectl`
+asks for every group version at once, some thirty requests, so under a smaller limit it completes
+only through client-go's retries of the `429`s, and a request answered `429` ten times fails.
+
 The binary serves TLS with the certificate chain in `--tls-cert-file` (`KUBE_PROXY_TLS_CERT_FILE`)
 and the private key in `--tls-key-file` (`KUBE_PROXY_TLS_KEY_FILE`) when both are set; either one
 empty serves plain HTTP. One PEM file can hold both the `CERTIFICATE` blocks and the `PRIVATE KEY`:
@@ -145,6 +299,9 @@ not load, such as one read mid-rotation, is logged, counted in
 being served. `certreload.CAPool` does the same for a CA bundle an embedder dials with: its
 `Transport` verifies each new connection against the current bundle, with hostname and IP SAN
 checks unchanged, speaks HTTP/1.1 only (`ForceAttemptHTTP2` off), and uses no HTTP proxy.
+`certreload.NewCAPoolUnion` pools several bundles, such as the client CAs a listener advertises
+for more than one authenticator; each file reloads on its own, and one that stops loading keeps
+its last good certificates in the pool while the others follow their files.
 
 Cached responses and coalesced fetches are shared across callers, which is safe while the
 `UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
@@ -183,11 +340,60 @@ still read them. An entry that is not an HTTP header name, or is `Host`, `Conten
 `Transfer-Encoding`, `Connection` or `Upgrade`, is an error from `NewHandler`. The binary sets
 neither option.
 
+A program that needs only those two options on top of the binary, or one more TokenReview audience
+with callers of its own, does not rebuild the server from the packages: its `main` calls `proxyserver.Run` (`pkg/proxyserver`), which is what
+`cmd/k8s-api-proxy` calls.
+
+```go
+func main() {
+	err := proxyserver.Run(context.Background(), os.Args[1:], proxyserver.Options{
+		Version:            version,
+		Authorize:          authorize,
+		ExtraCallerHeaders: []string{"X-Example-Credential"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`Options.Authorize` and `Options.ExtraCallerHeaders` become the `Config` fields of the same names,
+and `Options.Version` is what `--version` and the startup log report after the name
+`k8s-api-proxy`.
+
+`Options.CallerLimits` is `Config.CallerLimits` for an embedder that limits some callers and not
+others. The two per-caller flags stay the limits of a caller it does not answer for: a
+`MaxInFlight` or `MaxLongRunning` it returns as zero takes the flag's value, and a negative one is
+no limit for that caller whatever the flag says. Its key and group fields are used as returned.
+
+`Options.AudienceCallers` maps a TokenReview audience to the caller usernames admitted for it, and
+adds those entries to the audiences the flags and the environment configure. A caller admitted this
+way is held to its pod like any other TokenReview caller, so the proxy's ServiceAccount needs `get`
+on `pods` in that caller's namespace. An audience the server already accepts is an error at startup
+and not a union of the two caller lists, so an embedder cannot widen who `--audience` or
+`CREDENTIAL_PROXY_SESSION_AUDIENCE` admits. These are startup errors too: an audience name that is
+empty, padded with whitespace or holds a comma; an audience with no caller, or with a blank one; a
+caller that another audience already admits; and a non-empty map when `--auth-mode` does not include
+`token-review`. Each is an `*AudienceCallersError`, so an embedder that fills the map from settings
+of its own can find it with `errors.As` and name those settings. An empty map changes nothing.
+
+`proxyserver.NewHandler` returns the handler `Run` would serve for the same arguments and options,
+with the flags registered on a `flag.FlagSet` the caller passes and nothing started. It is for a
+program that serves the handler itself and for an embedder's tests of its `Options`.
+
+Everything else is the binary's: the same flags, environment variables and
+defaults, the same log lines, and the same drain on `SIGINT` or `SIGTERM`. `Run` returns the error
+the binary exits on, and `nil` after `--version` or a drained shutdown. It registers the flags on
+`flag.CommandLine`, so a process calls it once. A flag that does not parse exits the process there;
+if the program gave `flag.CommandLine` another error handling, `Run` returns the parse error and
+starts nothing.
+
 Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
 (`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
 archive against the release's signed `checksums.txt`. `k8s-api-proxy --version` prints the release an
 archive was built for; the `kube-proxy` image prints the commit it was built from, and a local build
-prints `dev`. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
+prints `dev`. The image runs [`kube-proxy/cmd/kube-proxy`](../kube-proxy/README.md), the same server
+with the kube-agents task credential gate. Archives from releases before the flag existed have no `--version`. Releases published before the pipeline built
 it carry none.
 
 For standalone sidecar or loopback bridge deployments outside a host cluster, `cmd/k8s-api-proxy`
@@ -293,7 +499,7 @@ the manifests cover the serving certificate, the Service name the certificate, t
 the gateway rule share, and the NetworkPolicy that admits the gateway's pods. In
 [`examples/local-bridge/`](examples/local-bridge/), one process per sandbox listens on loopback
 with `--auth-mode=none` and forwards to a local `--upstream-url`.
-`cmd/k8s-api-proxy/examples_test.go` builds the binary's handler from the container `args` in the
+`pkg/proxyserver/examples_test.go` builds the binary's handler from the container `args` in the
 manifests and from the fenced flag blocks in the two example READMEs, so an unknown flag or a
 refused combination there fails the module's tests; flags named in prose are not checked.
 
@@ -316,7 +522,7 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 ```
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `CallerIdentity`,
-`AuthorizeAttributes`, `AuthorizeError`, `UpstreamTransport`, `AuditSink`, `CacheStore` and
-`AuditEvent` may change in any release. The version moves with every
+`AuthorizeAttributes`, `AuthorizeError`, `CallerLimits`, `UpstreamTransport`, `AuditSink`, `CacheStore`,
+`AuditEvent`, `ValidateCallerHeaderNames`, `proxyserver.Run`, `proxyserver.NewHandler`, `proxyserver.Options`, `proxyserver.AudienceCallersError` and `pkg/mtlsauth` may change in any release. The version moves with every
 kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
 module until the module's own versioning is decided.

@@ -131,8 +131,16 @@ One exception to one session per incident: a record that reached the detector la
 no detector was pulling, or waited over 30 minutes) is backlog. It goes to `POST /v1/drift-backlog`
 with no session, and the daemon posts one digest per burst instead of a card each. An install's own
 Helm apply runs under the installer's account and arrives as exactly such a burst. A late `kubectl`
-write, and the late rows of a principal with fewer than three in the burst, are still carded. The detector's
-README, "The backlog", has the rule and its cost.
+write to anything but a kube-agents CRD, and the late rows of a principal with fewer than three in
+the burst, are still carded. An
+upgrade's writes reach the detector it is about to replace while that detector is pulling, so they
+are not late; the detector sends a write to its own release's objects (its two namespaces, the
+cluster-scoped RBAC and admission objects named after it, and objects that carry its Helm
+annotations) by a client other than `kubectl`, and a write to a kube-agents CRD, to the same route.
+The daemon digests the release writes only while their principal has a Helm upgrade under way,
+from Helm's create of its release record Secret to its first update of it, and cards them
+otherwise. The detector's README, "The
+backlog", has both rules and their cost.
 
 ## Choosing CUJs: the test
 

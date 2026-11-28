@@ -3884,7 +3884,15 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         start = source.index('  print_step "🎉 Upgrade Complete!"\n')
         return source[start:source.index("\n}\n", start)]
 
-    def _run(self, mode, keys, helper=_STUB_HELPER, install_env_file="/x/install.env", env=None):
+    def _run(
+        self,
+        mode,
+        keys,
+        helper=_STUB_HELPER,
+        install_env_file="/x/install.env",
+        env=None,
+        gcloud_body="echo 123456",
+    ):
         """Runs the tail; returns the process and the gcloud calls it made."""
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
         with tempfile.TemporaryDirectory() as tmp:
@@ -3893,7 +3901,7 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
                 f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
                 f"{helper}"
-                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; echo 123456; }}\n'
+                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; {gcloud_body}; }}\n'
                 "print_step() { :; }\n"
                 'print_gateway_home_channel_unset_summary() { echo "SUMMARY"; }\n'
                 "set -Eeuo pipefail\n"
@@ -3965,6 +3973,65 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST args=[] number=987654321 env=/x/install.env topic=t", "SUMMARY"])
         self.assertEqual(calls, "")
+
+    def test_a_full_upgrade_reads_chat_project_number_when_chat_project_id_differs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text(
+                "PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+            )
+            proc, calls = self._run(
+                "full",
+                {
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_PROJECT_ID": "workspace-chat-proj",
+                    "CHAT_MANAGE_PROJECT": "false",
+                    "NAMESPACE": "kubeagents-system",
+                },
+                helper="",
+                install_env_file=str(install_env),
+                env={"HOME": tmp, "TERM": "dumb"},
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(calls, "projects describe workspace-chat-proj --format=value(projectNumber)\n")
+        self.assertIn("projects/workspace-chat-proj/topics/platform-agent-chat-events", out)
+        self.assertIn("service-123456@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn("https://chat.google.com/dm/123456", out)
+
+    def test_a_full_upgrade_does_not_leak_host_project_number_when_chat_project_id_is_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text(
+                "PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\nCHAT_PROJECT_ID=workspace-chat-proj\nCHAT_MANAGE_PROJECT=false\n"
+            )
+            proc, calls = self._run(
+                "full",
+                {
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_PROJECT_ID": "workspace-chat-proj",
+                    "CHAT_MANAGE_PROJECT": "false",
+                    "PROJECT_NUMBER": "111111",
+                    "NAMESPACE": "kubeagents-system",
+                },
+                helper="",
+                install_env_file=str(install_env),
+                env={"HOME": tmp, "TERM": "dumb"},
+                gcloud_body="return 1",
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(calls, "projects describe workspace-chat-proj --format=value(projectNumber)\n")
+        self.assertIn("service-<CHAT_PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertNotIn("service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com", out)
+        self.assertIn("CHAT_PROJECT_NUMBER is unavailable;", out)
+        self.assertIn(
+            "have an administrator of 'workspace-chat-proj' run the 'gcloud beta services identity create' and Pub/Sub IAM commands printed above",
+            out,
+        )
+        self.assertNotIn("re-run install.sh (it re-applies the Chat Pub/Sub resources)", out)
+        self.assertNotIn("111111", out)
+        self.assertNotIn("https://chat.google.com/dm/", out)
 
 
 class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):
@@ -4933,6 +5000,164 @@ class KanbanAdmissionPreflightTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             self.assertIn("Dry-Run Upgrade Plan Preview", proc.stdout)
+
+
+class PostUpgradeHealthVerificationTest(unittest.TestCase):
+    """Stage 5 rollout verification skips sandbox and credential-proxy waits in operator mode.
+
+    An operator-only upgrade leaves workload images on the previous revision,
+    so a newer operator can render probes (such as the credential broker's :8768
+    readiness listener added in 0.24.0) that an older workload image cannot
+    answer until --upgrade-mode=harness rolls it.
+    """
+
+    def _run_verify(self, mode, restarted_agent="false", fail_targets=(), missing_targets=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            log_file = tmp_path / "kubectl.log"
+            fail_list = " ".join(shlex.quote(t) for t in fail_targets)
+            missing_list = " ".join(shlex.quote(t) for t in missing_targets)
+            kubectl_stub = bin_dir / "kubectl"
+            kubectl_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log_file))}\n"
+                "if [ \"${1:-}\" = \"get\" ]; then\n"
+                f"  for m in {missing_list}; do\n"
+                "    if [ \"${2:-}/${3:-}\" = \"$m\" ]; then exit 1; fi\n"
+                "  done\n"
+                "  exit 0\n"
+                "fi\n"
+                "if [ \"${1:-}\" = \"rollout\" ] && [ \"${2:-}\" = \"status\" ]; then\n"
+                f"  for f in {fail_list}; do\n"
+                "    if [ \"${3:-}\" = \"$f\" ]; then\n"
+                "      echo \"error: timed out waiting for ${3}\" >&2\n"
+                "      exit 1\n"
+                "    fi\n"
+                "  done\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            kubectl_stub.chmod(0o755)
+
+            installer_common = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                f'source "{installer_common}"\n'
+                f'PARAM_UPGRADE_MODE={shlex.quote(mode)}\n'
+                'PARAM_IMAGE_TAG=""\n'
+                f'verify_post_upgrade_health "kubeagents-system" {shlex.quote(restarted_agent)} "{_REPO_ROOT}"\n'
+            )
+            env = get_isolated_test_env(bin_dir=str(bin_dir))
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(_REPO_ROOT),
+            )
+            calls = log_file.read_text().splitlines() if log_file.exists() else []
+            return proc, calls
+
+    def test_operator_mode_skips_sandbox_and_broker_waits_even_when_broker_would_fail(self):
+        proc, calls = self._run_verify(
+            mode="operator",
+            restarted_agent="false",
+            fail_targets=(
+                "statefulset/platform-agent-shell",
+                "deployment/platform-agent-credential-proxy",
+            ),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rollouts = [c for c in calls if c.startswith("rollout status ")]
+        self.assertEqual(len(rollouts), 1, rollouts)
+        self.assertIn("deployment/kube-agents-controller-manager", rollouts[0])
+        self.assertFalse(any("platform-agent-shell" in c for c in calls), calls)
+        self.assertFalse(any("platform-agent-credential-proxy" in c for c in calls), calls)
+        self.assertIn("Skipping platform-agent-shell and platform-agent-credential-proxy rollout waits in operator mode", proc.stdout)
+        self.assertIn("--upgrade-mode=harness", proc.stdout)
+
+    def test_operator_mode_with_restarted_agent_waits_for_operator_and_gateway_only(self):
+        proc, calls = self._run_verify(
+            mode="operator",
+            restarted_agent="true",
+            fail_targets=("deployment/platform-agent-credential-proxy",),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rollouts = [c for c in calls if c.startswith("rollout status ")]
+        self.assertEqual(len(rollouts), 2, rollouts)
+        self.assertIn("deployment/kube-agents-controller-manager", rollouts[0])
+        self.assertIn("deployment/platform-agent-gateway", rollouts[1])
+        self.assertFalse(any("platform-agent-shell" in c for c in calls), calls)
+        self.assertFalse(any("platform-agent-credential-proxy" in c for c in calls), calls)
+        self.assertIn("Skipping platform-agent-shell and platform-agent-credential-proxy rollout waits in operator mode", proc.stdout)
+
+    def test_harness_mode_waits_for_gateway_sandbox_and_broker_and_propagates_failure(self):
+        proc_ok, calls_ok = self._run_verify(mode="harness")
+        self.assertEqual(proc_ok.returncode, 0, proc_ok.stdout + proc_ok.stderr)
+        rollouts_ok = [c for c in calls_ok if c.startswith("rollout status ")]
+        self.assertEqual(len(rollouts_ok), 3, rollouts_ok)
+        self.assertIn("deployment/platform-agent-gateway", rollouts_ok[0])
+        self.assertIn("statefulset/platform-agent-shell", rollouts_ok[1])
+        self.assertIn("deployment/platform-agent-credential-proxy", rollouts_ok[2])
+        self.assertNotIn("Skipping platform-agent-shell", proc_ok.stdout)
+
+        proc_fail, calls_fail = self._run_verify(
+            mode="harness",
+            fail_targets=("deployment/platform-agent-credential-proxy",),
+        )
+        self.assertNotEqual(proc_fail.returncode, 0, proc_fail.stdout + proc_fail.stderr)
+        self.assertTrue(
+            any("rollout status deployment/platform-agent-credential-proxy" in c for c in calls_fail),
+            calls_fail,
+        )
+
+    def test_full_mode_waits_for_operator_gateway_sandbox_and_broker_and_propagates_failure(self):
+        proc_ok, calls_ok = self._run_verify(mode="full")
+        self.assertEqual(proc_ok.returncode, 0, proc_ok.stdout + proc_ok.stderr)
+        rollouts_ok = [c for c in calls_ok if c.startswith("rollout status ")]
+        self.assertEqual(len(rollouts_ok), 4, rollouts_ok)
+        self.assertIn("deployment/kube-agents-controller-manager", rollouts_ok[0])
+        self.assertIn("deployment/platform-agent-gateway", rollouts_ok[1])
+        self.assertIn("statefulset/platform-agent-shell", rollouts_ok[2])
+        self.assertIn("deployment/platform-agent-credential-proxy", rollouts_ok[3])
+        self.assertNotIn("Skipping platform-agent-shell", proc_ok.stdout)
+
+        proc_fail, calls_fail = self._run_verify(
+            mode="full",
+            fail_targets=("deployment/platform-agent-credential-proxy",),
+        )
+        self.assertNotEqual(proc_fail.returncode, 0, proc_fail.stdout + proc_fail.stderr)
+        self.assertTrue(
+            any("rollout status deployment/platform-agent-credential-proxy" in c for c in calls_fail),
+            calls_fail,
+        )
+
+    def test_harness_mode_skips_rollout_wait_when_sandbox_or_broker_object_is_missing(self):
+        proc, calls = self._run_verify(
+            mode="harness",
+            missing_targets=(
+                "statefulset/platform-agent-shell",
+                "deployment/platform-agent-credential-proxy",
+            ),
+            fail_targets=(
+                "statefulset/platform-agent-shell",
+                "deployment/platform-agent-credential-proxy",
+            ),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rollouts = [c for c in calls if c.startswith("rollout status ")]
+        self.assertEqual(len(rollouts), 1, rollouts)
+        self.assertIn("deployment/platform-agent-gateway", rollouts[0])
+        self.assertTrue(any("get statefulset platform-agent-shell" in c for c in calls), calls)
+        self.assertTrue(any("get deployment platform-agent-credential-proxy" in c for c in calls), calls)
+
+    def test_main_invokes_verify_post_upgrade_health(self):
+        text = _UPGRADE_SH.read_text()
+        main = text[text.index("main() {"):]
+        self.assertIn('verify_post_upgrade_health "$target_namespace" "$restarted_agent" "$repo_dir"', main)
 
 
 if __name__ == "__main__":

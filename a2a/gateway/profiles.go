@@ -70,6 +70,14 @@ const (
 	// noticeUnattendedChild refuses a scheduled run's child whose profile
 	// doesn't allow unattended runs (#6744).
 	noticeUnattendedChild = "%s doesn't take scheduled work, so a scheduled run can't hand it a task"
+	// noticeBelowScheduleSession refuses a delegation from a session turn
+	// in a chain a schedule started: such a turn never gets the delegate
+	// tool (wakeMayDelegate), so one arriving anyway is refused here too.
+	noticeBelowScheduleSession = "a turn in a chain a schedule started doesn't delegate"
+	// noticeWakeNotGranted refuses a delegation from a wake the gateway
+	// didn't let delegate again (wakeMayDelegate): it has no delegate tool,
+	// so one arriving anyway is refused.
+	noticeWakeNotGranted = "this turn reports what came back and wasn't let delegate again"
 	// The profile parent's chain and scope refusals (#5686). The chain and
 	// scope named are the parent's own.
 	noticeProfileCycle         = "%s is already working on this request above this task (%s), so it can't take it again"
@@ -949,11 +957,11 @@ func truncateBytes(s string, n int) string {
 
 // publishDispatchStop writes the stop record for a profile task, beside the
 // cancel already sent on its `…in`, for the dispatcher, which has no read on
-// `…in` (addendum 9 on #3655). The stream and the dispatcher's reader aren't
-// in this tree yet: until they are, the publish gets no ack and is logged,
-// and a task still queued runs when a slot frees. A task addressed to platform or a session has no record. A
-// failed publish is logged and leaves the cancel standing: a held task still
-// gets the cancel, and only one still queued would run.
+// `…in` (addendum 9 on #3655). The dispatcher ends a task it still holds
+// queued when it finds the record (a2a/dispatch/stop.go). A task addressed
+// to platform or a session has no record. A failed publish is logged and
+// leaves the cancel standing: a held task still gets the cancel, and only
+// one still queued would run.
 func (g *Gateway) publishDispatchStop(ctx context.Context, ref TaskRef) {
 	if ref.Tier == "" {
 		return

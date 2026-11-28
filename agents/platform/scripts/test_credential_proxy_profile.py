@@ -1011,6 +1011,70 @@ class ProfileRouteDenylistTest(ProfileRouteTest):
                 self.assertIn("takes no --", body["message"])
 
 
+# A synthetic token of a shape credential_shapes redacts.
+_PROFILE_OUTPUT_TOKEN = "ghp_SyntheticProfileOutput0123456789abcdef"
+
+
+class _OutputExecutor(_RecordingExecutor):
+    """Answers every command with the result a test sets."""
+
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+
+    def execute(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        return self.result
+
+
+class ProfileExecOutputRedactionTest(unittest.TestCase):
+    """A profile worker's exec output loses its credential shapes; the rest of the reply stands.
+
+    The route end to end as ProfileRouteTest drives it (its fixture, borrowed
+    rather than inherited so its tests do not run twice), with an executor
+    whose answer the test chooses.
+    """
+
+    setUp = ProfileRouteTest.setUp
+    _restore = staticmethod(ProfileRouteTest._restore)
+    set_gate = ProfileRouteTest.set_gate
+    post = ProfileRouteTest.post
+
+    def answer(self, **fields):
+        values = dict(exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False)
+        values.update(fields)
+        CredentialProxyHandler.executor = _OutputExecutor(credential_proxy.ExecutionResult(**values))
+
+    def test_a_profile_workers_stdout_and_stderr_are_redacted(self):
+        self.answer(
+            stdout=f"data:\n  token: {_PROFILE_OUTPUT_TOKEN}\n  region: us-central1\n",
+            stderr=f"Authorization: Bearer {_PROFILE_OUTPUT_TOKEN}\n",
+            stdout_bytes=64,
+        )
+        status, body = self.post({"argv": ["kubectl", "get", "configmap", "app", "-o", "yaml"]})
+        self.assertEqual(200, status, body)
+        self.assertEqual("data:\n  token: [REDACTED]\n  region: us-central1\n", body["stdout"])
+        self.assertEqual("Authorization: Bearer [REDACTED]\n", body["stderr"])
+        self.assertEqual(64, body["bytesWritten"])
+        self.assertTrue(any("command output redacted" in record and "shapes=2" in record for record in self.records))
+        self.assertFalse(any(_PROFILE_OUTPUT_TOKEN in record for record in self.records), self.records)
+
+    def test_a_profile_workers_exit_code_is_kept(self):
+        self.answer(exit_code=1, stderr=f"error: token {_PROFILE_OUTPUT_TOKEN} rejected\n")
+        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        self.assertEqual((1, "completed"), (body["exitCode"], body["status"]))
+        self.assertEqual("error: token [REDACTED] rejected\n", body["stderr"])
+
+    def test_a_profile_workers_cut_stdout_is_redacted_across_the_cut(self):
+        cut = "value: " + _PROFILE_OUTPUT_TOKEN[:12]
+        self.answer(stdout=cut, truncated=True, stdout_truncated=True, stdout_bytes=len(cut), output_limit=len(cut))
+        status, body = self.post({"argv": ["kubectl", "get", "configmap", "app", "-o", "yaml"]})
+        self.assertEqual(200, status, body)
+        self.assertEqual("value: [REDACTED]", body["stdout"])
+        self.assertEqual((True, len(cut)), (body["stdoutTruncated"], body["bytesWritten"]))
+
+
 class ChangedDefaultTest(unittest.TestCase):
     """A stored default that changed anyway does not move a profile's call.
 
@@ -1805,6 +1869,26 @@ class ProfileVcsRouteTest(unittest.TestCase):
                 self.reset()
                 status, body = self.vcs_post(verb, VALID["token"])
                 self.assert_ran(verb, status, body)
+
+    def test_a_forge_read_answer_is_redacted_and_a_clone_is_not(self):
+        # A forge's text is tool output; a clone's answer is a base64 git
+        # bundle, which redaction would corrupt, so it passes as built.
+        token_shape = "ghp_SyntheticVcsAnswerToken0123456789abc"
+        for verb in sorted(credential_proxy.REDACTED_VCS_READ_VERBS):
+            with self.subTest(verb=verb):
+                self.reset()
+                self.routes[verb].return_value = {"body": f"see {token_shape}", token_shape: 1}
+                status, body = self.vcs_post(verb, VALID["token"])
+                self.assertEqual(200, status, body)
+                self.assertEqual({"body": "see [REDACTED]", "[REDACTED]": 1}, body)
+        bundle = {"bundleBase64": "AKIA" + "A" * 16, "branch": "main"}
+        self.routes["clone"].return_value = bundle
+        status, body = self.vcs_post("clone", VALID["token"])
+        self.assertEqual((200, bundle), (status, body))
+        self.assertEqual(
+            {"clone", "identity", "publish", "proposal-create", "proposal-update"},
+            set(PROFILE_VCS_READS | credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS) - credential_proxy.REDACTED_VCS_READ_VERBS,
+        )
 
     def test_a_profile_vcs_request_takes_the_profile_share_and_the_background_class(self):
         # As on /v1/exec: a profile worker's clone or publish is bounded by
@@ -2735,6 +2819,65 @@ class ReportCredentialTest(unittest.TestCase):
         self.assertNotEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
 
 
+UNATTENDED = CASES["the unattended permit, a builtin schedule trigger with a stream"]
+UNATTENDED_REPORT = CASES["the unattended permit on a report credential"]
+
+
+class UnattendedPermitIsInertTest(unittest.TestCase):
+    """vcs:unattended-write, which the verifiers know before the broker's gate reads it.
+
+    Until the gate reads the permit (docs/designs/unattended-write-permit.md,
+    row 6), a credential that carries it reaches what the same credential
+    reaches without it: no version-control write, and for a report credential
+    the audit-report routes alone.
+    """
+
+    _restore = staticmethod(ProfileRouteTest._restore)
+    set_gate = ProfileRouteTest.set_gate
+    request = ReportCredentialTest.request
+    assert_report_refused = ReportCredentialTest.assert_report_refused
+
+    def setUp(self):
+        ProfileRouteTest.setUp(self)
+
+    def admit(self, case, tier):
+        self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", tier)}
+        self.set_gate()
+        return CredentialProxyHandler.profile_gate.admit(self.principal, case["token"])
+
+    def test_the_permit_alone_opens_no_gated_write(self):
+        unattended = self.admit(UNATTENDED, "read")
+        self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), unattended.task.permits)
+        confirmed = self.admit(PERMIT, "read")
+        for verb in sorted(credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS):
+            with self.subTest(verb=verb):
+                self.assertIsNotNone(credential_proxy.profile_vcs_refusal(unattended, verb))
+                self.assertIsNone(credential_proxy.profile_vcs_refusal(confirmed, verb))
+
+    def test_a_report_credential_with_the_permit_reaches_the_report_routes_alone(self):
+        principal = self.admit(UNATTENDED_REPORT, "unattended")
+        self.assertTrue(principal.task.report_only)
+        self.assertEqual(frozenset({task_credential.PERMIT_VCS_UNATTENDED_WRITE}), principal.task.permits)
+
+        def verdict(case, method, path):
+            status, body = self.request(method, path, token=case["token"])
+            return status, body.get("rule"), body.get("code")
+
+        gated = [f"/v1/vcs/{verb}" for verb in sorted(credential_proxy.PROFILE_PERMIT_GATED_VCS_VERBS)]
+        for path in broker_route_paths() + gated:
+            for method in ("GET", "POST"):
+                with self.subTest(method=method, path=path):
+                    # The same answer as the report credential with no permit.
+                    got = verdict(UNATTENDED_REPORT, method, path)
+                    self.assertEqual(verdict(REPORT, method, path), got)
+                    if not credential_proxy.report_credential_permits(method, path):
+                        self.assertEqual(403, got[0])
+        for path in gated:
+            with self.subTest(path=path):
+                self.assert_report_refused(*self.request("POST", path, token=UNATTENDED_REPORT["token"]))
+        self.assertEqual([], self.executor.calls)
+
+
 class ReportCredentialRoutesTest(unittest.TestCase):
     """REPORT_CREDENTIAL_ROUTES, pinned: an entry added or widened fails here."""
 
@@ -2745,13 +2888,16 @@ class ReportCredentialRoutesTest(unittest.TestCase):
                 ("GET", "{stream}/latest"),
                 ("GET", "{stream}/runs"),
                 ("GET", "{stream}/runs/{run}"),
+                ("GET", "{stream}/runs/{start}"),
                 ("PUT", "{stream}/runs/{run}"),
+                ("PUT", "{stream}/runs/{start}"),
                 ("PUT", "{stream}/latest"),
                 ("DELETE", "{stream}/latest"),
             ],
             [
                 (method, pattern.pattern.replace(credential_proxy._REPORT_STREAM, "{stream}").replace(
-                    credential_proxy._REPORT_RUN_STAMP, "{run}"))
+                    credential_proxy._REPORT_RUN_STAMP, "{run}").replace(
+                    credential_proxy._REPORT_RUN_START, "{start}"))
                 for method, pattern in credential_proxy.REPORT_CREDENTIAL_ROUTES
             ],
         )

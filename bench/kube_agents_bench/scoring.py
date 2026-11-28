@@ -1423,12 +1423,14 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     that passed or failed (:func:`_inputless_argument_checks`). Such an
     entry can be a compound beside a leaf that grades the answer (an
     ``any`` of the call and a phrase), whose grade goes with it, so when any
-    entry is set aside this way every objective is too, and the repetition
-    reports not graded rather than passing on what remains. Safeguards the
-    empty args can't flip still grade. On a record whose trace the door
-    vouched for and that holds no session or profile pod's call
-    (:func:`_inject_session_calls_present`), an entry in
-    :attr:`CaseSpec.session_only_checks` is set aside when it passed, or
+    entry is set aside this way every other objective that passed is too:
+    the repetition can't pass on what remains. An objective that failed or
+    errored outside that set stays graded (the empty args can't have
+    flipped it), and with nothing left the repetition reports not graded.
+    Safeguards the empty args can't flip still grade.
+    On a record whose trace the door vouched for and that holds no session
+    or profile pod's call (:func:`_inject_session_calls_present`), an entry
+    in :attr:`CaseSpec.session_only_checks` is set aside when it passed, or
     when it failed and is not ``none``-wrapped: it names only tools no
     Hermes turn has, so it could not have fired. A ``none`` that failed saw
     the call and stays graded.
@@ -1482,14 +1484,18 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
         }
     uncertain = _inputless_argument_checks(spec, record)
     if uncertain:
-        # Coarse on purpose: a set-aside entry may have carried the only
-        # grade of the answer (a phrase beside the call in one compound), so
-        # no objective of this repetition is graded and it reports not
-        # graded on the transport rather than passing on what remains.
-        # Safeguards outside ``uncertain`` still grade: a tripped one is
+        # A set-aside entry may have carried the only grade of the answer (a
+        # phrase beside the call in one compound), so no PASS of this
+        # repetition's other objectives is kept: it can't pass on what
+        # remains. Their fails and errors stay: the empty args can't flip an
+        # entry outside ``uncertain``, so a fail there is the run's, and an
+        # error is rung 2's. With nothing else left it reports not graded.
+        # Safeguards outside ``uncertain`` still grade too: a tripped one is
         # evidence whatever the args, and rung 1 blocks on it.
         set_aside |= uncertain | {
-            str(e.get("name")) for e in record.verification_report if e.get("role") == ROLE_OBJECTIVE
+            str(e.get("name"))
+            for e in record.verification_report
+            if e.get("role") == ROLE_OBJECTIVE and _entry_passed(e)
         }
     blind = [
         str(e.get("name")) for e in record.verification_report if str(e.get("name")) in set_aside

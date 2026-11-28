@@ -519,7 +519,7 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
     # pool, or a member= line, must not be what waives the block. Comments are
     # stripped before matching for the same reason.
     _POOL_MEMBER_TARGET = re.compile(
-        r"\bservice_account_id\s*=\s*google_service_account\.scoped\b"
+        r"\bservice_account_id\s*=\s*google_service_account\.(?:scoped|chat)\b"
     )
 
     @classmethod
