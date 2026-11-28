@@ -1685,6 +1685,11 @@
 # seeded fleet.
 ./tasks/scope-held-cluster-is-reported/task.yaml
 
+# Probe for mutable container image tag vs. sha256 digest pinning (#5759,
+# #5761, #7558): both :latest and semver tags are mutable unless pinned by
+# digest. Structured two-line declaration check; deployer: noop.
+./tasks/security-mutable-image-tag-digest-pinning/task.yaml
+
 # #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
 # stack plants two namespaces exporting one host everywhere and two exporting
 # another to themselves only, on the host cluster, installing a minimal
