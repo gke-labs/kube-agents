@@ -28,13 +28,24 @@ locals {
     "gkebackup.googleapis.com",
     "developerknowledge.googleapis.com",
   ]
-  pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator || var.enable_drift_pubsub) ? [
+  chat_project               = var.chat_project_id != "" ? var.chat_project_id : var.project_id
+  chat_cross_project         = local.chat_project != var.project_id
+  manage_chat_project        = var.enable_google_chat && var.chat_manage_project
+  chat_service_account_id    = local.chat_cross_project ? var.chat_service_account_id : ""
+  chat_service_account_email = var.enable_google_chat ? module.chat_pubsub[0].chat_service_account_email : ""
+
+  pubsub_apis = ((var.enable_google_chat && !local.chat_cross_project && var.chat_manage_project) || var.enable_pubsub_platform || var.enable_stockout_investigator || var.enable_drift_pubsub) ? [
     "pubsub.googleapis.com",
   ] : []
-  chat_apis = var.enable_google_chat ? [
+  chat_apis = (var.enable_google_chat && !local.chat_cross_project && var.chat_manage_project) ? [
     "chat.googleapis.com",
     "gsuiteaddons.googleapis.com",
   ] : []
+  chat_project_apis = (local.chat_cross_project && local.manage_chat_project) ? toset([
+    "chat.googleapis.com",
+    "gsuiteaddons.googleapis.com",
+    "pubsub.googleapis.com",
+  ]) : toset([])
   # Only when a folder or organisation is declared: the reconcile resolves a
   # container's members with one Cloud Asset Inventory search, and an install
   # that names explicit projects alone never calls the API and must not fail
@@ -142,16 +153,21 @@ locals {
   # The CR's spec.integration, as one local so the tests can read it.
   platform_agent_integration = merge(
     var.enable_google_chat ? {
-      googleChat = merge({
-        enabled          = true
-        topicName        = module.chat_pubsub[0].topic_name
-        subscriptionName = module.chat_pubsub[0].subscription_name
-        allowedUsers     = var.google_chat_allowed_users
-        homeChannel      = var.google_chat_home_channel
-        mode             = var.google_chat_mode
-        }, var.google_chat_home_channel_policy != "" ? {
-        homeChannelPolicy = var.google_chat_home_channel_policy
-      } : {})
+      googleChat = merge(
+        {
+          enabled          = true
+          topicName        = module.chat_pubsub[0].topic_name
+          subscriptionName = module.chat_pubsub[0].subscription_name
+          allowedUsers     = var.google_chat_allowed_users
+          homeChannel      = var.google_chat_home_channel
+          mode             = var.google_chat_mode
+        },
+        local.chat_cross_project ? { projectId = local.chat_project } : {},
+        local.chat_service_account_email != "" ? { serviceAccountEmail = local.chat_service_account_email } : {},
+        var.google_chat_home_channel_policy != "" ? {
+          homeChannelPolicy = var.google_chat_home_channel_policy
+        } : {}
+      )
     } : {},
     var.enable_slack ? {
       slack = merge({
@@ -689,16 +705,32 @@ resource "google_project_iam_member" "litellm_vertex_user" {
   depends_on = [google_project_service.vertex_ai]
 }
 
+# When chat_project_id differs from project_id, the Google Chat app and its
+# Pub/Sub topic and subscription live in chat_project_id; enable the three APIs
+# there too. chat_manage_project = false leaves the Chat project to its admin.
+resource "google_project_service" "chat_project" {
+  for_each = local.chat_project_apis
+
+  project            = local.chat_project
+  service            = each.value
+  disable_on_destroy = false
+}
+
 module "chat_pubsub" {
   source = "../../modules/chat-pubsub"
   count  = var.enable_google_chat ? 1 : 0
 
-  project_id                  = var.project_id
+  project_id                  = local.chat_project
   agent_service_account_email = module.kube_agents_iam.service_account_email
+  chat_service_account_id     = local.chat_service_account_id
+  manage                      = var.chat_manage_project
   topic_name                  = var.chat_topic_name
   subscription_name           = var.chat_subscription_name
 
-  depends_on = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_project_service.chat_project,
+  ]
 }
 
 # The drift detector's audit-log ingress: Log Router sink, drift-audit topic

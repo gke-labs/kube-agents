@@ -92,6 +92,8 @@ scope = {
 }
 
 enable_google_chat        = false
+chat_project_id           = ""
+chat_manage_project       = true
 chat_topic_name           = "platform-agent-chat-events"
 chat_subscription_name    = "platform-agent-chat-events-sub"
 google_chat_allowed_users = []

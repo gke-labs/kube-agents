@@ -132,6 +132,10 @@ KV_AUTH_VARIABLE = "SESSION_KV_API_KEY"  # the name of the variable the bearer t
 DEFAULT_KV_ENDPOINT = "http://127.0.0.1:8699"
 KV_FINDINGS_PATH = "/v1/findings"
 KV_TIMEOUT_SECONDS = 30
+# The queue is on the pod's loopback: a proxy from the environment must not get
+# the request and its bearer token, and urllib does not leave out a loopback
+# host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # The queue answers 503 only when it wrote nothing (its lock wait ran out, or its
 # transaction rolled back), and says the same body may be sent again: once, after
 # this pause, while the run's time allows it.
@@ -177,6 +181,7 @@ ROW_MEMBERS_KEY = "members"
 SKEW_VERDICT_BLOCKS = watch.SKEW_VERDICT_BLOCKS
 SKEW_VERDICT_CEILING = "at ceiling"
 WORKLOAD_REPLICAS_KEY = "replicas"
+REPLICA_NOUN = ("replica", "replicas")
 WORKLOADS_KEY = "workloads"
 NAME_KEY = watch.NAME_KEY
 PDB_KEY = watch.PDB_KEY
@@ -484,7 +489,7 @@ def kv_request(path: str, body: dict | None = None, timeout: float = KV_TIMEOUT_
     method = "GET" if body is None else "POST"
     req = urllib.request.Request(f"{kv_endpoint()}{path}", data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _SESSION_KV_OPENER.open(req, timeout=timeout) as resp:
             answer = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # The queue says which row or field it refused, or that it is busy, in
@@ -633,7 +638,11 @@ def budget_findings(member: dict) -> list[dict]:
         # the report names no workload at all.
         running = [w for w in workloads if (w.get(WORKLOAD_REPLICAS_KEY) or 0) > 0]
         singleton = any((w.get(WORKLOAD_REPLICAS_KEY) or 0) <= 1 for w in running) or not running
-        owners = ", ".join(f"{w.get(KIND_KEY)} {w.get(NAMESPACE_KEY)}/{w.get(NAME_KEY)} ({w.get(WORKLOAD_REPLICAS_KEY)} replicas)" for w in workloads)
+        owners = ", ".join(
+            f"{w.get(KIND_KEY)} {w.get(NAMESPACE_KEY)}/{w.get(NAME_KEY)} "
+            f"({w.get(WORKLOAD_REPLICAS_KEY)} {REPLICA_NOUN[w.get(WORKLOAD_REPLICAS_KEY) != 1]})"
+            for w in workloads
+        )
         name = str(budget.get(NAME_KEY) or budget.get(PDB_KEY) or "")
         namespace = str(budget.get(NAMESPACE_KEY) or "")
         field = budget.get(FIELD_KEY)

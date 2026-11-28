@@ -138,6 +138,11 @@ SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 # request that names no cluster resolves to this rather than to whatever the
 # base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+GOOGLE_CHAT_PROJECT_ID_ENV = "GOOGLE_CHAT_PROJECT_ID"
+GOOGLE_CHAT_SERVICE_ACCOUNT_ENV = "GOOGLE_CHAT_SERVICE_ACCOUNT"
+GOOGLE_CHAT_SUBSCRIPTION_PREFIX = "projects/"
+GOOGLE_CHAT_DISCOVERY_SERVICE = "chat"
+GOOGLE_CHAT_DISCOVERY_VERSION = "v1"
 
 # A kubectl read that names no cluster -- no `--context`, no `--kubeconfig`, no
 # KUBECONFIG forwarded by the shim -- runs on the host cluster through the
@@ -1731,6 +1736,49 @@ EXIT_STARTUP_FAILURE = 1
 # format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
 LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 LOG_MSEC_FORMAT = "%s.%03dZ"
+# GET /api/scope on the agent API proxy door: reads the reconcile's scope
+# snapshot and cluster profile identities from the data volume, plus local
+# k8s-event-watcher readiness from its metrics port on loopback.
+AGENT_API_SCOPE_PATH = "/api/scope"
+AGENT_API_FLEET_SCOPE_FILE = "fleet_scope.json"
+AGENT_API_WORKSPACE_ROOT_ENV = "CREDENTIAL_PROXY_WORKSPACE_ROOT"
+AGENT_API_HERMES_HOME_ENV = "HERMES_HOME"
+AGENT_API_DEFAULT_WORKSPACE_ROOT = "/opt/data"
+AGENT_API_PROFILES_DIR = "profiles"
+AGENT_API_RESERVED_PROFILES = frozenset({"default", "platform", "tse"})
+AGENT_API_PROFILE_CONFIG_FILE = "config.yaml"
+AGENT_API_PROFILE_SCAFFOLD_FILE = "profile.yaml"
+AGENT_API_PROFILE_USER_MD_FILE = "USER.md"
+AGENT_API_CLUSTER_IDENTITY_KEY = "cluster_identity"
+AGENT_API_EVENT_WATCHER_ENABLED_ENV = "EVENT_WATCHER_ENABLED"
+AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT = "true"
+AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV = "EVENT_WATCHER_METRICS_PORT"
+AGENT_API_EVENT_WATCHER_DEFAULT_METRICS_PORT = 9095
+AGENT_API_EVENT_WATCHER_METRICS_HOST = "127.0.0.1"
+AGENT_API_EVENT_WATCHER_METRICS_PATH = "/metrics"
+AGENT_API_EVENT_WATCHER_SCRAPE_TIMEOUT_SECONDS = 1.5
+AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES = 1024 * 1024
+AGENT_API_EVENT_WATCHER_READ_CHUNK_BYTES = 64 * 1024
+AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES = 64 * 1024
+AGENT_API_WATCH_SET_READY_METRIC = "k8s_event_watcher_watch_set_ready"
+AGENT_API_CLUSTER_UP_METRIC = "k8s_event_watcher_cluster_up"
+AGENT_API_DISCOVERY_ERRORS_METRIC = "k8s_event_watcher_cluster_discovery_errors_total"
+AGENT_API_EVENT_WATCHER_TRACKED_METRICS = (
+    AGENT_API_WATCH_SET_READY_METRIC,
+    AGENT_API_CLUSTER_UP_METRIC,
+    AGENT_API_DISCOVERY_ERRORS_METRIC,
+)
+AGENT_API_METRIC_CLUSTER_LABEL = "cluster"
+AGENT_API_METRIC_PROJECT_LABEL = "project"
+AGENT_API_METRIC_LOCATION_LABEL = "location"
+AGENT_API_METRIC_PROFILE_LABEL = "profile"
+AGENT_API_METRIC_NO_PROFILE_VALUE = "-"
+AGENT_API_EVENT_WATCHER_DIRECT_PROFILE = "direct"
+AGENT_API_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off"})
+AGENT_API_IDENTITY_CACHE_MAX_ENTRIES = 1024
+_PROMETHEUS_LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
+_PROFILE_IDENTITY_CACHE_LOCK = threading.Lock()
+_PROFILE_IDENTITY_CACHE: dict[tuple[str, int, int], dict[str, str] | None] = {}
 
 
 def probe_gce_universe_domain_answer(
@@ -2786,6 +2834,38 @@ CALLER_ROLES = (
     CALLER_ROLE_TEAMS_INBOUND,
 )
 
+# The roles whose `/v1/exec` output and MCP relay replies the broker passes
+# through `redact_tool_output` before answering: the callers whose model reads
+# the answer with nothing between it and the broker. The shell is not one: the
+# Hermes runtime behind it redacts tool results on its own side
+# (deploy/docker/patches/credential_redaction.py), and its answers reach the
+# model through that. The scope Job's answers feed scope_policy, not a model.
+REDACTED_OUTPUT_ROLES: frozenset[str] = frozenset({CALLER_ROLE_PROFILE, CALLER_ROLE_SESSION})
+# The version-control verbs whose answers those roles get redacted: the reads
+# whose answer is a forge's text. Left out: `clone`, whose answer is a git
+# bundle in base64 (redacting it would corrupt the bundle; the files reach the
+# model through the worker's own file tools, which the broker does not see);
+# `identity`, the install's own repository names; and the writes, whose answer
+# is the broker's account of what it did, which `proposal-create`'s claim
+# reads.
+REDACTED_VCS_READ_VERBS: frozenset[str] = frozenset(
+    {"proposal-view", "proposal-list", "proposal-commits", "branch-view", "issue-list", "issue-view"}
+)
+# The roles those answers are redacted for: the two above, and the A2A MCP
+# server's, whose one verb is `proposal-view` (ROLE_VCS_VERBS). That pod
+# answers MCP clients outside the cluster, whose model reads a proposal's body,
+# comments and diff as the install's forge credential fetched them, from a
+# repository the client may hold no read on of its own.
+REDACTED_VCS_READ_ROLES: frozenset[str] = REDACTED_OUTPUT_ROLES | {CALLER_ROLE_MCP}
+# The roles an audit-report read is redacted for: the two above, and the A2A
+# gateway's report relay, which posts the report it reads to chat. `finish`
+# redacts a report's strings before it stores them, but a profile worker's raw
+# store PUT does not go through `finish`, so the read is redacted here too. The
+# listener checks the writer stamp's sha256 against the stored bytes before it
+# answers, so the redaction comes after that check, and the X-Report-Writer
+# header is passed on unchanged. A body with nothing to redact passes as it came.
+REDACTED_REPORT_READ_ROLES: frozenset[str] = REDACTED_OUTPUT_ROLES | {CALLER_ROLE_A2A_REPORTS}
+
 # Which executables a role may hand to /v1/exec. A role absent here keeps
 # whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the profile role keeps
 # the two CLIs that reach a cluster read-only under task-credential confinement,
@@ -3512,9 +3592,17 @@ def required_roles(path: str) -> tuple[str, ...]:
 # decodes to an empty, `.` or `..` part or a control character, in any escaping.
 # A run is the ring's `%Y%m%dT%H%M%S.%fZ` stamp
 # (audit_report.REPORT_STAMP_FORMAT). The routes validate each segment again.
+# The one other run name is a run-start record's (#6812), `started-<run id>`
+# (REPORT_RUN_START_PREFIX), admitted on the GET and PUT of one run alone,
+# under a run write's rules and, for a profile task, only for its own task id
+# (report_run_start_permitted; fleet-audit-report-store.md §3).
 _REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
 _REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
+# Mirrored from audit_report_store.RUN_START_PREFIX and its run id, a DNS-1123
+# label; test_audit_report_routes.py holds them equal.
+REPORT_RUN_START_PREFIX = "started-"
+_REPORT_RUN_START = rf"{REPORT_RUN_START_PREFIX}[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?"
 _REPORT_STREAM = f"{AUDIT_REPORTS_PREFIX}/{_REPORT_AUDIT_ID}/{_REPORT_STORE_KEY}"
 # How deep a store key is unescaped before it is refused: it is escaped at most
 # twice (a non-GitHub path inside the key), so a fixed point past this is hostile.
@@ -3542,9 +3630,13 @@ REPORT_CREDENTIAL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(f"{_REPORT_STREAM}/latest")),
     ("GET", re.compile(f"{_REPORT_STREAM}/runs")),
     ("GET", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    # One run-start record, which finish reads back to mark its own run done.
+    ("GET", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_START}")),
     # finish's writes: the ring entry, then latest as its copy, and dropping a
     # latest that no longer describes the ledger.
     ("PUT", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    # start's run-start record, and finish's done mark on it.
+    ("PUT", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_START}")),
     ("PUT", re.compile(f"{_REPORT_STREAM}/latest")),
     ("DELETE", re.compile(f"{_REPORT_STREAM}/latest")),
 )
@@ -3635,6 +3727,9 @@ RULE_REPORT_NO_TRIGGER = "audit-report.no-trigger"
 RULE_REPORT_TRIGGER_ORIGIN = "audit-report.trigger-origin"
 RULE_REPORT_TRIGGER_STREAM = "audit-report.trigger-stream"
 RULE_REPORT_REPOSITORY_KEY = "audit-report.repository-key"
+# A profile task's PUT of a run-start record named for any run but its own
+# task (#6812): it may write its own record alone (report_run_start_permitted).
+RULE_REPORT_RUN_START_TASK = "audit-report.run-start-task"
 # The A2A gateway's report reader (#5618): a write, a route other than one
 # report, and a key segment other than REPORT_A2A_PUBLISH_KEY are each their
 # own refusal.
@@ -3672,12 +3767,16 @@ REPORT_WRITER_RE = re.compile(
 RULE_REPORT_WRITER = "audit-report.writer"
 
 # What a store path asks for, by its shape under REPORT_CREDENTIAL_ROUTES:
-# the stream list, one stream's latest, its run index, or one run.
+# the stream list, one stream's latest, its run index, one run, or one
+# run-start record (#6812). A run-start record is never REPORT_ROUTE_RUN, so it
+# carries no writer stamp and the A2A report reader cannot read it.
 REPORT_ROUTE_LIST = "list"
 REPORT_ROUTE_LATEST = "latest"
 REPORT_ROUTE_RUNS = "runs"
 REPORT_ROUTE_RUN = "run"
-# The reads the A2A gateway's report reader makes: one finished report, never an index.
+REPORT_ROUTE_RUN_START = "run-start"
+# The reads the A2A gateway's report reader makes: one finished report, never an
+# index or a run-start record.
 REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN})
 # The segment counts of a split store path ("", "v1", "audit-reports", ...).
 _REPORT_LIST_SEGMENTS = 3
@@ -3733,6 +3832,8 @@ def report_route_kind(path: str) -> str | None:
     if len(segments) == _REPORT_STREAM_ROUTE_SEGMENTS and segments[5] == "runs":
         return REPORT_ROUTE_RUNS
     if len(segments) == _REPORT_RUN_SEGMENTS and segments[5] == "runs":
+        if segments[6].startswith(REPORT_RUN_START_PREFIX):
+            return REPORT_ROUTE_RUN_START
         return REPORT_ROUTE_RUN
     return None
 
@@ -3797,7 +3898,9 @@ def report_write_permitted(
 ) -> str | None:
     """The rule a write to the store breaks, or None when the caller may write.
 
-    A write is a ring entry, latest, or dropping latest. ``key`` is the
+    A write is a ring entry, a run-start record (decided here exactly as a
+    ring entry, nothing here reads the route; report_run_start_permitted then
+    binds a profile task to its own record), latest, or dropping latest. ``key`` is the
     request's raw store-key segment, compared whole with the install's own:
     ``gitops_key``, the key `finish` publishes to (report_publish_store_key),
     or, when that rule yields no repository (``gitops_key`` None),
@@ -3844,6 +3947,25 @@ def report_write_permitted(
     if role == CALLER_ROLE_SHELL and key != REPORT_NO_FORGE_STORE_KEY and key in registered_keys:
         return None
     return RULE_REPORT_REPOSITORY_KEY
+
+
+def report_run_start_permitted(role: Any, task: Any, run_name: Any) -> str | None:
+    """The rule a permitted write of a run-start record still breaks, or None.
+
+    Asked after report_write_permitted, for a PUT whose route is
+    REPORT_ROUTE_RUN_START. A profile caller writes only the record named for
+    its own run: ``run_name`` (the path's last segment) must be
+    `started-<task id>`, with the task id the verified task credential's `task`
+    claim, so a task cannot overwrite, mark done or crowd out another run's
+    record. The shell is not bound: it writes the ring itself. Every other
+    role was refused by report_write_permitted already, and is refused here too.
+    """
+    if role == CALLER_ROLE_SHELL:
+        return None
+    task_id = getattr(task, "task", None) if role == CALLER_ROLE_PROFILE else None
+    if not isinstance(task_id, str) or not task_id or run_name != f"{REPORT_RUN_START_PREFIX}{task_id}":
+        return RULE_REPORT_RUN_START_TASK
+    return None
 
 
 def report_writer_for(role: Any, task: Any, audit_id: Any) -> str | None:
@@ -7670,6 +7792,10 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
+        if self.command == "GET" and urllib.parse.urlsplit(self.path).path == AGENT_API_SCOPE_PATH:
+            self._drain_request_body()
+            self._handle_scope()
+            return
         # The bridge-session refusal runs in two halves. What the request line
         # and headers say on their own (a literal `a2a-*`) is answered before the
         # body is read; what they, and the body, name in a state.db is looked up
@@ -7778,6 +7904,471 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _drain_request_body(self) -> None:
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
+
+    def _handle_scope(self) -> None:
+        """Answer GET /api/scope with the reconcile snapshot, profile identities, and watcher status."""
+        payload = self._read_scope_snapshot(self.workspace_root)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8", errors="replace")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        with contextlib.suppress(OSError):
+            self.wfile.write(body)
+            self.wfile.flush()
+
+    @classmethod
+    def _read_scope_snapshot(cls, workspace_root: str | Path | None = None) -> dict[str, Any]:
+        root = Path(
+            workspace_root
+            or getattr(cls, "workspace_root", "")
+            or os.getenv(AGENT_API_WORKSPACE_ROOT_ENV)
+            or os.getenv(AGENT_API_HERMES_HOME_ENV)
+            or AGENT_API_DEFAULT_WORKSPACE_ROOT
+        )
+        snapshot: dict[str, Any] = {}
+        snapshot_path = root / AGENT_API_FLEET_SCOPE_FILE
+        try:
+            if snapshot_path.is_file():
+                parsed = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict) and isinstance(parsed.get("projects"), list):
+                    snapshot = parsed
+        except Exception as exc:
+            LOGGER.debug("could not read %s: %s", snapshot_path, exc)
+
+        profile_identities, present_profiles, profiles_dir_unreadable = cls._inspect_profiles(root)
+        event_watcher = cls._read_event_watcher_status(
+            profile_identities=profile_identities,
+            present_profiles=present_profiles,
+            profiles_dir_unreadable=profiles_dir_unreadable,
+        )
+        raw_max_projects = snapshot.get("maxProjects")
+        max_projects = (
+            raw_max_projects
+            if isinstance(raw_max_projects, int) and not isinstance(raw_max_projects, bool)
+            else 0
+        )
+        return {
+            "resolved_at": snapshot.get("resolvedAt", "") if isinstance(snapshot.get("resolvedAt"), str) else "",
+            "present": bool(snapshot.get("present")),
+            "boundary": bool(snapshot.get("boundary")),
+            "max_projects": max_projects,
+            "resolver": snapshot.get("resolver", "") if isinstance(snapshot.get("resolver"), str) else "",
+            "projects": snapshot.get("projects") if isinstance(snapshot.get("projects"), list) else [],
+            "containers": snapshot.get("containers") if isinstance(snapshot.get("containers"), list) else [],
+            "profiles": snapshot.get("profiles") if isinstance(snapshot.get("profiles"), dict) else {},
+            "unmanaged": snapshot.get("unmanaged") if isinstance(snapshot.get("unmanaged"), list) else [],
+            "profile_identities": profile_identities,
+            "event_watcher": event_watcher,
+        }
+
+    @classmethod
+    def _inspect_profiles(cls, root: Path) -> tuple[list[dict[str, Any]], set[str], bool]:
+        """Inspect `<root>/profiles` once for identities, on-disk profile dirs, and dir readability.
+
+        Returns `(profile_identities, present_profiles, profiles_dir_unreadable)`.
+        `present_profiles` contains every non-hidden, non-reserved directory entry
+        currently on disk (including directories whose `config.yaml` is missing,
+        corrupt, or unreadable) so cumulative watcher discovery-error counters can
+        drop removed profiles without hiding genuinely broken ones.
+        """
+        profiles_dir = root / AGENT_API_PROFILES_DIR
+        try:
+            if not profiles_dir.exists():
+                return [], set(), False
+            if not profiles_dir.is_dir():
+                return [], set(), True
+            dir_entries = sorted(profiles_dir.iterdir(), key=lambda p: p.name)
+        except FileNotFoundError:
+            return [], set(), False
+        except OSError as exc:
+            LOGGER.debug("could not list %s: %s", profiles_dir, exc)
+            return [], set(), True
+        try:
+            import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+        except ImportError:
+            yaml = None
+        entries: list[dict[str, Any]] = []
+        present_profiles: set[str] = set()
+        for entry in dir_entries:
+            if entry.name.startswith(".") or entry.name in AGENT_API_RESERVED_PROFILES:
+                continue
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError as exc:
+                LOGGER.debug("could not inspect profile %s: %s", entry, exc)
+                present_profiles.add(entry.name)
+                continue
+            present_profiles.add(entry.name)
+            try:
+                config_path = entry / AGENT_API_PROFILE_CONFIG_FILE
+                if not config_path.is_file():
+                    continue
+                identity = cls._parse_cluster_identity(config_path, yaml, profiles_dir=profiles_dir)
+                if not identity:
+                    continue
+                is_ready = (
+                    (entry / AGENT_API_PROFILE_SCAFFOLD_FILE).is_file()
+                    and (entry / AGENT_API_PROFILE_USER_MD_FILE).is_file()
+                )
+            except (OSError, ValueError) as exc:
+                LOGGER.debug("could not inspect profile %s: %s", entry, exc)
+                continue
+            entries.append(
+                {
+                    "profile": entry.name,
+                    "project": identity[AGENT_API_METRIC_PROJECT_LABEL],
+                    "cluster": identity[AGENT_API_METRIC_CLUSTER_LABEL],
+                    "location": identity[AGENT_API_METRIC_LOCATION_LABEL],
+                    "ready": is_ready,
+                }
+            )
+        return entries, present_profiles, False
+
+    @classmethod
+    def _read_profile_identities(cls, root: Path) -> list[dict[str, Any]]:
+        entries, _, _ = cls._inspect_profiles(root)
+        return entries
+
+    @staticmethod
+    def _parse_cluster_identity(
+        config_path: Path,
+        yaml_mod: Any,
+        *,
+        profiles_dir: Path | None = None,
+    ) -> dict[str, str] | None:
+        if yaml_mod is None:
+            return None
+        base = os.path.normpath(str(profiles_dir if profiles_dir is not None else config_path.parent))
+        candidate = os.path.normpath(str(config_path))
+        if not candidate.startswith(base + os.sep):
+            return None
+        try:
+            real_base = os.path.realpath(base)
+            real_candidate = os.path.realpath(candidate)
+            if not real_candidate.startswith(real_base + os.sep):
+                return None
+            stat_res = os.stat(real_candidate)
+        except OSError:
+            return None
+        cache_key = (real_candidate, stat_res.st_mtime_ns, stat_res.st_size)
+        with _PROFILE_IDENTITY_CACHE_LOCK:
+            if cache_key in _PROFILE_IDENTITY_CACHE:
+                cached = _PROFILE_IDENTITY_CACHE[cache_key]
+                return dict(cached) if cached is not None else None
+        try:
+            with open(real_candidate, encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, ValueError):
+            return None
+        result: dict[str, str] | None = None
+        loader = getattr(yaml_mod, "CSafeLoader", yaml_mod.SafeLoader)
+        try:
+            data = yaml_mod.load(text, Loader=loader) or {}
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            ident = data.get(AGENT_API_CLUSTER_IDENTITY_KEY)
+            if isinstance(ident, dict):
+                project = str(ident.get(AGENT_API_METRIC_PROJECT_LABEL) or "").strip()
+                cluster = str(ident.get(AGENT_API_METRIC_CLUSTER_LABEL) or "").strip()
+                location = str(ident.get(AGENT_API_METRIC_LOCATION_LABEL) or "").strip()
+                if project and cluster and location:
+                    result = {
+                        AGENT_API_METRIC_PROJECT_LABEL: project,
+                        AGENT_API_METRIC_CLUSTER_LABEL: cluster,
+                        AGENT_API_METRIC_LOCATION_LABEL: location,
+                    }
+        with _PROFILE_IDENTITY_CACHE_LOCK:
+            if len(_PROFILE_IDENTITY_CACHE) >= AGENT_API_IDENTITY_CACHE_MAX_ENTRIES:
+                _PROFILE_IDENTITY_CACHE.clear()
+            _PROFILE_IDENTITY_CACHE[cache_key] = dict(result) if result is not None else None
+        return result
+
+    @classmethod
+    def _read_event_watcher_status(
+        cls,
+        *,
+        profile_identities: list[dict[str, Any]] | None = None,
+        present_profiles: set[str] | None = None,
+        profiles_dir_unreadable: bool = False,
+    ) -> dict[str, Any]:
+        raw_enabled = os.getenv(
+            AGENT_API_EVENT_WATCHER_ENABLED_ENV,
+            AGENT_API_EVENT_WATCHER_ENABLED_DEFAULT,
+        ).strip().lower()
+        enabled = raw_enabled not in AGENT_API_FALSEY_ENV_VALUES
+        if not enabled:
+            return {
+                "enabled": False,
+                "reachable": False,
+                "watch_set_ready": False,
+                "clusters_up": 0,
+                "clusters_total": 0,
+                "discovery_errors": 0,
+                "clusters": [],
+            }
+        raw_port = os.getenv(
+            AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV,
+            str(AGENT_API_EVENT_WATCHER_DEFAULT_METRICS_PORT),
+        ).strip()
+        try:
+            port = int(raw_port)
+        except ValueError:
+            port = 0
+        if not METRICS_PORT_MIN <= port <= METRICS_PORT_MAX:
+            return {
+                "enabled": True,
+                "reachable": False,
+                "watch_set_ready": False,
+                "clusters_up": 0,
+                "clusters_total": 0,
+                "discovery_errors": 0,
+                "clusters": [],
+                "error": f"{AGENT_API_EVENT_WATCHER_METRICS_PORT_ENV} is not configured",
+            }
+        conn = http.client.HTTPConnection(
+            AGENT_API_EVENT_WATCHER_METRICS_HOST,
+            port,
+            timeout=AGENT_API_EVENT_WATCHER_SCRAPE_TIMEOUT_SECONDS,
+        )
+        try:
+            conn.request("GET", AGENT_API_EVENT_WATCHER_METRICS_PATH)
+            resp = conn.getresponse()
+            if resp.status != HTTPStatus.OK:
+                return {
+                    "enabled": True,
+                    "reachable": False,
+                    "watch_set_ready": False,
+                    "clusters_up": 0,
+                    "clusters_total": 0,
+                    "discovery_errors": 0,
+                    "clusters": [],
+                    "error": f"k8s-event-watcher metrics answered HTTP {resp.status}",
+                }
+            raw_metrics = cls._read_tracked_event_watcher_metrics(resp)
+        except (OSError, http.client.HTTPException) as exc:
+            return {
+                "enabled": True,
+                "reachable": False,
+                "watch_set_ready": False,
+                "clusters_up": 0,
+                "clusters_total": 0,
+                "discovery_errors": 0,
+                "clusters": [],
+                "error": f"k8s-event-watcher metrics unreachable: {type(exc).__name__}",
+            }
+        finally:
+            conn.close()
+        return cls._parse_event_watcher_metrics(
+            raw_metrics,
+            profile_identities=profile_identities,
+            present_profiles=present_profiles,
+            profiles_dir_unreadable=profiles_dir_unreadable,
+        )
+
+    @classmethod
+    def _read_tracked_event_watcher_metrics(cls, resp: Any) -> str:
+        """Stream `/metrics` line by line and keep only the three tracked metric families.
+
+        Prometheus `Registry.Gather` sorts families alphabetically, placing
+        unbounded event counters (`events_seen_total`, `events_deduped_total`,
+        etc.) between `k8s_event_watcher_cluster_up` and
+        `k8s_event_watcher_watch_set_ready`. Filtering lines as they arrive
+        reaches `watch_set_ready` at the end of the body without buffering
+        untracked counter series in memory.
+        """
+        kept_lines: list[str] = []
+        kept_bytes = 0
+        pending = b""
+        skipping_overlong = False
+        tracked_prefixes = tuple(m.encode("ascii") for m in AGENT_API_EVENT_WATCHER_TRACKED_METRICS)
+        while True:
+            chunk = resp.read(AGENT_API_EVENT_WATCHER_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            data = pending + chunk
+            parts = data.split(b"\n")
+            pending = parts.pop()
+            for raw_line in parts:
+                if skipping_overlong:
+                    skipping_overlong = False
+                    continue
+                line = raw_line.strip()
+                if line.startswith(tracked_prefixes) and len(line) <= AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                    if kept_bytes + len(line) <= AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES:
+                        kept_lines.append(line.decode("utf-8", errors="replace"))
+                        kept_bytes += len(line)
+            if len(pending) > AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                pending = b""
+                skipping_overlong = True
+        if pending and not skipping_overlong:
+            line = pending.strip()
+            if line.startswith(tracked_prefixes) and len(line) <= AGENT_API_EVENT_WATCHER_MAX_LINE_BYTES:
+                if kept_bytes + len(line) <= AGENT_API_EVENT_WATCHER_MAX_METRICS_BYTES:
+                    kept_lines.append(line.decode("utf-8", errors="replace"))
+        return "\n".join(kept_lines)
+
+    @classmethod
+    def _parse_event_watcher_metrics(
+        cls,
+        text: str,
+        *,
+        profile_identities: list[dict[str, Any]] | None = None,
+        present_profiles: set[str] | None = None,
+        profiles_dir_unreadable: bool = False,
+    ) -> dict[str, Any]:
+        watch_set_ready = False
+        clusters: list[dict[str, Any]] = []
+        clusters_up = 0
+        discovery_error_profiles: set[str] = set()
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            brace = line.find("{")
+            if brace >= 0:
+                end_brace = line.rfind("}")
+                if end_brace < brace:
+                    continue
+                name = line[:brace].strip()
+                label_text = line[brace + 1 : end_brace]
+                value_part = line[end_brace + 1 :].strip()
+            else:
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                name, value_part = parts[0], parts[1].strip()
+                label_text = ""
+            value_fields = value_part.split()
+            if not value_fields:
+                continue
+            try:
+                val = float(value_fields[0])
+            except ValueError:
+                continue
+            if math.isnan(val) or math.isinf(val):
+                continue
+            if name == AGENT_API_WATCH_SET_READY_METRIC:
+                watch_set_ready = val >= 1.0
+            elif name == AGENT_API_CLUSTER_UP_METRIC:
+                labels = {m.group(1): m.group(2) for m in _PROMETHEUS_LABEL_RE.finditer(label_text)}
+                up = val >= 1.0
+                if up:
+                    clusters_up += 1
+                clusters.append(
+                    {
+                        AGENT_API_METRIC_CLUSTER_LABEL: labels.get(AGENT_API_METRIC_CLUSTER_LABEL, ""),
+                        AGENT_API_METRIC_PROJECT_LABEL: labels.get(AGENT_API_METRIC_PROJECT_LABEL, ""),
+                        AGENT_API_METRIC_LOCATION_LABEL: labels.get(AGENT_API_METRIC_LOCATION_LABEL, ""),
+                        "up": up,
+                    }
+                )
+            elif name == AGENT_API_DISCOVERY_ERRORS_METRIC:
+                if val > 0:
+                    labels = {m.group(1): m.group(2) for m in _PROMETHEUS_LABEL_RE.finditer(label_text)}
+                    discovery_error_profiles.add(labels.get(AGENT_API_METRIC_PROFILE_LABEL, ""))
+        clusters.sort(
+            key=lambda c: (
+                c[AGENT_API_METRIC_PROJECT_LABEL],
+                c[AGENT_API_METRIC_LOCATION_LABEL],
+                c[AGENT_API_METRIC_CLUSTER_LABEL],
+            )
+        )
+        discovery_errors = cls._count_active_discovery_errors(
+            discovery_error_profiles,
+            clusters,
+            profile_identities=profile_identities,
+            present_profiles=present_profiles,
+            profiles_dir_unreadable=profiles_dir_unreadable,
+        )
+        return {
+            "enabled": True,
+            "reachable": True,
+            "watch_set_ready": watch_set_ready,
+            "clusters_up": clusters_up,
+            "clusters_total": len(clusters),
+            "discovery_errors": discovery_errors,
+            "clusters": clusters,
+        }
+
+    @classmethod
+    def _count_active_discovery_errors(
+        cls,
+        discovery_error_profiles: set[str],
+        clusters: list[dict[str, Any]],
+        *,
+        profile_identities: list[dict[str, Any]] | None = None,
+        present_profiles: set[str] | None = None,
+        profiles_dir_unreadable: bool = False,
+    ) -> int:
+        """Count profiles in `discovery_error_profiles` that are still actively failing.
+
+        `k8s_event_watcher_cluster_discovery_errors_total{profile="..."}` is a
+        cumulative Prometheus counter that never resets inside a watcher pod's
+        lifetime. When on-disk profile state is supplied (`present_profiles is
+        not None`), drop stale counter entries for profiles that were removed
+        from disk or that recovered and now uniquely map to a watched cluster in
+        `clusters` (even when `up=False`, where discovery succeeded and informer
+        health is tracked separately via `clusters_up`).
+        """
+        if not discovery_error_profiles:
+            return 0
+        if present_profiles is None or profiles_dir_unreadable:
+            return len(discovery_error_profiles)
+
+        watched_triples = {
+            (
+                c[AGENT_API_METRIC_PROJECT_LABEL],
+                c[AGENT_API_METRIC_LOCATION_LABEL],
+                c[AGENT_API_METRIC_CLUSTER_LABEL],
+            )
+            for c in clusters
+            if c.get(AGENT_API_METRIC_PROJECT_LABEL)
+            and c.get(AGENT_API_METRIC_LOCATION_LABEL)
+            and c.get(AGENT_API_METRIC_CLUSTER_LABEL)
+        }
+
+        ident_by_profile: dict[str, tuple[str, str, str]] = {}
+        claimants_by_triple: dict[tuple[str, str, str], set[str]] = {}
+        for entry in profile_identities or ():
+            prof = entry.get(AGENT_API_METRIC_PROFILE_LABEL, "")
+            triple = (
+                entry.get(AGENT_API_METRIC_PROJECT_LABEL, ""),
+                entry.get(AGENT_API_METRIC_LOCATION_LABEL, ""),
+                entry.get(AGENT_API_METRIC_CLUSTER_LABEL, ""),
+            )
+            if prof and all(triple):
+                ident_by_profile[prof] = triple
+                if prof != AGENT_API_EVENT_WATCHER_DIRECT_PROFILE:
+                    claimants_by_triple.setdefault(triple, set()).add(prof)
+
+        active = 0
+        watched_errored_by_triple: dict[tuple[str, str, str], int] = {}
+        for prof in discovery_error_profiles:
+            if not prof or prof == AGENT_API_METRIC_NO_PROFILE_VALUE:
+                continue
+            if prof not in present_profiles:
+                continue
+            if prof == AGENT_API_EVENT_WATCHER_DIRECT_PROFILE:
+                active += 1
+                continue
+            triple = ident_by_profile.get(prof)
+            if triple is None or triple not in watched_triples:
+                active += 1
+                continue
+            watched_errored_by_triple[triple] = watched_errored_by_triple.get(triple, 0) + 1
+
+        for triple, errored_count in watched_errored_by_triple.items():
+            # One on-disk profile owns the watch for this triple; at most
+            # len(claimants) - 1 errored profiles can remain active duplicates.
+            non_owners = max(0, len(claimants_by_triple.get(triple, ())) - 1)
+            active += min(errored_count, non_owners)
+
+        return active
 
     @classmethod
     def _collect_session_id(cls, raw_session_id: Any, candidates: set[str]) -> bool:
@@ -8200,19 +8791,38 @@ class GoogleChatRelay:
         "https://www.googleapis.com/auth/pubsub",
     )
 
-    def __init__(self, project_id: str, subscription_name: str) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        subscription_name: str,
+        service_account_email: str = "",
+    ) -> None:
         import google.auth
         from google.cloud import pubsub_v1
         from googleapiclient.discovery import build
 
         credentials, _ = google.auth.default(scopes=self.SCOPES)
+        target_principal = service_account_email.strip()
+        if target_principal:
+            from google.auth import impersonated_credentials
+
+            credentials = impersonated_credentials.Credentials(
+                source_credentials=credentials,
+                target_principal=target_principal,
+                target_scopes=list(self.SCOPES),
+            )
         self.subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
         self.subscription_path = (
             subscription_name
-            if subscription_name.startswith("projects/")
+            if subscription_name.startswith(GOOGLE_CHAT_SUBSCRIPTION_PREFIX)
             else self.subscriber.subscription_path(project_id, subscription_name)
         )
-        self.chat = build("chat", "v1", credentials=credentials, cache_discovery=False)
+        self.chat = build(
+            GOOGLE_CHAT_DISCOVERY_SERVICE,
+            GOOGLE_CHAT_DISCOVERY_VERSION,
+            credentials=credentials,
+            cache_discovery=False,
+        )
         self._credentials = credentials
         # build() hands the discovery resource a single AuthorizedHttp, and so
         # a single httplib2.Http holding a single TLS socket. httplib2 is not
@@ -9334,6 +9944,157 @@ class ExecutionResult:
     # Whether the cut fell on stdout. `truncated` covers either stream; the
     # shim's non-zero exit is for a cut payload, not for cut diagnostics.
     stdout_truncated: bool = False
+    # Where stderr was cut, as an offset into `stderr`, or None when it was
+    # not: by the cap, or by the command being killed mid-write for a timeout
+    # or a stop (the drain, a caller's ceiling), which ends the output
+    # mid-token as a cap does. What follows the offset is the broker's own note
+    # (a kubectl timeout, a drain), appended after the bound. `exec_response`
+    # redacts across the cut at this offset.
+    stderr_cut_at: int | None = None
+    # The same for stdout, which takes no note, so a cut is at its end.
+    # `stdout_truncated` alone stays the cap's flag the caller sees; this one
+    # also covers a timeout or a stop.
+    stdout_cut_at: int | None = None
+
+
+def redact_tool_output(text: str, cut_at: int | None = None) -> tuple[str, int]:
+    """A command's output as a profile or session caller receives it, and how many shapes went.
+
+    `redact_credentials`' shapes in their tool-output form
+    (`credential_shapes.TOOL_OUTPUT_SHAPES`: a token after a JSON escape is
+    matched, and a private key is its whole PEM block), replaced on the text
+    the caller would otherwise receive. The output cap is applied while the command runs
+    (`_capture_output` drops what is past it as it arrives), so the bytes past
+    a cut never reach this process and cannot be redacted first. Instead the
+    redaction is carried across the cut: `cut_at` is where the cap cut the
+    text, and the characters just before it get `credential_shapes.redact_cut_tail`
+    as well, so a token the cut left shorter than its shape's minimum length is
+    replaced and its prefix does not pass, and a private key whose END line
+    the cut took goes from its BEGIN line to the cut
+    (`credential_shapes.redact_cut_private_key`). Text after `cut_at` (the
+    broker's own note) gets the whole-shape pass alone.
+    """
+    if cut_at is None:
+        return credential_shapes.redact_tool_output_counted(text)
+    head, key_count = credential_shapes.redact_cut_private_key(text[:cut_at])
+    head, head_count = credential_shapes.redact_tool_output_counted(head)
+    head, tail_count = credential_shapes.redact_cut_tail(head)
+    rest, rest_count = credential_shapes.redact_tool_output_counted(text[cut_at:])
+    return head + rest, key_count + head_count + tail_count + rest_count
+
+
+def exec_response(result: ExecutionResult, role: str | None) -> tuple[dict[str, Any], int]:
+    """The `/v1/exec` reply for a completed command, and how many shapes were redacted from it.
+
+    For a role in REDACTED_OUTPUT_ROLES, stdout and stderr go through
+    `redact_tool_output`; every other role gets the command's text as it was
+    captured. Nothing else in the reply changes: the exit code, the flags, and
+    `bytesWritten`, which counts the command's own stdout bytes the cap kept,
+    not the length of the redacted text.
+    """
+    stdout, stderr, redacted = result.stdout, result.stderr, 0
+    if role in REDACTED_OUTPUT_ROLES:
+        stdout_cut_at = result.stdout_cut_at
+        if stdout_cut_at is None and (result.stdout_truncated or result.timed_out):
+            stdout_cut_at = len(stdout)
+        stdout, stdout_count = redact_tool_output(stdout, stdout_cut_at)
+        stderr, stderr_count = redact_tool_output(stderr, result.stderr_cut_at)
+        redacted = stdout_count + stderr_count
+    response: dict[str, Any] = {
+        "status": "completed",
+        "exitCode": result.exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "durationMs": result.duration_ms,
+        "truncated": result.truncated,
+        # Beside `truncated`: how much of stdout survived the cap,
+        # and the cap. The shim prints both on a cut, so a caller
+        # knows how much it holds and that the rest is to be paged.
+        "bytesWritten": result.stdout_bytes,
+        "limit": result.output_limit,
+        "stdoutTruncated": result.stdout_truncated,
+        "timedOut": result.timed_out,
+    }
+    # Only `get-credentials` fills this, and only when the caller
+    # asked for the file. It is gcloud's own output, not anything
+    # the agent wrote.
+    if result.kubeconfig:
+        response["kubeconfig"] = result.kubeconfig
+    return response, redacted
+
+
+# The separator before the ordinal a redacted object key takes when another key
+# of the same object already redacted to the same text.
+REDACTED_KEY_ORDINAL_SEPARATOR = "#"
+
+
+def _redact_json_strings(value: Any) -> tuple[Any, int]:
+    """Every string in a parsed JSON document, object keys included, through `redact_tool_output`.
+
+    A key that comes out the same as a key already kept (two keys that
+    redact to the same text, or one that redacts to a key the object holds
+    literally) is kept as well: it takes `#2`, `#3`, ... after it, the first
+    of those the object does not hold, so no value is dropped.
+    """
+    if isinstance(value, str):
+        return redact_tool_output(value)
+    if isinstance(value, list):
+        items, total = [], 0
+        for item in value:
+            redacted, count = _redact_json_strings(item)
+            items.append(redacted)
+            total += count
+        return items, total
+    if isinstance(value, dict):
+        fields, total = {}, 0
+        for key, item in value.items():
+            redacted, count = _redact_json_strings(item)
+            new_key, key_count = redact_tool_output(key)
+            ordinal, base = 1, new_key
+            while new_key in fields:
+                ordinal += 1
+                new_key = f"{base}{REDACTED_KEY_ORDINAL_SEPARATOR}{ordinal}"
+            fields[new_key] = redacted
+            total += count + key_count
+        return fields, total
+    return value, 0
+
+
+def redact_reply_body(
+    body: bytes, role: str | None, roles: frozenset[str] = REDACTED_OUTPUT_ROLES
+) -> tuple[bytes, int]:
+    """A JSON reply body (the MCP relay's, an audit report read) as the caller receives it, and the count.
+
+    For a role in ``roles`` (REDACTED_OUTPUT_ROLES unless the caller names
+    another set) the reply is parsed and every string value redacted, so a token inside a tool result's text is matched on the
+    text the tool wrote rather than on its JSON escaping (where a `\\n` before a
+    token would hide its word boundary). The document is re-serialised only
+    when something was replaced. When nothing was, the bytes are still
+    redacted as text before they pass: a parser keeps the last of two equal
+    keys in an object, so a token in the first never reaches the parsed pass
+    while the upstream's bytes carry it. A reply that does not parse is
+    redacted as UTF-8 text too, undecodable bytes kept as they were. The
+    tool-output form keeps a JSON escape whole, so the text pass leaves JSON
+    that parses. The MCP relay refuses an over-cap reply whole
+    rather than cutting it, and the report store answers whole reports, so
+    there is no cut to carry the redaction across.
+    """
+    if role not in roles or not body:
+        return body, 0
+    try:
+        document = json.loads(body)
+    except ValueError:
+        return _redact_body_as_text(body)
+    redacted, count = _redact_json_strings(document)
+    if not count:
+        return _redact_body_as_text(body)
+    return json.dumps(redacted, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), count
+
+
+def _redact_body_as_text(body: bytes) -> tuple[bytes, int]:
+    """A reply body redacted as UTF-8 text, and the count; the bytes as they came when nothing went."""
+    text, count = redact_tool_output(body.decode("utf-8", errors="surrogateescape"))
+    return (text.encode("utf-8", errors="surrogateescape"), count) if count else (body, 0)
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -11227,6 +11988,8 @@ class _CapturedOutput:
     # Whether the cut fell on stdout: the caller's payload, as against its
     # diagnostics. `truncated` covers either stream.
     stdout_truncated: bool = False
+    # Whether the cut fell on stderr.
+    stderr_truncated: bool = False
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
@@ -11444,6 +12207,7 @@ def _capture_output(
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
     stdout_truncated = False
+    stderr_truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
     stopped = False
@@ -11468,7 +12232,7 @@ def _capture_output(
 
         Returns (timed_out, abandoned).
         """
-        nonlocal truncated, stdout_truncated, written
+        nonlocal truncated, stdout_truncated, stderr_truncated, written
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
@@ -11528,6 +12292,8 @@ def _capture_output(
                     truncated = True
                     if stream is process.stdout:
                         stdout_truncated = True
+                    else:
+                        stderr_truncated = True
         return False, False
 
     try:
@@ -11582,6 +12348,7 @@ def _capture_output(
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
         stopped=stopped,
         stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
     )
 
 
@@ -14571,6 +15338,13 @@ class CommandExecutor:
             )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
+        # Taken before the notes below are appended, which is where the output
+        # was cut: by the cap, or by the kill of a command that timed out or was
+        # stopped (the drain, a caller's ceiling) mid-write, which can end
+        # either stream mid-token just as the cap can.
+        killed = captured.timed_out or captured.stopped
+        stdout_cut_at = len(stdout_text) if captured.stdout_truncated or stdout_cut or killed else None
+        stderr_cut_at = len(stderr_text) if captured.stderr_truncated or stderr_cut or killed else None
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
             target_str = (
                 f"target kubeconfig {kubeconfig_path}"
@@ -14607,6 +15381,8 @@ class CommandExecutor:
             stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
             output_limit=self.max_output_bytes,
             stdout_truncated=captured.stdout_truncated or stdout_cut,
+            stdout_cut_at=stdout_cut_at,
+            stderr_cut_at=stderr_cut_at,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -17289,7 +18065,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 registered,
             )
             # The PUT of a ring entry carries the writer stamp, made from the
-            # verified caller and nothing the request says.
+            # verified caller and nothing the request says. A run-start record
+            # (REPORT_ROUTE_RUN_START) is relayed unstamped: it is no report,
+            # and a profile task writes only its own run's.
+            if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN_START:
+                rule = report_run_start_permitted(role, task, segments[-1])
             if rule is None and method == "PUT" and report_route_kind(path) == REPORT_ROUTE_RUN:
                 writer = report_writer_for(role, task, segments[3])
                 if writer is None:
@@ -17385,6 +18165,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 {"error": "the audit-report store failed", "code": "AUDIT_REPORT_STORE_FAILED"},
             )
             return
+        if not write:
+            # A report is agent-written text a profile caller reads back as
+            # tool output, and the a2a-reports relay posts to chat
+            # (REDACTED_REPORT_READ_ROLES); the writer stamp still names who
+            # wrote the stored one.
+            payload, redacted = redact_reply_body(payload, role, REDACTED_REPORT_READ_ROLES)
+            if redacted:
+                LOGGER.info("audit-report read redacted shapes=%d", redacted)
         self._log_audit_report(status, "relayed")
         self._write_audit_report_answer(status, payload, answered_writer)
 
@@ -18028,26 +18816,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         scope_file=os.getenv(scope_policy.SCOPE_FILE_ENV, ""),
                         window=self.scope_window,
                     )
-                response = {
-                    "status": "completed",
-                    "exitCode": result.exit_code,
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "durationMs": result.duration_ms,
-                    "truncated": result.truncated,
-                    # Beside `truncated`: how much of stdout survived the cap,
-                    # and the cap. The shim prints both on a cut, so a caller
-                    # knows how much it holds and that the rest is to be paged.
-                    "bytesWritten": result.stdout_bytes,
-                    "limit": result.output_limit,
-                    "stdoutTruncated": result.stdout_truncated,
-                    "timedOut": result.timed_out,
-                }
-                # Only `get-credentials` fills this, and only when the caller
-                # asked for the file. It is gcloud's own output, not anything
-                # the agent wrote.
-                if result.kubeconfig:
-                    response["kubeconfig"] = result.kubeconfig
+                # A profile or session caller's output loses its credential
+                # shapes here (REDACTED_OUTPUT_ROLES); the log carries the
+                # count, never what was replaced.
+                response, redacted = exec_response(result, principal.role if principal else None)
+                if redacted:
+                    LOGGER.info("command output redacted request_id=%s shapes=%d", request_id, redacted)
                 self._json(HTTPStatus.OK, response)
         except CallerHungUp as exc:
             # The exception names what the request was queued for: a slot, or
@@ -18820,6 +19594,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             self._json(HTTPStatus.BAD_GATEWAY, {"error": reason, "code": code})
             return
+        # A profile caller's reply loses its credential shapes here
+        # (REDACTED_OUTPUT_ROLES); the log carries the count alone.
+        reply_body, redacted = redact_reply_body(reply_body, principal.role if principal else None)
+        if redacted:
+            LOGGER.info("mcp reply redacted request_id=%s shapes=%d", request_id, redacted)
         LOGGER.info(
             "mcp forwarded request_id=%s server=%s method=%s status=%d bytes=%d duration_ms=%d",
             request_id,
@@ -20019,6 +20798,12 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     self._record_task_proposal(principal, result, task_key)
                 if verb == PROPOSAL_CREATE_VERB:
                     self._mint_claim(result, payload.get("repository"))
+                if role in REDACTED_VCS_READ_ROLES and verb in REDACTED_VCS_READ_VERBS:
+                    # A forge's text (proposal and issue bodies, comments,
+                    # diffs, commit messages) is read back as tool output.
+                    result, redacted = _redact_json_strings(result)
+                    if redacted:
+                        LOGGER.info("vcs %s answer redacted shapes=%d", verb, redacted)
                 self._json(HTTPStatus.OK, result)
                 return TOOL_STATUS_SUCCESS
         except CallerHungUp as exc:
@@ -21256,18 +22041,23 @@ def serve(args: argparse.Namespace) -> None:
         CredentialProxyHandler.slack_max_request_bytes = int(
             os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
         )
-        chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
+        chat_project = os.getenv(GOOGLE_CHAT_PROJECT_ID_ENV, "").strip()
+        chat_service_account = os.getenv(GOOGLE_CHAT_SERVICE_ACCOUNT_ENV, "").strip()
         chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
         if chat_project and chat_subscription:
             CredentialProxyHandler.chat_relay = GoogleChatRelay(
-                chat_project, chat_subscription
+                chat_project,
+                chat_subscription,
+                service_account_email=chat_service_account,
             )
             LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
         # The A2A gateway's relay instance on the same topic and credential;
         # armed independently so an install can run either consumer alone.
         if chat_project and a2a_subscription:
             CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
-                chat_project, a2a_subscription
+                chat_project,
+                a2a_subscription,
+                service_account_email=chat_service_account,
             )
             LOGGER.info(
                 "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project

@@ -55,7 +55,7 @@ def run_guard(
 
 
 class GuardVerdictTest(unittest.TestCase):
-    """What the script reports when a check cannot run."""
+    """What the script reports when a check cannot run or a forbidden term appears."""
 
     UNRUN = "A terminology check could not run"
 
@@ -70,6 +70,22 @@ class GuardVerdictTest(unittest.TestCase):
         self.assertIn(self.UNRUN, proc.stdout)
         self.assertIn("this-file-does-not-exist.md", proc.stdout)
         self.assertNotIn("No document states this cap", proc.stdout)
+
+    def test_operational_knowledge_framework_is_rejected(self):
+        bad = run_guard(
+            ["The Operational Knowledge Framework (OKF) stores knowledge notes.\n"]
+        )
+        self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+        self.assertIn("Wrong OKF expansion", bad.stdout)
+        self.assertIn("Open Knowledge Format", bad.stdout)
+        self.assertIn("Operational Knowledge Framework", bad.stdout)
+
+        good = run_guard(
+            ["The Open Knowledge Format (OKF) stores knowledge notes.\n"]
+        )
+        self.assertNotIn("Wrong OKF expansion", good.stdout)
+        self.assertNotIn("Operational Knowledge Framework", good.stdout)
+        self.assertNotIn(self.UNRUN, good.stdout)
 
 
 class GuardWiringTest(unittest.TestCase):

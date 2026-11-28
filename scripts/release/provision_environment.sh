@@ -172,7 +172,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT CHAT_MANAGE_PROJECT; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -320,6 +320,14 @@ fi
 
 if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
   INSTALL_ARGS+=(--enable-google-chat)
+fi
+
+if [ -n "${CHAT_PROJECT_ID:-}" ]; then
+  INSTALL_ARGS+=(--chat-project-id="${CHAT_PROJECT_ID}")
+fi
+
+if [ -n "${CHAT_MANAGE_PROJECT:-}" ]; then
+  INSTALL_ARGS+=(--chat-manage-project="$(canonical_bool "${CHAT_MANAGE_PROJECT}")")
 fi
 
 if [ -n "${GOOGLE_CHAT_MODE:-}" ]; then

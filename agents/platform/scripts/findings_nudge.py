@@ -2,15 +2,16 @@
 """The findings nudge: names findings from the queue in chat, paced.
 
 Backs the ``findings-morning-nudge`` cron job, which runs hourly with
-``no_agent: true`` and ``deliver: "chat"``. Its stdout is delivered verbatim,
-so everything this prints is what the user reads, and printing nothing relays
-nothing. Most hours have nothing to say.
+``no_agent: true`` and ``deliver: "chat"``. Most hours have nothing to say and
+print nothing. When findings are due, this script writes a structured sidecar
+card (:mod:`findings_nudge_card`) carrying the ``kube-agents.chat/v1`` card
+fields, a cluster breakdown table for the rest of the queue, and hidden thread
+metadata (finding ids and item coverage counts), then prints a clean plain-text
+fallback to stdout.
 
-No model turn, because there is no judgement to make: the ordering is the
-queue's (`GET /v1/findings/ranked`), what may be named now is
-``findings_queue.pace`` (§7.2 of `docs/designs/inventory-findings-queue.md`),
-and the recommendation was written by whoever found the thing. What is left is
-formatting and bookkeeping. Each run:
+No model turn runs here: ordering comes from ``GET /v1/findings/ranked``,
+pacing from ``findings_queue.pace`` (§7.2 of ``docs/designs/inventory-findings-queue.md``),
+and recommendations from the detectors that registered the findings. Each run:
 
 1. Expires lapsed snoozes, since this job is the queue's only tick.
 2. Reads the open queue and the items already added today, and asks ``pace``
@@ -21,18 +22,15 @@ formatting and bookkeeping. Each run:
    non-critical the nudge named waits for a decision, nothing is added.
 3. Once a UTC day, on the first run at or after 12:00 UTC, also reminds the
    top pending criticals and names every pending non-critical holding
-   additions back, with how to release it. A decision on any id of an item
-   covers the rows of the item a message has named
-   (`findings_queue.patch_finding`); every row of a line it names is marked
-   below, so the count printed beside the id is that number of objects. A
-   row a sweep adds to the line later stays open until a message names it. Shown rows
-   a complete sweep stopped reporting are in that count but not listed, and
-   the line says how many of them there are.
-4. Prints, records the day's state (the daily part sent, the items announced
-   today) in a file in the profile home, then marks every named row surfaced
-   as the paced publisher, which is what makes an addition pending and
-   records it against the day. An announced item counts against the day from
-   the state file alone while its marks have not landed.
+   additions back. Each line says how many other objects a decision on it
+   reaches (`findings_queue.patch_finding`); the ids, which chat does not
+   print, go into the thread's stored context for a reply in the thread.
+4. Writes the sidecar card, prints the fallback text, records the day's state
+   in the profile home (the daily part sent, the items announced today), then
+   marks every named row surfaced as the paced publisher, which is what makes
+   an addition pending and records it against the day. An announced item
+   counts against the day from the state file alone while its marks have not
+   landed.
 
 Nothing is added before the first inventory report is out (its delivery
 claimed, or on the conversation path its post's outcome recorded), so that
@@ -58,9 +56,12 @@ waiting for the budget does. If the state file cannot be written
 either, the same additions and the daily part are posted again every hour.
 """
 
+from __future__ import annotations
+
 import http.client
 import json
 import os
+import re
 import sys
 import traceback
 import urllib.error
@@ -68,22 +69,30 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import chat_message
+import findings_nudge_card as nudge_card
 import findings_queue as fq
+import slack_audit_report
+import slack_presenter
+
+JOB_ID = nudge_card.JOB_ID
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
 TIMEOUT_SECONDS = 30
+# The Session KV server is on the pod's loopback: a proxy from the environment
+# must not get the request and its bearer token, and urllib does not leave out
+# a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 PUBLISHER = "nudge"
-
-# The first line names the message in the channel.
-HEADING = "Findings queue"
-
-# A gathered item lists this many of its other objects by name, then counts
-# the rest; a fleet-wide condition can cover dozens.
-MAX_LISTED_MEMBERS = 5
+BACKLOG_PUBLICATION_PATH = "/v1/findings/publication/backlog"
+TARGET_REF_KEY = "target_ref"
+HTTP_SCHEMES = ("http://", "https://")
 
 # The profile home, where the once-a-day state lives, and the gateway home,
 # where onboarding's markers live. Under the ticker HERMES_HOME is the profile
@@ -133,6 +142,198 @@ TIME_FORMAT = "%Y-%m-%d %H:%M UTC"
 
 LOG_PREFIX = "findings_nudge"
 
+# Row and text sanitization constants.
+CRITICAL_SEVERITY = fq.SEVERITIES[0]
+MAJOR_SEVERITY = fq.SEVERITIES[1]
+DEFAULT_SEVERITY = MAJOR_SEVERITY
+# What the upgrade readiness review calls its checks and a cluster-wide
+# finding's object (`upgrade_readiness_review.CHECK_PREFIX`, `CLUSTER_OBJECT`);
+# test_findings_nudge.py holds the two in step.
+UPGRADE_CHECK_PREFIX = "upgrade-"
+CLUSTER_SCOPE_OBJECTS = ("Cluster",)
+UNSCOPED_CLUSTER = "fleet"
+
+LEADING_NUMBER_RE = re.compile(r"^\s*(?:\[\d+\]\s*|\d+\.\s+)+")
+# "minAvailable: 6 (>= 1 expected pods)" says the budget is at or above the pods
+# expected, so the plain form keeps both numbers and claims no floor on pods.
+EXPECTED_PODS_RE = re.compile(r"\(>=\s*(\d+)\s+expected\s+pods?\)", re.IGNORECASE)
+EXPECTED_PODS_PLAIN = "({pods} expected)"
+NESTED_PARENS_RE = re.compile(r"\(([^()]+?)\s+\(([^()]+)\)\)")
+NESTED_PARENS_FLAT = r"(\1, \2)"
+# "1 replicas" is a count; the "1" that ends a version, a name or a fraction
+# ("1.31.1 nodes", "pool-1 nodes", "0/1 pods") is not.
+ONE_PLURAL_RE = re.compile(r"(?<![\d./-])\b1\s+(replicas|pods|nodes|objects|instances|clusters)\b", re.IGNORECASE)
+
+# A recommendation is text this script did not write, so it is shown as written
+# or not at all: nothing is cut out of it and nothing is edited around a
+# command. Where a command is found (a tool in backticks, in parentheses,
+# opening the action, after "Run", or followed in its sentence by a flag),
+# `COMMAND_ACTION` stands in for the whole recommendation. A false hit ("drop
+# the -latest tag") costs the sentence, never its meaning. A command with no
+# flag written into a sentence is not told from prose and stays as written.
+# The one rewording is the whole action `kubectl delete <kind> <name>`.
+CLI_TOOLS_PATTERN = r"(?:kubectl|gcloud|helm|git|gh|terraform|tofu|docker)"
+# The plain form only: a flag is not a kind, and a condition after it is not dropped.
+KUBECTL_DELETE_RE = re.compile(
+    r"^\s*`?kubectl\s+delete\s+([a-z][a-z0-9.]*)\s+([a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)`?\s*\.?\s*$"
+)
+COMMAND_FOUND_RE = re.compile(
+    rf"`{CLI_TOOLS_PATTERN}\b[^`]*`"
+    rf"|\(\s*(?i:e\.g\.?,?\s*|for example,?\s*|run\s+)?`?{CLI_TOOLS_PATTERN}\b"
+    rf"|^\s*(?i:run\s+)?`?{CLI_TOOLS_PATTERN}\s+\S"
+    # A "." or ";" inside a version or a file name does not end the sentence.
+    rf"|(?i:\b{CLI_TOOLS_PATTERN}\b)(?:(?![.;](?:\s|$)).)*?\s--?[A-Za-z]",
+)
+# In place of a recommendation with a command in it. It states no action of its
+# own, and it is true also when the source says not to run the command.
+COMMAND_ACTION = "The recommendation names a command, which is not shown here."
+# The name the first tests gave it.
+FALLBACK_ACTION = COMMAND_ACTION
+REMOVE_ACTION = "Remove the {kind} {name}."
+SUBJECT_EDGE_CHARS = " :—-"
+# A detector's title is "<what is wrong>: <subject> ..."; what may follow the subject's name.
+TITLE_SUBJECT_SEPARATOR = ": "
+SUBJECT_END_CHARS = " (:"
+POD_NOUN = ("pod", "pods")
+CLUSTER_NOUN = ("cluster", "clusters")
+WAITING_JOINER = " and "
+# A title cut for the card ends in the presenter's ellipsis, which closes it as a period does.
+SENTENCE_ENDINGS = (".", "!", "?", slack_presenter.ELLIPSIS)
+
+# Card and fallback presentation constants.
+ROLE_NEW = "new"
+ROLE_REMINDER = "reminder"
+ROLE_BLOCKING = "blocking"
+
+# "delay or block": a PodDisruptionBudget holds each node's drain for up to an
+# hour and the upgrade then goes on (GKE's node pool upgrade strategies page);
+# the upgrade readiness review lists other criticals, an orphan Node object
+# among them, as stopping it.
+HEADLINE_UPGRADE_CRITICAL = (
+    "1 critical issue will delay or block cluster upgrades",
+    "{count} critical issues will delay or block cluster upgrades",
+)
+HEADLINE_NEW_CRITICAL = (
+    "1 new critical issue needs attention",
+    "{count} new critical issues need attention",
+)
+HEADLINE_OPEN_CRITICAL = (
+    "1 critical issue needs attention",
+    "{count} critical issues need attention",
+)
+HEADLINE_UPGRADE_OTHER = (
+    "1 upgrade readiness issue needs review",
+    "{count} upgrade readiness issues need review",
+)
+HEADLINE_NEW_OTHER = (
+    "1 new issue needs review",
+    "{count} new issues need review",
+)
+HEADLINE_BLOCKING = (
+    "1 open issue is pausing new findings",
+    "{count} open issues are pausing new findings",
+)
+
+# The count beside the headline is of issues (a check on a cluster); it says how
+# many objects those cover, so "40" is not read against a queue of 449 rows.
+# An object that fails three checks is one object: the queue's rows are not counted.
+NOTE_OPEN_ACROSS = "· {issues} covering {objects} on {clusters}"
+NOTE_OPEN_ONLY = "· {issues} covering {objects}"
+# Without the queue's rows there is no object count to give.
+NOTE_OPEN_ACROSS_PLAIN = "· {open_count} open across {clusters}"
+NOTE_OPEN_ONLY_PLAIN = "· {open_count} open"
+OPEN_ISSUE_NOUN = ("open issue", "open issues")
+OBJECT_NOUN = ("object", "objects")
+OBJECT_KEY_FIELDS = ("project", "cluster", "namespace", "object")
+NOTE_SINGLE_CLUSTER = "· {cluster}"
+NOTE_MULTI_CLUSTER = "· across {clusters}"
+
+# The fallback opens on the bold line the card's headline is.
+FALLBACK_HEAD = "**{headline}**"
+# How many more objects a decision on the line reaches, beside the one it names.
+EXTRA_SUFFIX = " (+{extra} more)"
+EXTRA_ONLY = "({extra} more)"
+
+FIX_SINGLE_LABEL = "Fix issue"
+FIX_FIRST_LABEL = "Fix first issue"
+REVIEW_SINGLE_LABEL = "Review item"
+REVIEW_FIRST_LABEL = "Review first item"
+# The next issues by rank are in the message itself, as plain lines inside the
+# folded queue breakdown, above its per-cluster table: one click opens them and
+# no agent turn is needed. A button for them cost a turn each press (a list of
+# the whole queue took several minutes, a list answered from saved text half a
+# minute). The same lines go into the thread's stored note, for a typed
+# follow-up.
+NEXT_ITEMS_MAX = 10
+NEXT_ITEMS_HEADER = "[Next {issues} by rank, as the message's queue breakdown lists them]"
+# The line that opens the list inside the fold.
+NEXT_ITEMS_LEAD = "**Next {issues} by rank**"
+# A saved line gives the objects its issue covers as a plain count. "(+N more)"
+# is a shown row's, where it says what a decision on the row reaches.
+NEXT_ITEM_LINE = "- {severity} · {summary}"
+NEXT_ITEM_LINE_MANY = "- {severity} · {summary} ({objects})"
+NEXT_ITEMS_REST = "{rest} more open after these. The table counts every open issue the message does not show, by cluster."
+NEXT_ITEMS_LAST = "These are all the open issues the message does not show."
+BACKLOG_LINK_LABEL = "Open backlog"
+BACKLOG_TEXT_LINE = "Open backlog: {url}"
+CHOICE_REPLY_FORMAT = "{label}: {summary}"
+
+# The notice names the three decisions the queue takes (findings_queue.DECISION_STATES).
+# "resolved" is a verification outcome, which the decision route refuses.
+BLOCKING_NOTICE_SINGLE = "New findings are paused until you accept, snooze, or dismiss this open item{waiting}."
+BLOCKING_NOTICE_MULTI = (
+    "New findings are paused until you accept, snooze, or dismiss these {count} open items{waiting}."
+)
+WAITING_SUFFIX = " ({waiting} waiting behind {pronoun})"
+WAITING_PRONOUNS = ("it", "them")
+WAITING_CRITICAL = ("critical issue", "critical issues")
+WAITING_OTHER = ("other issue", "other issues")
+WAITING_PLAIN = ("issue", "issues")
+# "open", as the note beside the headline says: the rest of the queue holds
+# lines being worked on and lines a message already named, not only queued ones.
+MORE_OPEN = ("more issue is", "more issues are")
+OPEN_WITH_CRITICAL = "{more} open ({critical} critical, {lower} lower priority)."
+OPEN_ONLY_CRITICAL = "{more} open ({critical} critical)."
+OPEN_PLAIN = "{more} open."
+ROLLED_UP_SINGLE = "1 provider-managed finding requires no action from you and is hidden."
+ROLLED_UP_MULTI = "{count} provider-managed findings require no action from you and are hidden."
+
+FOLD_TITLE_TEMPLATE = "Queue breakdown ({count} more open)"
+# The table lists the first clusters only; its title says so when it is cut
+# (the count is in the line above it, and the title has 40 characters).
+FOLD_TITLE_CUT_TEMPLATE = "Queue breakdown (top {shown} clusters)"
+# One column per severity (`findings_queue.SEVERITIES`), so the line above the
+# table can say "lower priority" for major and minor together.
+FOLD_COLUMNS = ["Cluster", "Critical", "Major", "Minor", "Next open issue"]
+FOLD_CRITICAL, FOLD_MAJOR, FOLD_MINOR, FOLD_NEXT = "critical", "major", "minor", "next"
+FOLD_PREVIEW = "{target}: {summary}"
+MAX_FOLD_CLUSTERS = 15
+FOLD_NEXT_ISSUE_MAX = 80
+REPLY_SUMMARY_MAX = 300
+
+METADATA_HEADER = nudge_card.METADATA_HEADER
+METADATA_LINE = "{index}. [{role}] id={id} members={members} location={location} covers={covers} unreported={unreported}"
+METADATA_NO_LOCATION = "-"
+
+
+class NudgeBundle(NamedTuple):
+    """Rendered text fallback and structured sidecar card for one nudge run."""
+
+    text: str
+    card: dict | None
+
+
+class FormattedItem(NamedTuple):
+    """Cleaned display and metadata representations of one surfaced item."""
+
+    role: str
+    severity: str
+    cluster: str
+    card_row: dict
+    plain_line: str
+    reply_summary: str
+    metadata_line: str
+
 
 def _request(endpoint: str, path: str, body: dict | None = None, method: str = "") -> dict:
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -143,7 +344,7 @@ def _request(endpoint: str, path: str, body: dict | None = None, method: str = "
     req = urllib.request.Request(
         f"{endpoint}{path}", data=data, headers=headers, method=method or ("POST" if data else "GET")
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+    with _SESSION_KV_OPENER.open(req, timeout=TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -241,112 +442,575 @@ def _plural(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
-def _where(finding: dict) -> str:
-    cluster = finding.get("cluster") or ""
-    # The project leads: a cluster name alone is ambiguous once two projects
-    # are in scope, and this line is where the reader goes to look.
-    # A cluster-scoped finding names the cluster as its object, and reading
-    # `prod/prod` back is a puzzle rather than a location.
-    parts = [finding.get("project") or "", cluster, finding.get("namespace") or "", finding.get("object") or ""]
-    if parts[3] == cluster:
-        parts = parts[:3]
-    return "/".join(part for part in parts if part)
+def _one_line(text: str) -> str:
+    return " ".join((text or "").split())
 
 
-def _object(finding: dict) -> str:
-    """A member's place within its item, whose project and cluster it shares."""
-    return "/".join(part for part in (finding.get("namespace") or "", finding.get("object") or "") if part)
+def _plain(text: str) -> str:
+    """One line of a finding's text with no live mention or link in it.
 
-
-def _item_lines(items: list, start: int = 1) -> list[str]:
-    lines = []
-    for position, item in enumerate(items, start=start):
-        top, others = item.members[0], item.members[1:]
-        action = (top.get("recommendation") or {}).get("action") or ""
-        entry = f"{position}. [{top.get('rank_score')}] {top.get('title')}\n   {_where(top)}"
-        if others:
-            listed = ", ".join(_object(row) for row in others[:MAX_LISTED_MEMBERS])
-            unlisted = len(others) - min(len(others), MAX_LISTED_MEMBERS)
-            entry += f"\n   also {listed}" + (f" and {unlisted} more" if unlisted else "")
-        if action:
-            entry += f"\n   {action}"
-        entry += f"\n   id: {top.get('id')}"
-        if item.covers > 1:
-            entry += f" (a decision on it covers all {item.covers} objects in this item"
-            # The rest are shown rows a complete sweep stopped reporting: no
-            # longer pending, so not listed, but still decided with the item.
-            unreported = item.covers - len(item.members)
-            if unreported:
-                entry += f", {unreported} of them not listed because the last complete sweep did not report them"
-            entry += ")"
-        lines.append(entry)
-    return lines
-
-
-def compose(plan: fq.PacingPlan, open_count: int, daily: bool) -> str:
-    """The message, or "" when there is nothing to say. Pure, so the wording earns a test.
-
-    `daily` is whether this run carries the once-a-day part: the reminders and
-    the stop-add notice.
+    A title or a recommendation is text a detector or a model wrote, and the
+    fallback goes out as plain text: `<!channel>` loses its brackets and a link
+    keeps its label, as the fleet-audit card's rows do.
     """
-    critical = fq.ITEM_CLASSES[0]
-    sections = []
-    added_critical = [item for item in plan.add if item.item_class == critical]
-    added_other = [item for item in plan.add if item.item_class != critical]
-    if added_critical:
-        sections.append(
-            "\n".join([f"New: {_plural(len(added_critical), 'critical finding', 'critical findings')}."]
-                      + _item_lines(added_critical))
-        )
-    if added_other:
-        sections.append(
-            "\n".join([f"New: {_plural(len(added_other), 'finding', 'findings')}, none of them critical."]
-                      + _item_lines(added_other))
-        )
-    if daily and plan.remind:
-        sections.append(
-            "\n".join(
-                [f"Still open: {_plural(len(plan.remind), 'critical finding', 'critical findings')}, undecided."]
-                + _item_lines(plan.remind)
-            )
-        )
-    if daily and plan.blocking:
-        waiting_critical = sum(1 for item in plan.waiting if item.item_class == critical)
-        waiting_other = len(plan.waiting) - waiting_critical
-        counts = []
-        if waiting_critical:
-            counts.append(_plural(waiting_critical, "critical finding", "critical findings"))
-        if waiting_other:
-            kind = "other finding" if waiting_critical else "finding"
-            counts.append(_plural(waiting_other, kind, f"{kind}s"))
-        verb = "is" if len(plan.waiting) == 1 else "are"
-        waiting = f" {' and '.join(counts)} {verb} waiting." if counts else ""
-        sections.append(
-            "\n".join(
-                [
-                    "New findings are on hold until "
-                    + ("this one is" if len(plan.blocking) == 1 else f"these {len(plan.blocking)} are")
-                    + " dismissed, snoozed or accepted." + waiting
-                ]
-                + _item_lines(plan.blocking)
-                + [
-                    "Reply with the id and the decision: dismiss (won't fix), snooze until a "
-                    "date, or accept (being worked on). "
-                    "A decision on an id covers the objects counted beside it; "
-                    "a finding added to the line later stays open until a message names it."
-                ]
-            )
-        )
-    if not sections:
-        return ""
+    return slack_audit_report._row_text(_one_line(text))
 
-    tail = f"{_plural(open_count, 'finding is', 'findings are')} open on the queue. Ask for the full list."
-    if plan.rolled_up:
-        tail += (
-            f" {_plural(plan.rolled_up, 'of them is', 'of them are')} provider-managed,"
-            " with no next step you can take, never named here."
+
+def _fix_singular_plurals(text: str) -> str:
+    return ONE_PLURAL_RE.sub(lambda m: f"1 {m.group(1)[:-1]}", text)
+
+
+def clean_title(raw_title: str) -> str:
+    """Strip check entry numbers, raw scores, and awkward pod/replica phrasing from a title."""
+    cleaned = LEADING_NUMBER_RE.sub("", _plain(raw_title))
+    cleaned = EXPECTED_PODS_RE.sub(
+        lambda m: EXPECTED_PODS_PLAIN.format(pods=_plural(int(m.group(1)), *POD_NOUN)),
+        cleaned,
+    )
+    cleaned = NESTED_PARENS_RE.sub(NESTED_PARENS_FLAT, cleaned)
+    cleaned = _fix_singular_plurals(cleaned)
+    return _one_line(cleaned)
+
+
+def _ensure_period(sentence: str) -> str:
+    stripped = sentence.strip()
+    if not stripped:
+        return ""
+    return stripped if stripped.endswith(SENTENCE_ENDINGS) else f"{stripped}."
+
+
+def clean_action(raw_action: str) -> str:
+    """Show a recommendation's action as written, or `COMMAND_ACTION` when it holds a command.
+
+    Nothing is cut out of the text. The whole action `kubectl delete <kind>
+    <name>` is said in words, "Remove the <kind> <name>.".
+    """
+    text = _plain(raw_action)
+    if not text:
+        return ""
+    delete_match = KUBECTL_DELETE_RE.match(text)
+    if delete_match:
+        return REMOVE_ACTION.format(kind=delete_match.group(1), name=delete_match.group(2))
+    if COMMAND_FOUND_RE.search(text):
+        return COMMAND_ACTION
+    return _ensure_period(_fix_singular_plurals(text))
+
+
+def ambiguous_clusters(rows: list[dict]) -> frozenset[str]:
+    """Cluster names shared by two or more distinct projects across ``rows``."""
+    projects_by_cluster: dict[str, set[str]] = {}
+    for row in rows:
+        cluster = str(row.get("cluster") or "").strip()
+        project = str(row.get("project") or "").strip()
+        if cluster and project:
+            projects_by_cluster.setdefault(cluster, set()).add(project)
+    return frozenset(cluster for cluster, projects in projects_by_cluster.items() if len(projects) > 1)
+
+
+def cluster_label(finding: dict, ambiguous: frozenset[str] = frozenset()) -> str:
+    """Readable cluster name, disambiguated with its project only when names collide."""
+    cluster = str(finding.get("cluster") or "").strip()
+    project = str(finding.get("project") or "").strip()
+    if cluster and cluster in ambiguous and project:
+        return _plain(f"{cluster} ({project})")
+    return _plain(cluster)
+
+
+def _target_name(finding: dict) -> str:
+    raw_cluster = str(finding.get("cluster") or "").strip()
+    namespace = str(finding.get("namespace") or "").strip()
+    obj = str(finding.get("object") or "").strip()
+    # A cluster-wide finding has no workload to name: the row leads with its cluster.
+    if not obj or obj == raw_cluster or obj in CLUSTER_SCOPE_OBJECTS:
+        return ""
+    return _plain(f"{namespace}/{obj}" if namespace else obj)
+
+
+def _leading_groups(text: str) -> tuple[str, str]:
+    """Split ``text`` into the parenthesised groups it opens with and what follows them."""
+    end = 0
+    while end < len(text) and text[end] == "(":
+        depth = 0
+        for offset, char in enumerate(text[end:]):
+            depth += (char == "(") - (char == ")")
+            if depth == 0:
+                break
+        else:
+            break  # an unclosed group is not a group
+        end += offset + 1
+        end += len(text[end:]) - len(text[end:].lstrip())
+    return text[:end].rstrip(), text[end:]
+
+
+def _peel_redundant_subject(cleaned_title: str, target: str, obj: str, raw_cluster: str) -> str:
+    """Remove redundant workload or cluster names when the row already leads with them.
+
+    A detector's title is `<what is wrong>: <subject> (<its settings>) <what it
+    does>`; the settings go last, so what is left still reads as a sentence.
+    """
+    category, colon, after = cleaned_title.partition(TITLE_SUBJECT_SEPARATOR)
+    for candidate in (target, obj):
+        # Right after the first colon, and the whole name only: `web` is not the
+        # subject of "...: web-frontend", nor of "...: web, api and worker".
+        if not (candidate and colon and after.startswith(candidate)):
+            continue
+        rest = after[len(candidate) :]
+        if rest and rest[0] not in SUBJECT_END_CHARS:
+            continue
+        rest = rest.lstrip(SUBJECT_EDGE_CHARS)
+        if not rest:
+            return category
+        groups, lead = _leading_groups(rest)
+        if not groups:
+            return f"{category}: {rest}"
+        return f"{category}: {lead} {groups}" if lead else f"{category} {groups}"
+    for candidate in (target, obj):
+        if candidate and cleaned_title.startswith(f"{candidate} "):
+            return cleaned_title[len(candidate) + 1 :].strip()
+    if not target and raw_cluster and cleaned_title.endswith(f" on {raw_cluster}"):
+        return cleaned_title[: -len(f" on {raw_cluster}")].strip()
+    return cleaned_title
+
+
+def _best_severity(members: list[dict]) -> str:
+    severities = [str(row.get("severity") or "") for row in members if row.get("severity") in fq.SEVERITIES]
+    if not severities:
+        return DEFAULT_SEVERITY
+    return min(severities, key=fq.SEVERITIES.index)
+
+
+def format_item(
+    index: int,
+    role: str,
+    item,
+    ambiguous: frozenset[str] = frozenset(),
+) -> FormattedItem:
+    """Format one surfaced ``PacedItem`` into card row, plain fallback line, and hidden metadata."""
+    severity = _best_severity(item.members)
+    # The line's tag and the row under it come from one member: the queue ranks
+    # by score, so the first member is not always the most severe one.
+    top = next((row for row in item.members if row.get("severity") == severity), item.members[0])
+    raw_cluster = str(top.get("cluster") or "").strip()
+    cluster = cluster_label(top, ambiguous)
+    obj = str(top.get("object") or "").strip()
+    target = _target_name(top)
+    # Every object a decision on this line reaches, the ones a sweep stopped
+    # reporting included: the reader is told how far a dismissal goes.
+    extra = max(0, max(len(item.members), item.covers) - 1)
+    extra_suffix = EXTRA_SUFFIX.format(extra=extra) if extra else ""
+
+    raw_title = str(top.get("title") or "").strip()
+    cleaned = clean_title(raw_title)
+    summary = _peel_redundant_subject(cleaned, target, obj, raw_cluster)
+
+    if target and cluster:
+        subject_md = f"**{target}**{extra_suffix} on `{cluster}`"
+        subject_plain = f"{target}{extra_suffix} on {cluster}"
+    elif target:
+        subject_md = f"**{target}**{extra_suffix}"
+        subject_plain = f"{target}{extra_suffix}"
+    elif cluster:
+        subject_md = f"**{cluster}**{extra_suffix}"
+        subject_plain = f"{cluster}{extra_suffix}"
+    else:
+        subject_md = EXTRA_ONLY.format(extra=extra) if extra else ""
+        subject_plain = subject_md
+
+    # The card shows a row's first line up to the presenter's limit, and a click on the
+    # card's button names that line only when the card shows it whole. So a title that
+    # would take the line past the limit is cut here, where both forms are built.
+    lead_md = f"{subject_md} — " if (subject_md and summary) else ""
+    room = slack_presenter.ROW_TEXT_MAX - len(lead_md)
+    if len(summary) > room > 0:
+        summary = slack_presenter._clip(summary, room)
+    card_text = f"{lead_md}{summary}" if lead_md else (subject_md or summary)
+    plain_head = f"{subject_plain} — {summary}" if (subject_plain and summary) else (subject_plain or summary)
+
+    action = clean_action(str((top.get("recommendation") or {}).get("action") or ""))
+    card_row: dict = {"severity": severity, "text": card_text}
+    if action:
+        card_row["detail"] = action
+
+    plain_lead = _ensure_period(plain_head) if action else plain_head
+    row_start = f"{nudge_card.ROW_LINE_PREFIX}{severity} · {plain_lead}"
+    plain_line = f"{row_start} {action}".strip() if action else row_start
+
+    member_ids = ",".join(str(m.get("id") or "") for m in item.members if m.get("id"))
+    raw_where = "/".join(
+        part
+        for part in (
+            str(top.get("project") or "").strip(),
+            raw_cluster,
+            str(top.get("namespace") or "").strip(),
+            obj,
         )
-    return f"{HEADING}\n\n" + "\n\n".join(sections) + f"\n\n{tail}"
+        if part
+    )
+    unreported = max(0, item.covers - len(item.members))
+    metadata_line = METADATA_LINE.format(
+        index=index,
+        role=role,
+        id=top.get("id"),
+        members=member_ids,
+        location=raw_where or METADATA_NO_LOCATION,
+        covers=item.covers,
+        unreported=unreported,
+    )
+    return FormattedItem(
+        role=role,
+        severity=severity,
+        cluster=cluster,
+        card_row=card_row,
+        plain_line=plain_line,
+        reply_summary=slack_presenter._clip(plain_head, REPLY_SUMMARY_MAX),
+        metadata_line=metadata_line,
+    )
+
+
+def _is_upgrade_item(item) -> bool:
+    for member in item.members:
+        check = str(member.get("check_slug") or member.get("check") or "").lower()
+        if check.startswith(UPGRADE_CHECK_PREFIX):
+            return True
+    return False
+
+
+def _headline(added_critical: list, reminded: list, added_other: list, blocking: list) -> str:
+    crit_items = added_critical + reminded
+    if crit_items:
+        count = len(crit_items)
+        if all(_is_upgrade_item(item) for item in crit_items):
+            template = HEADLINE_UPGRADE_CRITICAL[count != 1]
+        elif added_critical and not reminded:
+            template = HEADLINE_NEW_CRITICAL[count != 1]
+        else:
+            template = HEADLINE_OPEN_CRITICAL[count != 1]
+        return template.format(count=count)
+    if added_other:
+        count = len(added_other)
+        template = (
+            HEADLINE_UPGRADE_OTHER[count != 1]
+            if all(_is_upgrade_item(item) for item in added_other)
+            else HEADLINE_NEW_OTHER[count != 1]
+        )
+        return template.format(count=count)
+    count = len(blocking)
+    return HEADLINE_BLOCKING[count != 1].format(count=count)
+
+
+def _note(open_actionable: int, surfaced_count: int, clusters: list[str], objects: int = 0) -> str:
+    unique = list(dict.fromkeys(c for c in clusters if c))
+    if open_actionable > surfaced_count:
+        if objects:
+            issues = _plural(open_actionable, *OPEN_ISSUE_NOUN)
+            covered = _plural(objects, *OBJECT_NOUN)
+            if unique:
+                return NOTE_OPEN_ACROSS.format(
+                    issues=issues, objects=covered, clusters=_plural(len(unique), *CLUSTER_NOUN)
+                )
+            return NOTE_OPEN_ONLY.format(issues=issues, objects=covered)
+        if unique:
+            return NOTE_OPEN_ACROSS_PLAIN.format(
+                open_count=open_actionable,
+                clusters=_plural(len(unique), *CLUSTER_NOUN),
+            )
+        return NOTE_OPEN_ONLY_PLAIN.format(open_count=open_actionable)
+    if len(unique) == 1:
+        return NOTE_SINGLE_CLUSTER.format(cluster=unique[0])
+    if len(unique) > 1:
+        return NOTE_MULTI_CLUSTER.format(clusters=_plural(len(unique), *CLUSTER_NOUN))
+    return ""
+
+
+def _waiting_phrase(waiting_items: list, blocking_count: int) -> str:
+    if not waiting_items:
+        return ""
+    critical_class = fq.ITEM_CLASSES[0]
+    waiting_critical = sum(1 for item in waiting_items if item.item_class == critical_class)
+    waiting_other = len(waiting_items) - waiting_critical
+    parts = []
+    if waiting_critical:
+        parts.append(_plural(waiting_critical, *WAITING_CRITICAL))
+    if waiting_other:
+        parts.append(_plural(waiting_other, *(WAITING_OTHER if waiting_critical else WAITING_PLAIN)))
+    pronoun = WAITING_PRONOUNS[blocking_count != 1]
+    return WAITING_SUFFIX.format(waiting=WAITING_JOINER.join(parts), pronoun=pronoun)
+
+
+def _queue_fold(
+    rows: list[dict],
+    surfaced_keys: set[tuple],
+    ambiguous: frozenset[str],
+    remaining_count: int,
+) -> tuple[dict | None, int]:
+    """Build the cluster breakdown table for the rest of the queue and return ``(fold, remaining_critical)``."""
+    grouped_items: dict[tuple, list[dict]] = {}
+    for row in rows:
+        if fq.rolled_up(row):
+            continue
+        key = fq.item_key(row)
+        if key in surfaced_keys:
+            continue
+        grouped_items.setdefault(key, []).append(row)
+
+    if not grouped_items:
+        return None, 0
+
+    remaining_critical = 0
+    by_cluster: dict[str, dict[str, int | str]] = {}
+    for members in grouped_items.values():
+        sev = _best_severity(members)
+        if sev == CRITICAL_SEVERITY:
+            remaining_critical += 1
+        # The member the count's severity comes from, as a row and a list line take theirs.
+        top = next((row for row in members if row.get("severity") == sev), members[0])
+        cluster = cluster_label(top, ambiguous) or UNSCOPED_CLUSTER
+        bucket = by_cluster.setdefault(
+            cluster,
+            {FOLD_CRITICAL: 0, FOLD_MAJOR: 0, FOLD_MINOR: 0, FOLD_NEXT: ""},
+        )
+        if sev == CRITICAL_SEVERITY:
+            bucket[FOLD_CRITICAL] = int(bucket[FOLD_CRITICAL]) + 1
+        elif sev == MAJOR_SEVERITY:
+            bucket[FOLD_MAJOR] = int(bucket[FOLD_MAJOR]) + 1
+        else:
+            bucket[FOLD_MINOR] = int(bucket[FOLD_MINOR]) + 1
+        if not bucket[FOLD_NEXT]:
+            target = _target_name(top)
+            cleaned = _peel_redundant_subject(
+                clean_title(str(top.get("title") or "")),
+                target,
+                str(top.get("object") or "").strip(),
+                str(top.get("cluster") or "").strip(),
+            )
+            preview = (
+                FOLD_PREVIEW.format(target=target, summary=cleaned) if (target and cleaned) else (target or cleaned)
+            )
+            bucket[FOLD_NEXT] = slack_presenter._clip(preview, FOLD_NEXT_ISSUE_MAX)
+
+    sorted_clusters = sorted(
+        by_cluster.items(),
+        key=lambda kv: (-int(kv[1][FOLD_CRITICAL]), -int(kv[1][FOLD_MAJOR]), -int(kv[1][FOLD_MINOR]), kv[0]),
+    )[:MAX_FOLD_CLUSTERS]
+
+    table_rows = [
+        [
+            cluster_name,
+            str(stats[FOLD_CRITICAL]),
+            str(stats[FOLD_MAJOR]),
+            str(stats[FOLD_MINOR]),
+            str(stats[FOLD_NEXT]),
+        ]
+        for cluster_name, stats in sorted_clusters
+    ]
+    title = (
+        FOLD_TITLE_CUT_TEMPLATE.format(shown=len(sorted_clusters))
+        if len(by_cluster) > len(sorted_clusters)
+        else FOLD_TITLE_TEMPLATE.format(count=remaining_count)
+    )
+    fold = {
+        nudge_card.FOLD_TITLE_KEY: slack_presenter._clip(title, chat_message.FOLD_TITLE_MAX),
+        nudge_card.FOLD_TABLE_KEY: {
+            nudge_card.TABLE_COLUMNS_KEY: list(FOLD_COLUMNS),
+            nudge_card.TABLE_ROWS_KEY: table_rows,
+        },
+    }
+    return fold, remaining_critical
+
+
+def _object_key(row: dict) -> tuple:
+    """What makes two rows the same object: one object can fail several checks."""
+    return tuple(str(row.get(field) or "") for field in OBJECT_KEY_FIELDS)
+
+
+def _next_items(rows: list[dict], surfaced_keys: set[tuple], ambiguous: frozenset[str]) -> tuple[list[str], int]:
+    """The next issues by rank that the message does not show, one plain line each, and how many more follow.
+
+    A line has the form of a row's own: severity, workload, objects covered,
+    cluster, short title. No table, so it reads the same in Slack and in Google Chat.
+    """
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        if fq.rolled_up(row):
+            continue
+        key = fq.item_key(row)
+        if key not in surfaced_keys:
+            grouped.setdefault(key, []).append(row)
+    lines = []
+    for index, (key, members) in enumerate(list(grouped.items())[:NEXT_ITEMS_MAX], start=1):
+        severity = _best_severity(members)
+        top = next((row for row in members if row.get("severity") == severity), members[0])
+        entry = format_item(index, ROLE_NEW, SimpleNamespace(key=key, members=[top], covers=1), ambiguous=ambiguous)
+        template = NEXT_ITEM_LINE_MANY if len(members) > 1 else NEXT_ITEM_LINE
+        lines.append(
+            template.format(severity=severity, summary=entry.reply_summary, objects=_plural(len(members), *OBJECT_NOUN))
+        )
+    return lines, max(0, len(grouped) - len(lines))
+
+
+def has_items(plan: fq.PacingPlan, daily: bool) -> bool:
+    """Return True when ``plan`` has at least one finding to surface on this run."""
+    return bool(plan.add or (daily and (plan.remind or plan.blocking)))
+
+
+def build_nudge(
+    plan: fq.PacingPlan,
+    open_count: int,
+    daily: bool,
+    rows: list[dict] | None = None,
+    backlog_url: str = "",
+) -> NudgeBundle:
+    """Build both the plain-text fallback and the structured card for ``plan``."""
+    critical_class = fq.ITEM_CLASSES[0]
+    added_critical = [item for item in plan.add if item.item_class == critical_class]
+    added_other = [item for item in plan.add if item.item_class != critical_class]
+    reminded = list(plan.remind) if daily else []
+    blocking = list(plan.blocking) if daily else []
+
+    tagged: list[tuple[str, object]] = (
+        [(ROLE_NEW, item) for item in added_critical]
+        + [(ROLE_REMINDER, item) for item in reminded]
+        + [(ROLE_NEW, item) for item in added_other]
+        + [(ROLE_BLOCKING, item) for item in blocking]
+    )
+    if not tagged:
+        return NudgeBundle(text="", card=None)
+
+    all_rows = list(rows) if rows is not None else [member for _, item in tagged for member in item.members]
+    ambiguous = ambiguous_clusters(all_rows)
+
+    formatted = [
+        format_item(idx, role, item, ambiguous=ambiguous)
+        for idx, (role, item) in enumerate(tagged, start=1)
+    ]
+    surfaced_keys = {item.key for _, item in tagged}
+    open_actionable = max(len(tagged), open_count - plan.rolled_up)
+    remaining = max(0, open_actionable - len(tagged))
+
+    all_clusters = [
+        cluster_label(row, ambiguous)
+        for row in all_rows
+        if not fq.rolled_up(row) and cluster_label(row, ambiguous)
+    ]
+    headline = _headline(added_critical, reminded, added_other, blocking)
+    objects = len({_object_key(row) for row in rows if not fq.rolled_up(row)}) if rows is not None else 0
+    note = _note(open_actionable, len(tagged), all_clusters, objects)
+
+    fold: dict | None = None
+    remaining_critical = 0
+    if remaining > 0 and rows is not None:
+        fold, remaining_critical = _queue_fold(rows, surfaced_keys, ambiguous, remaining)
+
+    after_lines: list[str] = []
+    if blocking:
+        waiting = _waiting_phrase(plan.waiting, len(blocking))
+        if len(blocking) == 1:
+            after_lines.append(BLOCKING_NOTICE_SINGLE.format(waiting=waiting))
+        else:
+            after_lines.append(BLOCKING_NOTICE_MULTI.format(count=len(blocking), waiting=waiting))
+    if remaining > 0:
+        more_words = _plural(remaining, *MORE_OPEN)
+        lower = max(0, remaining - remaining_critical)
+        if rows is not None and remaining_critical > 0 and lower:
+            after_lines.append(OPEN_WITH_CRITICAL.format(more=more_words, critical=remaining_critical, lower=lower))
+        elif rows is not None and remaining_critical > 0:
+            after_lines.append(OPEN_ONLY_CRITICAL.format(more=more_words, critical=remaining_critical))
+        else:
+            after_lines.append(OPEN_PLAIN.format(more=more_words))
+    if plan.rolled_up:
+        if plan.rolled_up == 1:
+            after_lines.append(ROLLED_UP_SINGLE)
+        else:
+            after_lines.append(ROLLED_UP_MULTI.format(count=plan.rolled_up))
+
+    blocking_only = bool(blocking and not (added_critical or reminded or added_other))
+    if blocking_only:
+        primary_label = REVIEW_SINGLE_LABEL if len(formatted) == 1 else REVIEW_FIRST_LABEL
+    else:
+        primary_label = FIX_SINGLE_LABEL if len(formatted) == 1 else FIX_FIRST_LABEL
+
+    choices = [primary_label]
+    replies = {
+        primary_label: CHOICE_REPLY_FORMAT.format(
+            label=primary_label,
+            summary=formatted[0].reply_summary,
+        )
+    }
+    next_lines: list[str] = []
+    next_closing = ""
+    if remaining > 0 and rows is not None:
+        next_lines, next_rest = _next_items(rows, surfaced_keys, ambiguous)
+        next_closing = NEXT_ITEMS_REST.format(rest=next_rest) if next_rest else NEXT_ITEMS_LAST
+    next_issues = _plural(len(next_lines), *OPEN_ISSUE_NOUN)
+    if next_lines and fold is not None:
+        fold[nudge_card.FOLD_TEXT_KEY] = "\n".join(
+            [NEXT_ITEMS_LEAD.format(issues=next_issues), *next_lines, "", next_closing]
+        )
+
+    clean_backlog = backlog_url.strip() if backlog_url and backlog_url.strip().startswith(HTTP_SCHEMES) else ""
+    links = [[BACKLOG_LINK_LABEL, clean_backlog]] if clean_backlog else []
+
+    head = FALLBACK_HEAD.format(headline=headline)
+    head_line = f"{head} {note}" if note else head
+    text_sections = [head_line, "\n".join(entry.plain_line for entry in formatted)]
+    tail_lines = list(after_lines)
+    if clean_backlog:
+        tail_lines.append(BACKLOG_TEXT_LINE.format(url=clean_backlog))
+    if tail_lines:
+        text_sections.append("\n".join(tail_lines))
+    fallback_text = "\n\n".join(text_sections)
+
+    thread_context = (
+        f"{fallback_text}\n\n{METADATA_HEADER}\n"
+        + "\n".join(entry.metadata_line for entry in formatted)
+    )
+    if next_lines:
+        thread_context += (
+            "\n\n" + NEXT_ITEMS_HEADER.format(issues=next_issues) + "\n" + "\n".join(next_lines) + f"\n{next_closing}"
+        )
+    tone = (
+        chat_message.TONE_CRITICAL
+        if any(entry.severity == CRITICAL_SEVERITY for entry in formatted)
+        else chat_message.TONE_ATTENTION
+    )
+    card = {
+        nudge_card.VERSION_KEY: nudge_card.CARD_SCHEMA_VERSION,
+        nudge_card.TEXT_KEY: fallback_text,
+        nudge_card.THREAD_CONTEXT_KEY: thread_context,
+        nudge_card.HEADLINE_KEY: headline,
+        nudge_card.NOTE_KEY: note,
+        nudge_card.TONE_KEY: tone,
+        nudge_card.ROWS_KEY: [entry.card_row for entry in formatted],
+        nudge_card.AFTER_KEY: after_lines,
+        nudge_card.FOLD_KEY: fold,
+        nudge_card.CHOICES_KEY: choices,
+        nudge_card.REPLIES_KEY: replies,
+        nudge_card.LINKS_KEY: links,
+    }
+    return NudgeBundle(text=fallback_text, card=card)
+
+
+def compose(
+    plan: fq.PacingPlan,
+    open_count: int,
+    daily: bool,
+    rows: list[dict] | None = None,
+    backlog_url: str = "",
+) -> str:
+    """Return the plain-text nudge message, or "" when there is nothing to say."""
+    return build_nudge(plan, open_count, daily, rows=rows, backlog_url=backlog_url).text
+
+
+def _backlog_url(endpoint: str) -> str:
+    """Best-effort read of the published backlog URL; empty when unpublished or unreachable."""
+    try:
+        pub = _request(endpoint, BACKLOG_PUBLICATION_PATH)
+    except Exception:
+        return ""
+    if not isinstance(pub, dict):
+        return ""
+    ref = str(pub.get(TARGET_REF_KEY) or "").strip()
+    return ref if ref.startswith(HTTP_SCHEMES) else ""
 
 
 def _report_failure(home: Path, state: dict, today: str) -> int:
@@ -425,13 +1089,15 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
         )
         daily = now.hour >= fq.REMIND_HOUR and state.get(DAILY_KEY) != today
         open_count = len({fq.item_key(row) for row in rows if not fq.rolled_up(row)}) + plan.rolled_up
-        message = compose(plan, open_count, daily)
+        backlog_url = _backlog_url(endpoint) if has_items(plan, daily) else ""
+        bundle = build_nudge(plan, open_count, daily, rows=rows, backlog_url=backlog_url)
     except Exception:
         sys.stderr.write(f"{LOG_PREFIX}: failed before posting:\n{traceback.format_exc()}")
         return _report_failure(home, state, today)
 
-    if message:
-        sys.stdout.write(message + "\n")
+    nudge_card.save(nudge_card.card_path(home), bundle.card)
+    if bundle.text:
+        sys.stdout.write(bundle.text + "\n")
         sys.stdout.flush()
 
     # Before the marks, so a mark that raises cannot cost the record that the

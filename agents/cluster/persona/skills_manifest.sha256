@@ -1,4 +1,4 @@
-f6d2dbf08061e42c5b191e2c934fa365f79a84642c459f5b459f8bc3539062a6  ./README.md
+bcd5d46afd926da4fbfb5d72c6dc51c6a5d9c123215b959d9d21463956e4652f  ./README.md
 445329de2cc6d6a0ef315a3f53adb58044adae19bd0eca1224dac0d33b0b0ba7  ./instructions.md
 f54367e57dcf160497961eb2595ac4243af552f5e2446f4c150b8a092ceff634  ./mcp.yaml
 2ef945ed14c5b5287be9ed8a783460584d14c13ade4e6843f0254a3e1559602d  ./persona.yaml
@@ -15,13 +15,13 @@ f3857134e866eba37cd0f9180ae223c9f8733b8d8aa8d2a5f5da246573412627  ./skills/gke-w
 377070f31145a9a8c60d722f6341315b08b6ebca705de2ce5359221b9794aad0  ./skills/gke-workload-security/assets/default-deny-netpol.yaml
 a4894f438f56f48ea03d2ffebcb04028bd13d7cdcb7e5f02047cc90dfb35a3ab  ./skills/gke-workload-security/assets/workload-identity-pod.yaml
 ee3a9a02dc9773a7aa27998ed55e5b464b5e0dc6731ea17e3a253bfed46bdbfb  ./skills/gke-workload-security/scripts/audit_cluster.sh
-31e7b5f41c8e561018123ba6eea4db2f62fac3d76d3966fbc2601a248968c453  ./skills/gke-workload-troubleshooting/SKILL.md
+5576fe53b196906113bcd623ca2a4a8f3aab88acfc23bbf260456812fd33d587  ./skills/gke-workload-troubleshooting/SKILL.md
 d0eece93c3c04b24fabfb686c1852876a377a91f85a77fe9516b0cf0f3ca946d  ./skills/pod-container-creating/SKILL.md
 0dcf951f424bd7306e5ceaace3ecccba4888fd64bcdd03e96f1471cf0912cf46  ./skills/pod-crashloop-oom/SKILL.md
 1306133bd7a0b90a97b9f64ec1a212a0a115a2b966a533363f32f4869830f2e4  ./skills/pod-pending-scheduling/SKILL.md
-5c3acb30a636d8c40833680a8faeb1ec5bc665075488ca7982245534d4c69b18  ./skills/service-connectivity/SKILL.md
+d9f1777d59258339fd2c460e875ab03733cefdae3fa6a16c6451203a7b0e206c  ./skills/service-connectivity/SKILL.md
 88f2151c4a221f4c6b06d69a31dba2de82bd6a9cdb7a5544cc16c93de602beb4  ./skills/version-control/SKILL.md
 98a9fff845b5885d3f600c9a7252695ac70600bdaee47b439a71fe1cf4bf47cb  ./skills/version-control/scripts/vcs.py
-4f32e9f41c5aa933df1e048b5e2f01b26f71c226b982327c6d8ee7a2a6a53ab8  ./skills/workload-triage-scan/SKILL.md
+1faabb3f15df92115dc636a7c67aee3708b9ae00825f3f0e509afa72822890ae  ./skills/workload-triage-scan/SKILL.md
 7df4645f87e111b88c9ae2054c552e6814951162a89a59226586a79f25a6dd9e  ./skills/workload-triage-scan/references/reporting.md
 0c0d29c6b9b90b8ec79e85bb4a7c86ce31471728c0cb5f7dc153bd687cb78a87  ./skills/workload-triage-scan/scripts/workload_triage.py

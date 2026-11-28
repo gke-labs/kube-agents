@@ -208,7 +208,9 @@ for spelling rather than presence. All six reach `install.sh` as boolean flags
 (`--enable-*`, `--vertex-manage-serving-project`), whose validators take `true` or
 `false` and nothing else, while
 the same values travelling through `install.env` reach `is_truthy`, which also takes
-`True`/`yes`/`y`/`1`/`on`. `provision_environment.sh` folds the second list into
+`True`/`yes`/`y`/`1`/`on`. (`provision_environment.sh` also validates `CHAT_MANAGE_PROJECT`
+and forwards `--chat-project-id` and `--chat-manage-project` when set in its environment;
+`render_install_env.sh` and the workflow `env:` blocks do not map them yet.) `provision_environment.sh` folds the second list into
 the first, so an environment that deployed on `True` keeps deploying; a spelling
 neither list recognises is refused before the teardown rather than by
 `install.sh` after it. A variable holding nothing but a space or a tab is

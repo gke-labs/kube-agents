@@ -529,6 +529,46 @@ MUTATIONS: list[Mutation] = [
         "must then be trusted to ignore",
     ),
     Mutation(
+        "A3-report-run-start-a2a-reads",
+        "agents/platform/scripts/credential_proxy.py",
+        ("REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN})\n",
+         "REPORT_A2A_READ_ROUTES = frozenset({REPORT_ROUTE_LATEST, REPORT_ROUTE_RUN, REPORT_ROUTE_RUN_START})\n"),
+        "test_A3_a_run_start_record_rides_the_run_write_rule_alone",
+        "let the report reader read a run-start record too, so a chat reply can say "
+        "a run did not finish -- it then reads a record no report rule vouches for, "
+        "on the one route its role was confined from",
+    ),
+    Mutation(
+        "A3-report-run-start-is-a-run",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if segments[6].startswith(REPORT_RUN_START_PREFIX):\n            return REPORT_ROUTE_RUN_START\n",
+         ""),
+        "test_A3_a_run_start_record_rides_the_run_write_rule_alone",
+        "treat a run-start record as one more run, since it rides the run route -- "
+        "it is then stamped as a report, and the A2A reader reads it as one",
+    ),
+    Mutation(
+        "A3-report-run-start-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (\"DELETE\", re.compile(f\"{_REPORT_STREAM}/latest\")),\n",
+         "    (\"DELETE\", re.compile(f\"{_REPORT_STREAM}/latest\")),\n"
+         "    (\"DELETE\", re.compile(f\"{_REPORT_STREAM}/runs/{_REPORT_RUN_START}\")),\n"),
+        "test_A3_a_run_start_record_rides_the_run_write_rule_alone",
+        "let a finish drop its run's record instead of marking it, to keep the "
+        "directory small -- a caller then erases a newer run's record and the run "
+        "that died reads as never started",
+    ),
+    Mutation(
+        "A3-report-run-start-any-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("                rule = report_run_start_permitted(role, task, segments[-1])\n",
+         "                pass\n"),
+        "test_A3_a_profile_task_writes_only_its_own_run_start_record",
+        "let a profile task write any run's record, since the run write's stream "
+        "and key rules already hold it to its own stream -- a task then marks the "
+        "newest real run done, or crowds it out, and a run that died reads as finished",
+    ),
+    Mutation(
         "A3-report-no-role-is-shell",
         "agents/platform/scripts/credential_proxy.py",
         ("    if role == CALLER_ROLE_SHELL:\n        pass\n",
@@ -1958,6 +1998,87 @@ Mutation(
         "every IAM principal in a tool result then reaches the model as "
         "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
         "turned off",
+    ),
+    Mutation(
+        "C1-broker-exec-output-unredacted",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        stdout, stdout_count = redact_tool_output(stdout, stdout_cut_at)\n"
+         "        stderr, stderr_count = redact_tool_output(stderr, result.stderr_cut_at)\n",
+         "        stdout_count = stderr_count = 0\n"),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "drop the redaction from the exec reply on the grounds that the sandbox "
+        "side redacts -- it does for the shell, but a profile worker's or a "
+        "session pod's model then reads a token from a ConfigMap as kubectl "
+        "printed it",
+    ),
+    Mutation(
+        "C1-broker-mcp-reply-unredacted",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if role not in roles or not body:\n",
+         "    if True:\n"),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "pass the MCP relay's reply through untouched because the upstream is "
+        "Google's -- a document a tool returns can still quote a token, and "
+        "the profile worker's model reads it",
+    ),
+    Mutation(
+        "C1-broker-json-escape-boundary-dropped",
+        "agents/platform/scripts/credential_shapes.py",
+        ("        source = JSON_ESCAPE_BOUNDARY + source[len(_WORD_BOUNDARY):]\n",
+         "        pass\n"),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "keep the shapes' plain word boundary in tool output, as in the log -- a "
+        "token after a `\\n` escape in kubectl -o json output then has the "
+        "escape's `n` in front of it and passes",
+    ),
+    Mutation(
+        "C1-broker-private-key-armour-only",
+        "agents/platform/scripts/credential_shapes.py",
+        ("    PRIVATE_KEY_SHAPE_NAME: PRIVATE_KEY_BLOCK,\n",
+         ""),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "redact the PEM armour line in tool output as the log does -- the key "
+        "body between the armour lines then reaches the model",
+    ),
+    Mutation(
+        "C1-broker-url-password-without-json-escapes",
+        "agents/platform/scripts/credential_shapes.py",
+        ('_URL_PASSWORD_CHAR = r"(?:[^\\s/?#\\[\\]\\"\'<>{}\\\\|^`,;]|" + _JSON_ESCAPE + r")"\n',
+         '_URL_PASSWORD_CHAR = r"[^\\s/?#\\[\\]\\"\'<>{}\\\\|^`,;]"\n'),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "keep the URL password's log-form class in tool output -- Go's JSON "
+        "encoder writes `&` as `\\u0026`, so a password holding one in "
+        "kubectl -o json output passes whole",
+    ),
+    Mutation(
+        "C1-broker-match-opens-on-an-escape-letter",
+        "agents/platform/scripts/credential_shapes.py",
+        ('_NOT_ON_AN_ESCAPE_LETTER = r"(?!(?<=(?<!\\\\)\\\\)[bfnrtu])"\n',
+         '_NOT_ON_AN_ESCAPE_LETTER = ""\n'),
+        "test_C1_the_broker_redacts_credential_shapes_from_profile_and_session_tool_output",
+        "let the plain word boundary open a match anywhere it holds -- a URL "
+        "after a `\\n` then takes the escape's `n` as its scheme's first letter "
+        "and leaves a lone backslash, and the JSON stops parsing",
+    ),
+    Mutation(
+        "C1-broker-header-value-in-prose",
+        "agents/platform/scripts/credential_shapes.py",
+        ("    HEADER_VALUE_SHAPE_NAME: HEADER_VALUE_TOOL_FORM,\n",
+         ""),
+        "test_C1_the_broker_leaves_must_keep_tool_output_byte_identical",
+        "use the log form's header value in tool output, any twelve letters "
+        "after `basic` or `bearer` -- prose about an auth bug then reaches the "
+        "model with its words blanked",
+    ),
+    Mutation(
+        "C1-broker-jwt-shape-one-segment",
+        "agents/platform/scripts/credential_shapes.py",
+        ('re.compile(r"\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}")',
+         're.compile(r"\\beyJ[A-Za-z0-9_-]{8,}")'),
+        "test_C1_the_broker_leaves_must_keep_tool_output_byte_identical",
+        "simplify the JWT shape to its eyJ header, to catch a token cut short -- "
+        "every base64-encoded JSON value and every list continue token in a "
+        "kubectl read then reaches the model as [REDACTED]",
     ),
     Mutation(
         "A1-flag-refusal-invites-a-write-retry",

@@ -58,7 +58,7 @@ gcloud policy-intelligence troubleshoot-policy iam \
 | Creates the drift detector's Log Router sink                                                                                                                                                    | `logging.sinks.create`                                                                                                                                            | `roles/logging.configWriter`            |
 | Installs the chart's ClusterRoles, Roles and their bindings on the cluster                                                                                                                      | `container.clusterRoles.create`, `.bind` and `.escalate`, `container.clusterRoleBindings.create`, and the same for `container.roles` and `container.roleBindings` | `roles/container.admin`                 |
 
-So `Editor` plus those six roles covers what a stock install needs that Editor lacks. Options add to it. Google Chat grants its topic and subscription (`pubsub.*.setIamPolicy` again), `--enable-stockout-investigator` creates its own sink, topic and subscription grants (the same permissions as the drift detector's), and the GitHub token minter grants its signing key and service account (`cloudkms.cryptoKeys.setIamPolicy`, `iam.serviceAccounts.setIamPolicy`). `--model-provider=vertex_ai` with `--vertex-project-id` naming another project grants the model gateway's service account `roles/aiplatform.user` there, which needs `resourcemanager.projects.setIamPolicy` in that project, or `--vertex-manage-serving-project=false` and the grant made by hand. `--scope-projects`, `--scope-shared-vpc-hosts` and `--scope-metrics-scopes` grant the agent read roles in every project they name or resolve to, which needs `resourcemanager.projects.setIamPolicy` in each, and nothing tests for it first. `--scope-folders` and `--scope-organizations` grant read roles on the folder or organisation, which needs `resourcemanager.folders.setIamPolicy` or `resourcemanager.organizations.setIamPolicy` there; the installer tests for those two before it applies anything.
+So `Editor` plus those six roles covers what a stock install needs that Editor lacks. Options add to it. Google Chat grants its topic and subscription (`pubsub.*.setIamPolicy` again), or, with `--chat-project-id` naming another project, creates `kubeagents-chat-gsa` and its token-creator and Pub/Sub bindings there unless `--chat-manage-project=false` leaves that project's setup to its administrator. `--enable-stockout-investigator` creates its own sink, topic and subscription grants (the same permissions as the drift detector's), and the GitHub token minter grants its signing key and service account (`cloudkms.cryptoKeys.setIamPolicy`, `iam.serviceAccounts.setIamPolicy`). `--model-provider=vertex_ai` with `--vertex-project-id` naming another project grants the model gateway's service account `roles/aiplatform.user` there, which needs `resourcemanager.projects.setIamPolicy` in that project, or `--vertex-manage-serving-project=false` and the grant made by hand. `--scope-projects`, `--scope-shared-vpc-hosts` and `--scope-metrics-scopes` grant the agent read roles in every project they name or resolve to, which needs `resourcemanager.projects.setIamPolicy` in each, and nothing tests for it first. `--scope-folders` and `--scope-organizations` grant read roles on the folder or organisation, which needs `resourcemanager.folders.setIamPolicy` or `resourcemanager.organizations.setIamPolicy` there; the installer tests for those two before it applies anything.
 
 What the install creates in your project:
 
@@ -69,7 +69,7 @@ What the install creates in your project:
 - The Google-managed service agents the grants above name: GKE's for CMEK, Logging's for the drift sink, and Google Chat's with Chat.
 - A versioned Cloud Storage bucket, `<PROJECT_ID>-kube-agents-tfstate`, for the Terraform state.
 
-The APIs it enables are `container`, `cloudkms`, `iam`, `cloudresourcemanager`, `monitoring`, `logging`, `cloudtrace`, `gkehub`, `gkebackup` and `developerknowledge` (each `<name>.googleapis.com`), `pubsub` with the drift detector, Google Chat, `--enable-stockout-investigator` or `--enable-pubsub-platform`, `chat` and `gsuiteaddons` with Google Chat, `cloudasset` with `--scope-folders` or `--scope-organizations`, `compute` with `--scope-shared-vpc-hosts`, and `aiplatform` in the serving project with `--model-provider=vertex_ai`, unless `--vertex-manage-serving-project=false` leaves the API and the grant there to you. Enabling them is in Editor already, in the project where you hold the role; `aiplatform` in another serving project needs `serviceusage.services.enable` in that project.
+The APIs it enables are `container`, `cloudkms`, `iam`, `cloudresourcemanager`, `monitoring`, `logging`, `cloudtrace`, `gkehub`, `gkebackup` and `developerknowledge` (each `<name>.googleapis.com`), `pubsub` with the drift detector, Google Chat, `--enable-stockout-investigator` or `--enable-pubsub-platform`, `chat` and `gsuiteaddons` with Google Chat (in `--chat-project-id` when set, unless `--chat-manage-project=false` leaves that project to you), `cloudasset` with `--scope-folders` or `--scope-organizations`, `compute` with `--scope-shared-vpc-hosts`, and `aiplatform` in the serving project with `--model-provider=vertex_ai`, unless `--vertex-manage-serving-project=false` leaves the API and the grant there to you. Enabling them is in Editor already, in the project where you hold the role; `aiplatform` in another serving project or `chat`, `gsuiteaddons` and `pubsub` in another Chat project needs `serviceusage.services.enable` in that project.
 
 The A2A stack adds no service account, no IAM grant and no API. Its bus identities are Kubernetes ServiceAccounts the operator creates, and the one cluster-scoped grant, the auth callout's ClusterRoleBinding to `system:auth-delegator`, is made by the operator under its own permissions, not yours.
 
@@ -236,7 +236,7 @@ The operator's admission webhooks need TLS certificates managed by [cert-manager
 
 Install it by hand only if you are:
 
-- deploying into an existing cluster without the installer or Terraform ([Manual install](/kube-agents/install/manual/)), or
+- deploying into an existing cluster without the installer or Terraform ([Enterprise Helm & GitOps](/kube-agents/install/enterprise-gitops/) or [Manual install](/kube-agents/install/manual/)), or
 - pinning a specific cert-manager version.
 
 The Helm chart on its own is the one path that never installs cert-manager: a chart that shipped a `Certificate` into a cluster without the CRDs would fail at apply time for everyone. It therefore leaves the operator's admission webhooks off (`operator.webhooks.enabled=false`) until you install cert-manager and turn them on. See the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md).
@@ -297,11 +297,13 @@ provisions the Chat backend. Pick "None" or Slack there if you want the project'
 alone. **Slack is unaffected** — it provisions no GCP resource at all, so a project whose Chat slot
 is already spoken for can still run kube-agents with Slack in it.
 
-If you do want Chat and the slot is taken, moving just the Chat backend elsewhere is not available
-through the supported paths: the chart renders the CR's `projectId` from
-`platformAgent.harness.projectId`, so the installer and the chart always put the Chat topic in the
-cluster's project. That leaves installing into a project whose Chat slot is free — a choice worth
-weighing against how you want the agent's fleet scoped, not against Chat alone.
+If you do want Chat and the slot in your cluster's project is taken, or your Google Workspace
+organization lives in a different GCP organization from the GKE cluster, pass
+`--chat-project-id=<CHAT_PROJECT_ID>` (`CHAT_PROJECT_ID` in `install.env`, `chat_project_id` in
+Terraform, or `platformAgent.integration.googleChat.projectId` in Helm). That moves the Chat app,
+Pub/Sub topic and subscription, and a dedicated `kubeagents-chat-gsa` service account into the
+separate project. Add `--chat-manage-project=false` when your installing identity cannot administer
+that project. See [ChatOps](/kube-agents/concepts/chatops/#a-google-chat-app-in-another-gcp-project-or-organization).
 
 ## LLM credentials
 
@@ -369,4 +371,5 @@ See [Gitea as the GitOps forge](/kube-agents/install/gitea/) for the token Secre
 ## Ready to install
 
 - [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run the installer end-to-end.
+- [Enterprise Helm & GitOps](/kube-agents/install/enterprise-gitops/) — deploy the official Helm chart via Flux or Argo CD with separate IAM Terraform.
 - [Manual install](/kube-agents/install/manual/) — step-by-step, no wrapper script.

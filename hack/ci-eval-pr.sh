@@ -4946,6 +4946,9 @@ unit_cost_hint() {
     # The same shape again, plus a detector stop and relaunch before the live
     # card wait. Unmeasured; priced with its siblings.
     gitops-drift-backlog-digest) echo 900 ;;
+    # The same shape with no detector stop: a publish, a card wait and the
+    # digest's settle. Unmeasured; priced with its siblings.
+    gitops-drift-own-release-digest) echo 900 ;;
     # The two CUJ 1 halves (#2889), registered 2026-10-20. Same shape as
     # gitops-drift-out-of-band-triage and gitops-drift-noise-filtered-triage
     # -- infra lock, a plant, an inject and a card wait -- and the band is a
@@ -5058,6 +5061,10 @@ unit_cost_hint() {
     # kustomize case runs in the second phase (writes_alone), so its hint
     # orders it only among that phase's units.
     gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 900 ;;
+    # The networking audit over the health-check-shadowed role, parked in
+    # FIXTURE_NOT_READY until its fixture is on the pool, and unmeasured: the
+    # same full audit as networking-world-open-ingress.
+    networking-health-check-shadowed) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
     # The stockout audit of stockout-pinned-pool, registered 2026-11-10
     # unmeasured, plus a stack that plants one Config Connector object and
@@ -5318,6 +5325,7 @@ unit_delegation_timeout() {
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service | obtainability-image-pull-failing) echo 3000 ;;
     gce-startup-script-failure | gce-rotated-console-notes | networking-world-open-ingress) echo 3000 ;;
+    networking-health-check-shadowed) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
     fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took

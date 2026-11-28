@@ -944,6 +944,10 @@ INJECT_LANE_REQUESTING = [
     # the change as a pull request; its objective's pull_request_opened leaf
     # allows one.
     "scale-request-proposes-pr",
+    # session-wake-hands-the-change-to-platform: a woken session asks
+    # platform for the no-pdb pull request after the cluster agent's read
+    # (#6861); its objective's pull_request_opened leaf allows one.
+    "session-wake-hands-the-change-to-platform",
     # stop-on-permission-refusal: refused or declined the kubectl scale the
     # user asked for, it may propose the change as a pull request (#4224);
     # its objective's pull_request_opened leaf allows one.

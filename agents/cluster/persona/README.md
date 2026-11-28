@@ -11,9 +11,9 @@ permit. It is the example persona for
 It ships as its own image, `persona-cluster` (`a2a/Dockerfile.persona-cluster`,
 with this directory under `/files`), and the chart's `profiles.cluster.enabled`
 renders the generic `cluster` AgentProfile that runs it (#3658). A profile
-worker pod mounts the image at `/persona`. No pod runs it until the profile
-dispatcher, worker and pool land (#4148, #4483, #4484) and the operator runs
-them.
+worker pod mounts the image at `/persona`. The chart README's
+[Optional AgentProfiles](../../../charts/kube-agents/README.md#optional-agentprofiles-profilestse-profilescluster-profilesfleetaudit)
+section, under `profiles.cluster`, says when a pod runs it.
 
 `skills_manifest.sha256` is this directory's content manifest, which the
 profile worker checks the image's files against at start

@@ -50,6 +50,10 @@ FIRST_REPORT_ROWS_MAX = 20
 TMP_SUFFIX = ".tmp"
 DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
 POST_TIMEOUT_SECONDS = 30
+# The Session KV server is on the pod's loopback: a proxy from the environment
+# must not get the request and its bearer token, and urllib does not leave out
+# a loopback host by itself.
+_SESSION_KV_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 SOURCE = "inventory"
 
@@ -344,7 +348,7 @@ def _request(endpoint: str, path: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(
         f"{endpoint}{path}", data=data, headers=headers, method="POST" if data else "GET"
     )
-    with urllib.request.urlopen(req, timeout=POST_TIMEOUT_SECONDS) as resp:
+    with _SESSION_KV_OPENER.open(req, timeout=POST_TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -515,8 +519,8 @@ def select_items(
     `FIRST_REPORT_ROWS_MAX`, and nothing else.
     Provider-managed observations (`fq.rolled_up`) are never items and count
     once per line (`fq.item_key`) among the others; a line that also has an
-    ordinary row is already counted as that item. The nudge's open count
-    still counts such a line twice, once as the item and once as managed.
+    ordinary row is already counted as that item. The count the nudge shows
+    leaves provider-managed lines out, so it counts such a line once too.
     Ids in `exclude` are rows the user dismissed, which are neither listed nor
     counted.
     """

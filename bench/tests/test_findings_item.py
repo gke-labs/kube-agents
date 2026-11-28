@@ -47,7 +47,7 @@ import yaml
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.spec import parse_node
 
-from kube_agents_bench import findings, onboarding, verifiers
+from kube_agents_bench import findings, onboarding, pushed_report, verifiers
 from kube_agents_bench.verifiers import FindingsItemStateVerifier
 
 REPO = Path(__file__).resolve().parents[2]
@@ -57,6 +57,15 @@ QUEUE_SCRIPT = STACK / "queue.py"
 TASK = REPO / "bench" / "tasks" / "findings-decision-covers-item" / "task.yaml"
 UNNAMED_ROWS = STACK / "findings-unnamed.json"
 UNNAMED_TASK = REPO / "bench" / "tasks" / "findings-decision-leaves-unnamed-open" / "task.yaml"
+REPLY_TASK = REPO / "bench" / "tasks" / "findings-decision-reply-names-no-id" / "task.yaml"
+TWIN_ROWS = STACK / "findings-twin.json"
+REPLY_CHECKS = (
+    "named-line-dismissed",
+    "similar-line-and-other-finding-undecided",
+    "twin-line-the-message-did-not-name-undecided",
+)
+# The hour the nudge adds non-critical findings from, on any day (findings_queue.DEFAULT_NONCRITICAL_AFTER_HOUR).
+NUDGE_ADDS_AT = (2026, 11, 23, 16, 0)
 API_KEY = "k-test"
 
 _spec = importlib.util.spec_from_file_location(
@@ -212,7 +221,7 @@ def _verify(name: str, timeout: float = 0.0, task: Path = TASK):
 
 
 def _named_id() -> str:
-    """The id in the prompt: the one the nudge prints for the gathered line."""
+    """The id in the prompt: one id of the line the nudge gathers."""
     return _check("line-dismissed")["finding_ids"][0]
 
 
@@ -253,6 +262,131 @@ def test_the_prompt_names_the_id_the_nudge_prints_and_no_other() -> None:
     assert first_of_line == _named_id()
     assert _named_id() in prompt
     assert [f["id"] for f in ranked if f["id"] in prompt] == [_named_id()]
+
+
+# --- the reply that names no id (findings-decision-reply-names-no-id) -----
+
+
+def _nudge():
+    """`findings_nudge`, loaded from the agent's scripts as the queue module above is."""
+    scripts = REPO / "agents" / "platform" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import findings_nudge
+
+    return findings_nudge
+
+
+def _replay() -> pushed_report.Replay:
+    return pushed_report.parse(_task_doc(REPLY_TASK)["prompt"])
+
+
+def _context_the_nudge_stores(tmp_path: Path) -> str:
+    """What the nudge stores for its thread when it names the five rows of findings.json: its text, then the ids.
+
+    The queue here holds those five rows only. The reply case's twin stands for a finding that
+    entered the queue after the message was posted, so the message's context does not hold it.
+    """
+    from datetime import datetime, timezone
+
+    served = _Queue(tmp_path / "nudge.db")
+    served.write(fq.register_findings, [{k: v for k, v in row.items() if k != "plant_state"} for row in _rows()])
+    with sqlite3.connect(served.path) as conn:
+        rows = fq.ranked_findings(conn)
+    plan = fq.pace(rows, datetime(*NUDGE_ADDS_AT, tzinfo=timezone.utc), fq.PacingLimits(), {"critical": 0, "noncritical": 0})
+    open_items = len({fq.item_key(row) for row in rows})
+    return _nudge().build_nudge(plan, open_items, False, rows=rows).card["thread_context"]
+
+
+def test_the_replys_stored_context_is_what_the_nudge_writes_for_the_rows_the_message_named(tmp_path: Path) -> None:
+    assert _replay().report == _context_the_nudge_stores(tmp_path)
+
+
+def _twin_id() -> str:
+    return _check("twin-line-the-message-did-not-name-undecided", REPLY_TASK)["finding_ids"][0]
+
+
+def test_the_reply_case_plants_the_messages_rows_and_one_twin() -> None:
+    doc = _task_doc(REPLY_TASK)
+    assert doc["infrastructure"]["variables"]["findings_file"] == TWIN_ROWS.name
+    assert doc["infrastructure"]["stack"] == _task_doc()["infrastructure"]["stack"]
+    planted = _rows(TWIN_ROWS)
+    # The rows the message named are the stack's default rows, so the stored context is built from them.
+    assert planted[:-1] == _rows()
+    twin, first = planted[-1], _rows()[0]
+    assert {k: v for k, v in twin.items() if k != "project"} == {k: v for k, v in first.items() if k != "project"}
+    assert twin["project"] != first["project"]
+
+
+def test_the_twin_fits_the_replys_words_and_the_stored_context_does_not_name_it() -> None:
+    by_id = {f["id"]: f for f in _registered(TWIN_ROWS)}
+    named = _check("named-line-dismissed", REPLY_TASK)["finding_ids"]
+    line, twin = by_id[named[0]], by_id[_twin_id()]
+    # Everything the reply's words and a list of the cluster's findings show is the same for the two.
+    for part in ("check_slug", "cluster", "namespace", "object", "title", "severity"):
+        assert twin[part] == line[part], part
+    assert fq.item_key(twin) != fq.item_key(line)
+    assert _check("twin-line-the-message-did-not-name-undecided", REPLY_TASK)["project"] == twin["project"]
+    replay = _replay()
+    assert twin["cluster"] in replay.reply and twin["project"] not in replay.reply
+    assert _twin_id() not in replay.report and twin["project"] not in replay.report
+    assert all(i in replay.report for i in named)
+
+
+def test_a_decision_on_the_named_line_passes_every_check_of_the_reply_case(queue) -> None:
+    served, base = queue
+    assert _run_queue_script("plant", base, TWIN_ROWS).returncode == 0
+    named = _check("named-line-dismissed", REPLY_TASK)["finding_ids"][0]
+    served.write(fq.patch_finding, named, {"state": "dismissed"})
+    for name in REPLY_CHECKS:
+        verdict = _verify(name, task=REPLY_TASK)
+        assert verdict.status == "pass", (name, verdict.reason)
+
+
+def test_the_plant_and_the_teardown_reach_the_twins_project(queue) -> None:
+    served, base = queue
+    result = _run_queue_script("plant", base, TWIN_ROWS)
+    assert result.returncode == 0, result.stderr
+    assert set(served.states().values()) == {"surfaced"} and len(served.states()) == len(_rows(TWIN_ROWS))
+    result = _run_queue_script("teardown", base, TWIN_ROWS)
+    assert result.returncode == 0, result.stderr
+    # The twin, open under a project of its own, is closed too: the teardown reads the rows' projects.
+    assert set(served.states().values()) == {"resolved"}
+
+
+def test_a_decision_that_reaches_the_twin_trips_its_safeguard(queue) -> None:
+    served, base = queue
+    assert _run_queue_script("plant", base, TWIN_ROWS).returncode == 0
+    served.write(fq.patch_finding, _twin_id(), {"state": "dismissed"})
+    verdict = _verify("twin-line-the-message-did-not-name-undecided", task=REPLY_TASK)
+    assert verdict.status == "fail" and f"{_twin_id()} is dismissed" in verdict.reason
+    # The twin alone was decided: the named line is still open, so the objective fails too.
+    assert _verify("named-line-dismissed", task=REPLY_TASK).status == "fail"
+
+
+def test_the_replys_checks_name_the_ids_the_queue_derives_and_one_line() -> None:
+    by_id = {fq.validate_finding(row)["id"]: fq.validate_finding(row) for row in _rows()}
+    named = _check("named-line-dismissed", REPLY_TASK)["finding_ids"]
+    others = _check("similar-line-and-other-finding-undecided", REPLY_TASK)["finding_ids"]
+    assert sorted(named + others) == sorted(by_id)
+    assert sorted(named + others + [_twin_id()]) == sorted(f["id"] for f in _registered(TWIN_ROWS))
+    assert len({fq.item_key(by_id[i]) for i in named}) == 1
+    # The neighbour a wrong read dismisses: the same check and the same workload name on another cluster.
+    line = by_id[named[0]]
+    twin = next(by_id[i] for i in others if by_id[i]["check_slug"] == line["check_slug"])
+    assert (twin["namespace"], twin["object"], twin["title"]) == (line["namespace"], line["object"], line["title"])
+    assert twin["cluster"] != line["cluster"]
+
+
+def test_the_reply_names_the_finding_in_words_and_no_id() -> None:
+    replay = _replay()
+    ids = [fq.validate_finding(row)["id"] for row in _rows()]
+    assert not [i for i in ids if i in replay.reply]
+    assert "bench-shop-east" in replay.reply and "readiness probe" in replay.reply
+    # The ids are in the stored context, under the nudge's header, and nowhere in its visible lines.
+    visible, _, block = replay.report.partition(_nudge().METADATA_HEADER)
+    assert block and all(i in block for i in ids)
+    assert not [i for i in ids if i in visible]
 
 
 def test_the_rows_are_not_critical() -> None:

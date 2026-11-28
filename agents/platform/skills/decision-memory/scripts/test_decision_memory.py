@@ -7,11 +7,13 @@ A live run against a real Hindsight is opt-in: set DECISION_MEMORY_LIVE_URL.
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -163,6 +165,24 @@ class RecordTests(unittest.TestCase):
         rc, out = self.r.run("validate")
         self.assertEqual(rc, 0, out)
         self.assertEqual(out["records"], 2)
+
+    def test_load_records_and_external_docs_skip_log_md(self):
+        self.r.write(".kube-agents/intent.yaml", "paths:\n  - knowledge\n")
+        self.r.write("knowledge/log.md", "# History\n\n- Initial records.\n")
+        self.r.write("knowledge/decisions/log.md", "# Decisions history\n")
+        self.r.write("knowledge/runbooks/log.md", "# Runbooks history\n")
+        self.r.write(
+            "knowledge/runbooks/RUN-001.md",
+            "---\ntype: runbook\ntitle: Restart checkout\n---\n\n# Restart checkout\n",
+        )
+        rc, out = self.r.run("validate")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["records"], 2)
+        ext = dm.load_external_doc_records(self.r.path)
+        self.assertEqual([r.path for r in ext], ["knowledge/runbooks/RUN-001.md"])
+        single_ext = dm._load_single_repo_external_docs(self.r.path)
+        self.assertEqual([r.path for r in single_ext], ["knowledge/runbooks/RUN-001.md"])
 
     def test_validate_rejects_unscoped_and_unevidenced_lesson(self):
         self.r.write("knowledge/lessons/LES-2026-002-x.md",
@@ -601,7 +621,20 @@ class FakeHindsight(BaseHTTPRequestHandler):
                 }
             return self._send({"success": True})
         if self.path.endswith("/memories/recall"):
-            res = [{"text": d["text"], "tags": d["tags"], "document_id": d["id"]} for d in FakeHindsight.docs.values()]
+            groups = (body or {}).get("tag_groups") or []
+            res = []
+            for d in FakeHindsight.docs.values():
+                doc_tags = set(d["tags"])
+                if all(
+                    (
+                        set(g.get("tags") or ()).issubset(doc_tags)
+                        if g.get("match") == "all_strict"
+                        else bool(doc_tags & set(g.get("tags") or ()))
+                    )
+                    for g in groups
+                    if g.get("tags")
+                ):
+                    res.append({"text": d["text"], "tags": d["tags"], "document_id": d["id"]})
             return self._send({"results": res})
         self._send({}, 404)
 
@@ -638,6 +671,43 @@ class IndexTests(unittest.TestCase):
 
     def tearDown(self):
         self.r.close()
+
+    def test_the_opener_takes_no_proxy_when_the_module_is_loaded_under_a_proxy_variable(self):
+        # The module builds its opener when it is imported. A process that has a proxy
+        # variable has it at that time, so the module is loaded in a new process. The
+        # probe prints the http proxy of the module's opener, then that of a default
+        # opener of the same process, which shows that the variable reached the process.
+        proxy = "http://egress.invalid:3128"
+        probe = (
+            "import urllib.request\n"
+            "import decision_memory\n"
+            "def http_proxies(opener):\n"
+            "    return [h.proxies.get('http') for h in opener.handlers if isinstance(h, urllib.request.ProxyHandler)]\n"
+            "print(http_proxies(decision_memory._HINDSIGHT_OPENER), http_proxies(urllib.request.build_opener()))\n"
+        )
+        environment = {key: value for key, value in os.environ.items() if key.lower() not in ("no_proxy", "http_proxy")}
+        environment["http_proxy"] = proxy
+        done = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=os.path.dirname(os.path.abspath(__file__)), env=environment, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(0, done.returncode, done.stderr)
+        self.assertEqual(f"[] [{proxy!r}]", done.stdout.strip())
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_hindsight(self):
+        # Hindsight is an in-cluster Service. With a proxy variable and no NO_PROXY
+        # entry for its host, urllib hands the decision records to the proxy.
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            proxy = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        # A plain `urlopen` builds its opener at the first call and keeps it. The
+        # test drops the kept one, so that a call that went back to `urlopen`
+        # reads this environment and goes to the closed port.
+        with mock.patch.dict(os.environ, {"http_proxy": proxy, "HTTP_PROXY": proxy}), mock.patch.object(urllib.request, "_opener", None):
+            for name in ("no_proxy", "NO_PROXY"):
+                os.environ.pop(name, None)
+            dm.Hindsight(self.url)._req("PUT", "", {})
+        self.assertEqual([("PUT", "/v1/default/banks/" + dm.DEFAULT_BANK_ID, {})], FakeHindsight.calls)
 
     def test_index_upserts_then_deletes_removed_records(self):
         rc, out = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
@@ -677,6 +747,52 @@ class IndexTests(unittest.TestCase):
         self.r.commit("x")
         rc, out = self.r.run("--hindsight-url", self.url, "check", "--base", "main", "--semantic")
         self.assertEqual([s["id"] for s in out["semantic"]], ["DEC-2026-001"])
+
+    def test_stable_runbook_indexes_as_active_and_surfaces_in_semantic_check(self):
+        self.r.write(
+            "knowledge/runbook/0004-coredns-latency.md",
+            "---\n"
+            "type: runbook\n"
+            "title: CoreDNS High Latency Triage\n"
+            "status: stable\n"
+            "---\n\n"
+            "Check upstream DNS forwarder saturation and conntrack table usage.\n",
+        )
+        self.r.write(
+            "knowledge/runbook/0005-draft-drain.md",
+            "---\n"
+            "type: runbook\n"
+            "title: Draft Node Drain Checklist\n"
+            "status: draft\n"
+            "---\n\n"
+            "Draft node drain notes.\n",
+        )
+        self.r.commit("knowledge: add stable and draft runbooks")
+
+        ext_by_id = {r.id: r for r in dm.load_external_doc_records(self.r.path)}
+        self.assertEqual(ext_by_id["RUN-0004"].status, "active")
+        self.assertEqual(ext_by_id["RUN-0005"].status, "proposed")
+        single_by_id = {r.id: r for r in dm._load_single_repo_external_docs(self.r.path)}
+        self.assertEqual(single_by_id["RUN-0004"].status, "active")
+        self.assertEqual(single_by_id["RUN-0005"].status, "proposed")
+
+        rc_idx, out_idx = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
+        self.assertEqual(rc_idx, 0, out_idx)
+        stable_doc = FakeHindsight.docs["okf:acme/gitops:RUN-0004"]
+        self.assertEqual(stable_doc["document_metadata"]["status"], "active")
+        self.assertIn("status:active", stable_doc["tags"])
+        draft_doc = FakeHindsight.docs["okf:acme/gitops:RUN-0005"]
+        self.assertEqual(draft_doc["document_metadata"]["status"], "proposed")
+        self.assertIn("status:proposed", draft_doc["tags"])
+
+        sh(self.r.path, "checkout", "-q", "-b", "dns-tweak")
+        self.r.write("clusters/prod-eu/dns/coredns.yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: coredns\n")
+        self.r.commit("dns: tweak coredns")
+        rc_chk, out_chk = self.r.run("--hindsight-url", self.url, "check", "--base", "main", "--semantic")
+        self.assertEqual(rc_chk, 0, out_chk)
+        semantic_ids = [s["id"] for s in out_chk["semantic"]]
+        self.assertIn("RUN-0004", semantic_ids)
+        self.assertNotIn("RUN-0005", semantic_ids)
 
     def test_index_and_recall_frame_untrusted_records_and_keep_managed_clean(self):
         backfill_lesson = (

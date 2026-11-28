@@ -103,9 +103,10 @@ type policyDriver interface {
 
 // coreAgentProfileDriver is d carrying the profile persona's grant (out,
 // the core-agent rendering) for a workspace at workdir, in place of the
-// session grant the pod's driver started with. A driver that doesn't take
-// a policy, or a grant that won't map or render, is an error: the worker
-// stops before it takes a task rather than run on the session's grant.
+// empty grant a profile pod's driver starts with. A driver that doesn't
+// take a policy, or a grant that won't map or render, is an error: the
+// worker stops before it takes a task rather than run with every tool
+// refused.
 func coreAgentProfileDriver(d Driver, out persona.Output, workdir string) (Driver, error) {
 	pd, ok := d.(policyDriver)
 	if !ok {

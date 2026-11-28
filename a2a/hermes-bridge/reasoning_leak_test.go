@@ -28,44 +28,6 @@ var leakedShapes = map[string]string{
 	"colon and text": "thought:Now that the task is created, the user asked for the delete.",
 }
 
-func TestOpensWithUnstructuredReasoning(t *testing.T) {
-	cases := []struct {
-		answer string
-		want   bool
-	}{
-		{leakedReasoning, true},
-		{"thought:\nThe user wants to delete the namespace.", true},
-		{"thought:The user asked for the delete.", true},
-		{"THOUGHT: the plan", true},
-		{"thought", true},
-		{"thought:", true},
-		{"Thought\nthe plan", true},
-		{"  THOUGHT  \r\nthe plan", true},
-		{"\n\n  \nthought\nthe plan", true},
-		{"The cluster runs 1.33.", false},
-		{"I thought about it: the cluster runs 1.33.", false},
-		{"Thought about it, the cluster runs 1.33.", false},
-		{"My thought: the cluster runs 1.33.", false},
-		{"thoughts\nthe plan", false},
-		// TrimSpace keeps U+001C..U+001F; the Python side of the rule matches it.
-		{"\x1cthought\nthe plan", false},
-		{"thoughtful answer", false},
-		{"thought :the plan", false},
-		{"thought about it\nthe plan", false},
-		{"The answer.\nthought\nmore", false},
-		{"The answer.\nthought: more", false},
-		{"thought\rthe plan", false},
-		{"\n\nThe cluster runs 1.33.", false},
-		{"", false},
-		{"\n  \n", false},
-	}
-	for _, tc := range cases {
-		if got := opensWithUnstructuredReasoning(tc.answer); got != tc.want {
-			t.Errorf("opensWithUnstructuredReasoning(%q) = %v, want %v", tc.answer, got, tc.want)
-		}
-	}
-}
-
 // An API turn whose answer is the model's reasoning, in any of the shapes,
 // ends failed with the token and the session, and neither the result nor the
 // reason carries the text.

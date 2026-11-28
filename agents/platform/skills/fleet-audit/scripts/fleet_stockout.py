@@ -7,7 +7,7 @@ which `audit_report.py finish --manifest-file` cross-checks the published
 document against; the checks it runs are defined in
 governance/stockout_prevention_sop.md.
 
-**All fourteen checks are converted.** Twelve read structures this repository's
+**All fifteen checks are converted.** Thirteen read structures this repository's
 other collectors already read with confidence — a `ComputeClass`/`Deployment`/
 `StatefulSet`/`StorageClass`/`Node` dump, a separate chunked `CapacityBuffer`
 read (`capacitybuffers.autoscaling.x-k8s.io`), the node pools (the discovery
@@ -18,7 +18,7 @@ read (`capacitybuffers.autoscaling.x-k8s.io`), the node pools (the discovery
 `ccc-mixed-disk-generations`, `ccc-hyperdisk-incompatible`,
 `ccc-unbacked-manual-fallback`, `capacity-buffer-not-ready`,
 `quota-exhaustion-risk`, `single-zone-nodepool`, `reservation-mismatch-risk`,
-`dangling-compute-class`.
+`dangling-compute-class`, `gpu-pool-missing-taint`.
 
 The other two — `spot-scarcity-risk`, off the beta Spot capacity-advice API
 (`gcloud beta compute advice capacity-history`), and
@@ -279,6 +279,79 @@ NO_CHECKED_OPTION = "no option that was checked"
 PODS_WAIT = "Pods that use this class wait."
 NO_NODE_ADDED = "GKE adds no node for {options}."
 OPTIONS_UNCHECKED = "{options} could not be checked: {names} no node pool and no machine type."
+# §3.15: a node pool with accelerators that no taint keeps other pods off, in
+# a cluster that also has an untainted node pool without accelerators.
+GPU_POOL_MISSING_TAINT = "gpu-pool-missing-taint"
+# §3.15 reads the pods on at most this many nodes of an unprotected pool, one
+# server-filtered read each, and names at most this many workloads and this
+# many of the cluster's other pools.
+GPU_POOL_NODES_READ_MAX = 5
+GPU_POOL_WORKLOADS_NAMED_MAX = 5
+GPU_POOL_PLAIN_POOLS_NAMED_MAX = 3
+FIELD_SELECTOR_KEY = "fieldSelector"
+PODS_ON_NODE_SELECTOR = "spec.nodeName={node}"
+# What stands for a node's name in a §3.15 finding's command: the read is one
+# for each node, and a command that named the nodes would change with every
+# replaced node, and the run's digest with it. The query is built with a
+# plain token, which the URL encoding leaves as it is; the command that is
+# published shows the slot as the procedure writes it.
+NODE_NAME_PLACEHOLDER = "NODE_NAME"
+NODE_NAME_SHOWN = "<node>"
+DAEMONSET_KIND = "DaemonSet"
+POD_FINISHED_PHASES = frozenset({"Succeeded", "Failed"})
+# A container's resource fields, and the domain of NVIDIA's device resources:
+# `nvidia.com/gpu`, and the other names that NVIDIA's device plugin can
+# advertise: `nvidia.com/mig-…` for a MIG slice under its `mixed` MIG
+# strategy, `nvidia.com/gpu.shared` for a shared GPU with
+# `renameByDefault=true`.
+CONTAINER_RESOURCE_FIELDS = ("requests", "limits")
+GPU_RESOURCE_DOMAIN = "nvidia.com/"
+# A quantity that declares none of a resource: `0`, `"0"`, `"0.0"`, or a zero
+# with a suffix (`0m`). Chart templates write it for an optional resource.
+ZERO_QUANTITY_RE = re.compile(r"^\s*[+-]?(?:0+(?:\.0*)?|\.0+)(?:[eE][+-]?\d+)?[A-Za-z]{0,2}\s*$")
+NODE_POOL_OBJECT = "NodePool/{name}"
+EXCERPT_SEPARATOR = "; "
+# How a failed read is written to the log.
+READ_FAILURE = "rc={rc}: {stderr}"
+NO_STDERR = "no stderr"
+# §3.15's grade when pods that request no GPU run on the pool now; without
+# one it is the configuration alone, `SEVERITY`'s entry.
+GPU_POOL_IN_USE_SEVERITY = "major"
+# The sentences of a §3.15 finding's excerpt. The pods sentence comes before
+# the list of other pools, so a long list is what a cut excerpt loses.
+GPU_POOL_ACCELERATOR = "{count} x {kind}"
+GPU_POOL_ACCELERATOR_COUNT_UNKNOWN = "?"
+GPU_POOL_ACCELERATOR_KIND_UNKNOWN = "accelerator"
+GPU_POOL_ACCELERATORS = "{accelerators} on {machine_type}"
+GPU_POOL_NO_TAINT = "no NoSchedule or NoExecute taint in the pool's settings"
+# Each pair is (one, several).
+GPU_POOL_PLAIN_POOLS = (
+    "the cluster also has an untainted node pool without accelerators ({pools})",
+    "the cluster also has untainted node pools without accelerators ({pools})",
+)
+GPU_POOL_NO_NODE = "the pool has no node now, so no pod runs on it"
+GPU_POOL_PODS_UNREAD = "the pods on its nodes were not read"
+GPU_POOL_NODES_READ = "nodes read: {read} of {live}"
+GPU_POOL_NO_STRAY_POD = (
+    "no pod that requests no GPU runs on its nodes now ({nodes}; DaemonSet pods, system pods, finished pods and pods with a resource claim are not counted)"
+)
+GPU_POOL_STRAY_PODS = (
+    "{count} pod that requests no GPU runs on its nodes now ({nodes}): {workloads}",
+    "{count} pods that request no GPU run on its nodes now ({nodes}): {workloads}",
+)
+GPU_POOL_AND_MORE = " and {count} more"
+UNKNOWN_MACHINE_TYPE = "an unknown machine type"
+# Why §3.15 does not apply on Autopilot, and the one `limitations` sentence
+# for a cluster whose pods read failed. The sentence carries no exit code, no
+# tool output and no list of pools: it is read in chat, on a line the chat
+# card caps, and in a cell of the ledger, which is the shorter of the two,
+# and each finding's excerpt already says its pods were not read. It holds
+# no semicolon, because a cluster's gaps are joined with one. The failure's
+# detail goes to the log.
+GPU_POOL_AUTOPILOT_REASON = "GKE Autopilot: GKE creates and manages the nodes, and exposes no user node pool whose taints could be missing."
+GPU_POOL_PODS_UNREAD_LIMITATION = "pods on a GPU node pool with no taint could not be read, so such a pool's finding is graded on its settings alone"
+# What a failed node pools read adds for §3.15 to that read's `limitations` sentence.
+GPU_POOL_POOLS_UNREAD_CLAUSE = f"and {GPU_POOL_MISSING_TAINT} read no node pool's taints"
 # The name GKE gives the cluster-level default ComputeClass.
 CLUSTER_DEFAULT_CLASS = "default"
 # §3.14: CapacityBuffer readiness check (autoscaling.x-k8s.io/v1beta1, GKE 1.35.2+).
@@ -597,6 +670,7 @@ IMPACT = {
     "ccc-mixed-disk-generations": "Stateful PV workload mixes Gen 2 and Gen 4 machine families, causing volume attachment failures and deadlocks when scaling across nodes.",
     "ccc-hyperdisk-incompatible": "Autoscaler fallback lands on an older machine family that does not support Hyperdisk, causing node provisioning or pod volume attachment to fail.",
     UNBACKED_MANUAL_FALLBACK: "Automatic node pool creation is off for this class, so GKE uses only the node pools that exist. A machine option with no node pool is one that GKE cannot use, and pods that use this class wait when its node pools cannot take them.",
+    GPU_POOL_MISSING_TAINT: "Nothing in this node pool's settings keeps pods that request no GPU off its GPU machines, and the cluster has other node pools for them. Such pods can fill the GPU machines, so GPU capacity is paid for work that does not use it and GPU pods can be left waiting.",
     "quota-exhaustion-risk": f"A regional GCP capacity quota is at {QUOTA_EXHAUSTION_RATIO:.0%} or more of its limit; once it is reached, Cluster Autoscaler cannot provision additional nodes in that region even if physical capacity exists.",
     # Both arms of §3.9 set their own `impact` on the hit -- and a pool
     # matching both gets both sentences -- so this entry is the fallback
@@ -619,6 +693,7 @@ SEVERITY = {
     "ccc-mixed-disk-generations": "critical",
     "ccc-hyperdisk-incompatible": "critical",
     UNBACKED_MANUAL_FALLBACK: "major",
+    GPU_POOL_MISSING_TAINT: "minor",  # overridden to major when pods that request no GPU run on the pool
     "quota-exhaustion-risk": "critical",
     "single-zone-nodepool": "major",
     "reservation-mismatch-risk": "major",  # overridden to critical for a broken/bypassed binding
@@ -687,6 +762,7 @@ run_and_gate = collector_run.run_and_gate
 TIMEOUT_RC = collector_run.TIMEOUT_RC
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
+CHAIN_SEPARATOR = collector_run.CHAIN_SEPARATOR
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 # The per-cluster reads. ComputeClass is a CRD (`cloud.google.com`) outside the
@@ -1869,6 +1945,180 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
 
 
 # --------------------------------------------------------------------------- #
+# 3.15 gpu-pool-missing-taint
+# --------------------------------------------------------------------------- #
+
+
+def has_accelerators(pool: dict) -> bool:
+    """Whether the node pool's settings list GPUs: `config.accelerators` is
+    GKE's list of them. A pool without that list is not this check's subject."""
+    return bool((pool.get("config") or {}).get("accelerators"))
+
+
+def blocks_untolerating_pods(taints: Sequence[dict]) -> bool:
+    """Whether one of a pool's taints, in the scheduler's shape
+    (`pool_taint_records`), keeps a pod with no toleration off its nodes: any
+    key, a blocking effect. GKE's own `nvidia.com/gpu=present:NoSchedule`, a
+    ComputeClass taint and an owner's own dedicated taint all do; a
+    `PreferNoSchedule` taint does not."""
+    from upgrade_retrospective import BLOCKING_TAINT_EFFECTS
+
+    return any((taint.get("effect") or "") in BLOCKING_TAINT_EFFECTS for taint in taints)
+
+
+def pool_opted_out(pool: dict) -> bool:
+    """The standard exclusion S4 for a node pool: the opt-out label among the node labels in the
+    pool's settings (`config.labels`). It is read from the settings, so it is
+    read the same for a pool with no node; a label put on a live node by hand
+    is not read."""
+    return ((pool.get("config") or {}).get("labels") or {}).get(OPT_OUT_LABEL) == OPT_OUT_VALUE
+
+
+def declares_none(quantity: object) -> bool:
+    """Whether a resource quantity is a declared zero: the key is there and
+    asks for nothing."""
+    return bool(ZERO_QUANTITY_RE.match(str(quantity)))
+
+
+def pod_requests_gpu(pod: dict) -> bool:
+    """Whether any container of the pod asks for an NVIDIA device resource,
+    under `requests` or `limits` (Kubernetes defaults a missing request to
+    the limit): `nvidia.com/gpu`, or another name in that domain, which
+    NVIDIA's device plugin can be set to advertise a MIG slice or a shared
+    GPU by. A declared zero asks for none, so it is no request; a quantity
+    that does not read as zero counts as one."""
+    spec = pod.get("spec") or {}
+    containers = [*(spec.get("containers") or []), *(spec.get("initContainers") or [])]
+    return any(
+        str(resource).startswith(GPU_RESOURCE_DOMAIN) and not declares_none(quantity)
+        for container in containers
+        if isinstance(container, dict)
+        for field in CONTAINER_RESOURCE_FIELDS
+        for resource, quantity in ((container.get("resources") or {}).get(field) or {}).items()
+    )
+
+
+def pods_without_gpu(pods: Sequence[dict], node_names: Sequence[str]) -> list[dict]:
+    """The pods on these nodes that §3.15 counts: on one of the nodes, not
+    finished, not a DaemonSet's (every node runs those), not in a system
+    namespace, requesting no GPU, and holding no resource claim. A pod with a
+    resource claim may take its GPU through the claim, which this read cannot
+    resolve, so it is left out rather than named as work that needs no GPU."""
+    on_nodes = set(node_names)
+    counted = []
+    for pod in pods:
+        if not isinstance(pod, dict):
+            continue
+        meta = pod.get("metadata") or {}
+        spec = pod.get("spec") or {}
+        if spec.get("nodeName") not in on_nodes:
+            continue
+        if (pod.get("status") or {}).get("phase") in POD_FINISHED_PHASES:
+            continue
+        if any(isinstance(o, dict) and o.get("kind") == DAEMONSET_KIND for o in meta.get("ownerReferences") or []):
+            continue
+        if _is_system_namespace(str(meta.get("namespace") or "")):
+            continue
+        if pod_requests_gpu(pod) or spec.get("resourceClaims"):
+            continue
+        counted.append(pod)
+    return counted
+
+
+def pods_on_node_query(node_name: str) -> dict[str, str]:
+    """The server-side filter of one node's pods."""
+    return {FIELD_SELECTOR_KEY: PODS_ON_NODE_SELECTOR.format(node=node_name)}
+
+
+def read_pods_on_nodes(node_names: Sequence[str], *, run: RunFn, env: dict) -> tuple[list[dict] | None, str]:
+    """The pods on each of these nodes, one server-filtered paged read a
+    node. `(pods, "")` on success; `(None, why)` when a read failed: the
+    finding then files on the pool's settings alone, and `why` is for the log."""
+    pods: list[dict] = []
+    for name in node_names:
+        parsed, result = paged_dump((PODS_KIND,), run=run, env=env, query=pods_on_node_query(name))
+        if parsed is None:
+            return None, READ_FAILURE.format(rc=result.rc, stderr=result.stderr.strip()[:STDERR_EXCERPT_CHARS] or NO_STDERR)
+        pods.extend(p for p in parsed.get("items") or [] if isinstance(p, dict))
+    return pods, ""
+
+
+def _named_with_rest(names: Sequence[str], limit: int) -> str:
+    """`names` joined, the first `limit` of them, with the rest counted."""
+    shown = OPTION_LIST_SEPARATOR.join(names[:limit])
+    return shown + GPU_POOL_AND_MORE.format(count=len(names) - limit) if len(names) > limit else shown
+
+
+def gpu_pool_unprotected(pool: dict, taints: Sequence[dict], plain_pools: Sequence[str]) -> bool:
+    """What the pool's settings alone decide: it has accelerators, no blocking
+    taint and no opt-out label, and the cluster has another pool
+    (`plain_pools`) for a pod with no toleration. No pod is read for a pool
+    this clears."""
+    return has_accelerators(pool) and bool(plain_pools) and not blocks_untolerating_pods(taints) and not pool_opted_out(pool)
+
+
+def check_gpu_pool_missing_taint(
+    pool: dict, taints: Sequence[dict], plain_pools: Sequence[str], live_node_count: int, stray_pods: Sequence[dict] | None, nodes_read: int
+) -> dict | None:
+    """A node pool with accelerators that no blocking taint protects, on a
+    cluster that also has a node pool a pod with no toleration can run on
+    instead: one without accelerators and without a blocking taint of its
+    own (`plain_pools`, their names). `taints` are the pool's own, in the
+    scheduler's shape.
+
+    GKE taints a GPU pool itself only when the cluster already has a pool
+    without GPUs, and its page says it does not apply the taint to existing
+    GPU nodes when such a pool comes later, so a pool can stay without one.
+    On a cluster with GPU pools only there is nowhere else for a pod to go
+    and no taint is GKE's own state: not a finding. Nor is it one where every
+    other pool is tainted, because the GPU pool is then the cluster's only
+    pool for ordinary pods; nor where the owners set the standard opt-out
+    label on the pool (`pool_opted_out`).
+
+    The pool's settings decide the finding. The pods decide its grade:
+    `stray_pods` are the pods `pods_without_gpu` kept from the read of
+    `nodes_read` of the pool's `live_node_count` nodes, or `None` when that
+    read failed. With one or more the pool is being used by work that needs
+    no GPU and the finding is `GPU_POOL_IN_USE_SEVERITY`; with none, with no
+    node, or with the pods unread, it is the configuration alone."""
+    if not gpu_pool_unprotected(pool, taints, plain_pools):
+        return None
+    config = pool.get("config") or {}
+    accelerators = OPTION_LIST_SEPARATOR.join(
+        GPU_POOL_ACCELERATOR.format(
+            count=a.get("acceleratorCount", GPU_POOL_ACCELERATOR_COUNT_UNKNOWN), kind=a.get("acceleratorType", GPU_POOL_ACCELERATOR_KIND_UNKNOWN)
+        )
+        for a in config.get("accelerators") or []
+        if isinstance(a, dict)
+    )
+    excerpts = [
+        GPU_POOL_ACCELERATORS.format(accelerators=accelerators, machine_type=config.get("machineType") or UNKNOWN_MACHINE_TYPE),
+        GPU_POOL_NO_TAINT,
+    ]
+    hit: dict = {"object": NODE_POOL_OBJECT.format(name=pool.get("name", ""))}
+    nodes = GPU_POOL_NODES_READ.format(read=nodes_read, live=live_node_count)
+    if not live_node_count:
+        excerpts.append(GPU_POOL_NO_NODE)
+    elif stray_pods is None:
+        excerpts.append(GPU_POOL_PODS_UNREAD)
+    elif not stray_pods:
+        excerpts.append(GPU_POOL_NO_STRAY_POD.format(nodes=nodes))
+    else:
+        counts: dict[str, int] = {}
+        for pod in stray_pods:
+            workload = f"{(pod.get('metadata') or {}).get('namespace', '')}/{workload_of(pod)}"
+            counts[workload] = counts.get(workload, 0) + 1
+        ranked = [f"{w} ({n})" for w, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        excerpts.append(
+            GPU_POOL_STRAY_PODS[len(stray_pods) > 1].format(count=len(stray_pods), nodes=nodes, workloads=_named_with_rest(ranked, GPU_POOL_WORKLOADS_NAMED_MAX))
+        )
+        hit["severity"] = GPU_POOL_IN_USE_SEVERITY
+    excerpts.append(GPU_POOL_PLAIN_POOLS[len(plain_pools) > 1].format(pools=_named_with_rest(list(plain_pools), GPU_POOL_PLAIN_POOLS_NAMED_MAX)))
+    hit["excerpt"] = EXCERPT_SEPARATOR.join(excerpts)
+    return hit
+
+
+# --------------------------------------------------------------------------- #
 # 3.10 reservation-mismatch-risk
 # --------------------------------------------------------------------------- #
 
@@ -2871,6 +3121,12 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 ),
             }
         )
+        not_applicable.append(
+            {
+                "check": GPU_POOL_MISSING_TAINT,
+                "reason": GPU_POOL_AUTOPILOT_REASON,
+            }
+        )
     elif pools_readable:
         # Recorded even when the cluster holds no pools. Zero pools is a real
         # answer to "is any pool single-zone" -- no -- and dropping the check
@@ -2915,8 +3171,62 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                         # reads.
                         hit["command"] = f"{pools_record['command']}; {pods_command_text}"
                     candidates.append(_emit("single-zone-nodepool", hit))
+        # §3.15. Zero pools is an answer here too. The pod read is issued only
+        # for a pool the settings already name, and only for nodes it has.
+        commands[GPU_POOL_MISSING_TAINT] = pools_record
+        taints_of = {name: record.get("taints", []) for name, record in taint_records.items()}
+        # The pools a pod with no toleration and no GPU request can run on
+        # instead: no accelerators and no blocking taint of their own.
+        plain_pools = sorted(
+            str(pool.get("name", ""))
+            for pool in node_pools
+            if not has_accelerators(pool) and not blocks_untolerating_pods(taints_of.get(str(pool.get("name", "")), []))
+        )
+        # A set: a node is one node however many times a dump lists it.
+        node_names_by_pool: dict[str, set[str]] = {}
+        for item in items:
+            if item.get("kind") == "Node":
+                meta = item.get("metadata") or {}
+                node_names_by_pool.setdefault((meta.get("labels") or {}).get(NODEPOOL_LABEL, ""), set()).add(str(meta.get("name", "")))
+        pods_unread = False
+        for pool in node_pools:
+            pool_name = str(pool.get("name", ""))
+            pool_taints = taints_of.get(pool_name, [])
+            # The settings decide first: no pod is read for a pool they clear.
+            if not gpu_pool_unprotected(pool, pool_taints, plain_pools):
+                continue
+            pool_nodes = sorted(node_names_by_pool.get(pool_name, set()))
+            nodes_to_read = pool_nodes[:GPU_POOL_NODES_READ_MAX]
+            stray_pods: list[dict] | None = []
+            if nodes_to_read:
+                pods_on_nodes, pods_failure = read_pods_on_nodes(nodes_to_read, run=run, env=env)
+                if pods_on_nodes is None:
+                    stray_pods = None
+                    pods_unread = True
+                    log(f"{project}/{location}/{name}: {GPU_POOL_MISSING_TAINT}: the pods read for node pool {pool_name} failed ({pods_failure})")
+                else:
+                    stray_pods = pods_without_gpu(pods_on_nodes, nodes_to_read)
+            hit = check_gpu_pool_missing_taint(pool, pool_taints, plain_pools, len(pool_nodes), stray_pods, len(nodes_to_read))
+            if hit:
+                if stray_pods:
+                    # The excerpt counts pods that the pools list cannot
+                    # reproduce, so the command names the pods read too, once,
+                    # with a stand-in for the node's name. Only then, which is
+                    # §3.9's condition for its backlog count. Here the count
+                    # also sets the grade, so the command changes together
+                    # with the grade, and not each time the pool gains or
+                    # loses its last node, which alone would move the run's
+                    # digest.
+                    pods_read = paged_command_text((PODS_KIND,), query=pods_on_node_query(NODE_NAME_PLACEHOLDER), kubeconfig=kubeconfig)
+                    hit["command"] = f"{pools_record['command']}{CHAIN_SEPARATOR}{pods_read.replace(NODE_NAME_PLACEHOLDER, NODE_NAME_SHOWN)}"
+                candidates.append(_emit(GPU_POOL_MISSING_TAINT, hit))
+        if pods_unread:
+            # One sentence for the cluster, whatever the number of pools.
+            limitations.append(GPU_POOL_PODS_UNREAD_LIMITATION)
     else:
         unevaluated["single-zone-nodepool"] = pools_failure
+        # §3.15 starts from the node pools, so it did not run either.
+        unevaluated[GPU_POOL_MISSING_TAINT] = pools_failure
         if any(_reads_pool_labels(w, compute_classes_by_name) for w in workloads):
             # The nodePoolAutoCreation arm needs the pool labels this read
             # would have given, and a workload here selects a class it applies
@@ -2939,8 +3249,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
             f"single-zone-nodepool could not be measured on this cluster: "
             f"{pools_failure}. The same failure left dangling-compute-class "
             f"without node pool labels, so its nodePoolAutoCreation arm did not "
-            f"run either, spot-scarcity-risk read no Spot node pool, and "
-            f"reservation-mismatch-risk compared no node pool with the reservation it names"
+            f"run either, spot-scarcity-risk read no Spot node pool, "
+            f"reservation-mismatch-risk compared no node pool with the reservation it names, "
+            f"{GPU_POOL_POOLS_UNREAD_CLAUSE}"
         )
         if manual_fallback_unread:
             # No class in scope is an answer the dump alone gives; a class in

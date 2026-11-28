@@ -1,4 +1,4 @@
-// Package memory implements the Operational Knowledge Framework (OKF) Curator and
+// Package memory implements the Open Knowledge Format (OKF) Curator and
 // Dreamer for kube-agents: NATS JetStream outcome ingestion on
 // a2a.topics.shared.annotations, deterministic YAML guard evaluation, cross-cluster
 // recurrence graduation, single-shot LiteLLM synthesis, Hindsight bank indexing
@@ -100,6 +100,15 @@ const (
 	recordDirPerm           = 0o750
 	recordFilePerm          = 0o600
 	maxRecordFileBytes      = 4 << 20
+	skippedIndexFile        = "index.md"
+	skippedLogFile          = "log.md"
+	skippedReadmeFile       = "readme.md"
+	skippedStateOfBeingFile = "state_of_being.md"
+	skippedTemplateFile     = "template.md"
+	skippedTemplatePrefix   = "0000-"
+	externalStatusAccepted  = "accepted"
+	externalStatusApproved  = "approved"
+	externalStatusStable    = "stable"
 )
 
 // OutcomeKind classifies a learning event processed by the Curator.
@@ -980,7 +989,7 @@ func LoadRecords(repoDir string) ([]Record, error) {
 				continue
 			}
 			lower := strings.ToLower(e.Name())
-			if lower == "index.md" || lower == "readme.md" || lower == "state_of_being.md" {
+			if isSkippedRootKnowledgeFile(lower) {
 				continue
 			}
 			rel := filepath.ToSlash(filepath.Join(sub, e.Name()))
@@ -1001,6 +1010,10 @@ func LoadRecords(repoDir string) ([]Record, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Meta.ID < out[j].Meta.ID })
 	return out, nil
+}
+
+func isSkippedRootKnowledgeFile(lower string) bool {
+	return lower == skippedIndexFile || lower == skippedLogFile || lower == skippedReadmeFile || lower == skippedStateOfBeingFile
 }
 
 func stripRepoPrefixForDocType(relPath string) string {
@@ -1147,7 +1160,7 @@ func parseExternalDocRecord(text, relPath string) (rec Record, explicitID bool) 
 		if rawStatus, hasStatus := fm["status"]; hasStatus && rawStatus != nil {
 			if stStr, ok := rawStatus.(string); ok {
 				switch strings.ToLower(strings.TrimSpace(stStr)) {
-				case "", "active", "accepted", "approved":
+				case "", string(StatusActive), externalStatusAccepted, externalStatusApproved, externalStatusStable:
 					status = StatusActive
 				case "proposed", "draft":
 					status = StatusProposed
@@ -1671,7 +1684,7 @@ func loadExternalDocRecordsFromRoots(repoDir string, roots []externalDocRoot) ([
 					continue
 				}
 				lower := strings.ToLower(e.Name())
-				if lower == "index.md" || lower == "readme.md" || lower == "template.md" || lower == "state_of_being.md" || strings.HasPrefix(lower, "0000-") {
+				if isSkippedRootKnowledgeFile(lower) || lower == skippedTemplateFile || strings.HasPrefix(lower, skippedTemplatePrefix) {
 					continue
 				}
 				innerRel := filepath.ToSlash(filepath.Join(sub, e.Name()))
