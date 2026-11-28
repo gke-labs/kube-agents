@@ -8,6 +8,7 @@ from pathlib import Path
 import os
 import sys
 import tempfile
+import time
 import unittest
 import subprocess
 from contextlib import redirect_stderr, redirect_stdout
@@ -959,8 +960,12 @@ class CollectProjectTest(unittest.TestCase):
         self.assertEqual(entries[0]["outcome"], "collected")
         self.assertEqual(entries[0]["candidates"], [])
         # A current cluster has no upgrade for 3.11 to ask about, so that one
-        # slug is declared rather than run; the other ten all ran.
-        self.assertEqual({c["check"] for c in entries[0]["commands"]}, set(pr.SEVERITY) - {pr.UPGRADE_BLOCKED_CHECK})
+        # slug is declared rather than run; 3.12 runs in phase 3 (`collect_system_crd_webhooks`),
+        # and the other ten all ran here.
+        self.assertEqual(
+            {c["check"] for c in entries[0]["commands"]},
+            set(pr.SEVERITY) - {pr.UPGRADE_BLOCKED_CHECK, pr.SYSTEM_CRD_WEBHOOK_CHECK},
+        )
         self.assertEqual(entries[0]["checks_not_applicable"], [{"check": pr.UPGRADE_BLOCKED_CHECK, "reason": pr.NOT_BEHIND_REASON}])
 
     def test_an_unjudged_baseline_check_is_left_out_of_commands(self):
@@ -1131,6 +1136,7 @@ class CollectProjectTest(unittest.TestCase):
             "get-server-config": run_of(0, json.dumps(server_config())),
         }
         entries = collect_both("acme", run=self.fake_run(responses), now=NOW)
+        pr.collect_system_crd_webhooks("acme", entries, run=self.fake_run(responses))
         roster = set(audit_report.audit_target_checks("security-patch-orchestrator", "a"))
         for entry in entries:
             self.assertEqual(entry["candidates"], [])
@@ -1697,15 +1703,16 @@ class AutopilotNodePoolChecksTest(unittest.TestCase):
         self.assertNotIn("master-behind", ran_no_baseline)
 
     def test_the_run_list_accounts_for_the_whole_roster(self):
-        """An Autopilot cluster owes a disposition for all eleven checks: ten
-        ran rather than being excused, and 3.11 is declared inapplicable
-        because a current cluster has no upgrade whose completion could be
-        blocked."""
+        """An Autopilot cluster owes a disposition for all twelve checks: ten
+        metadata checks ran rather than being excused, 3.11 is declared
+        inapplicable on a current cluster, and 3.12 is declared inapplicable
+        below GKE 1.35."""
         entry, ran = self.collect(autopilot=True)
+        pr.collect_system_crd_webhooks("acme", [entry], run=lambda *a, **k: run_of(1, "", "unexpected"))
         roster = set(audit_report.AUDITS["security-patch-orchestrator"].checks)
         declared = {c["check"] for c in entry["checks_not_applicable"]}
-        self.assertEqual(roster - ran, {pr.UPGRADE_BLOCKED_CHECK})
-        self.assertEqual(declared, {pr.UPGRADE_BLOCKED_CHECK})
+        self.assertEqual(roster - ran, {pr.UPGRADE_BLOCKED_CHECK, pr.SYSTEM_CRD_WEBHOOK_CHECK})
+        self.assertEqual(declared, {pr.UPGRADE_BLOCKED_CHECK, pr.SYSTEM_CRD_WEBHOOK_CHECK})
 
 
 class UpgradeBlockedTest(unittest.TestCase):
@@ -3122,7 +3129,10 @@ class UpgradeBlockedTest(unittest.TestCase):
         with mock.patch.object(pr, "collect_upgrade_blocked", side_effect=crash):
             manifest = pr.collect_fleet(run=run, now=NOW, max_workers=1)
         by = {short(e): e for e in manifest["clusters"] if e.get("outcome") == "collected"}
-        self.assertEqual([x["check"] for x in by["cur"]["checks_not_applicable"]], [pr.UPGRADE_BLOCKED_CHECK])
+        self.assertEqual(
+            [x["check"] for x in by["cur"]["checks_not_applicable"]],
+            [pr.UPGRADE_BLOCKED_CHECK, pr.SYSTEM_CRD_WEBHOOK_CHECK],
+        )
         self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(by["cur"]))
         reasons = [u["reason"] for u in by["lag"].get("checks_unevaluated") or [] if u["check"] == pr.UPGRADE_BLOCKED_CHECK]
         self.assertEqual(reasons, [pr.UNEVALUATED_NOT_RUN_FORMAT.format(why=pr.UNEVALUATED_PHASE_CRASHED.format(error="RuntimeError"))])
@@ -3633,6 +3643,420 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+
+class SystemCrdWebhookCheckTest(unittest.TestCase):
+    """§3.12 (`upgrade-system-crd-webhook-block`): GKE 1.35+ system CRD webhook check."""
+
+    def setUp(self):
+        self._kc_tmp = tempfile.TemporaryDirectory(prefix="patch-readiness-kc-")
+        import collect as _collect
+
+        self._kc_patch = mock.patch.object(_collect, "KUBECONFIG_DIR", Path(self._kc_tmp.name))
+        self._kc_patch.start()
+
+    def tearDown(self):
+        self._kc_patch.stop()
+        self._kc_tmp.cleanup()
+
+    @staticmethod
+    def _seeded_crd_gate():
+        return {
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "seeded-crd-gate"},
+            "webhooks": [
+                {
+                    "name": "crd-gate.seeded.invalid",
+                    "failurePolicy": "Fail",
+                    "objectSelector": {"matchLabels": {"managed-by": "kube-agents-seeded-fleet"}},
+                    "clientConfig": {
+                        "service": {"namespace": "seeded-upgrade", "name": "nonexistent-crd-gate", "port": 443}
+                    },
+                    "rules": [
+                        {
+                            "apiGroups": ["autoscaling.x-k8s.io"],
+                            "apiVersions": ["*"],
+                            "operations": ["CREATE", "UPDATE"],
+                            "resources": ["capacitybuffers"],
+                            "scope": "Namespaced",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    @staticmethod
+    def _established_crd(established: bool = True):
+        return {
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "capacitybuffers.autoscaling.x-k8s.io"},
+            "status": {"conditions": [{"type": "Established", "status": "True" if established else "False"}]},
+        }
+
+    def _make_run(self, *, webhooks=(), services=(), slices=(), namespaces=(), crd_rc=0, crd_obj=None, crd_stderr="", cred_rc=0, dump_fail_path=None, issued=None):
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if issued is not None:
+                issued.append(list(argv))
+            if "get-credentials" in joined:
+                return pr.Run(list(argv), cred_rc, "", "cred denied" if cred_rc else "", 0.01)
+            if "get" in argv and "--raw" in argv:
+                raw_path = argv[argv.index("--raw") + 1]
+                if dump_fail_path and dump_fail_path in raw_path:
+                    return pr.Run(list(argv), 1, "", "forbidden", 0.01)
+                if "validatingwebhookconfigurations" in raw_path:
+                    items = [w for w in webhooks if w.get("kind") == "ValidatingWebhookConfiguration"]
+                elif "mutatingwebhookconfigurations" in raw_path:
+                    items = [w for w in webhooks if w.get("kind") == "MutatingWebhookConfiguration"]
+                elif "/services" in raw_path:
+                    items = list(services)
+                elif "endpointslices" in raw_path:
+                    items = list(slices)
+                elif "/namespaces" in raw_path:
+                    items = list(namespaces)
+                else:
+                    items = []
+                return pr.Run(list(argv), 0, json.dumps({"items": items, "metadata": {}}), "", 0.01)
+            if "crd" in argv and pr._upgrade_readiness().CAPACITY_BUFFER_CRD_NAME in argv:
+                body = json.dumps(crd_obj if crd_obj is not None else self._established_crd()) if crd_rc == 0 else ""
+                return pr.Run(list(argv), crd_rc, body, crd_stderr, 0.01)
+            return pr.Run(list(argv), 1, "", f"unstubbed: {joined}", 0.01)
+
+        return run
+
+    def _entry(self, name="seeded-b", master="1.35.8-gke.1796000", target="1.36.4-gke.2377000", channel="REGULAR", dns=False):
+        return {
+            "name": f"acme/us-central1-b/{name}",
+            "project": "acme",
+            "location": "us-central1-b",
+            "autopilot": False,
+            "outcome": pr.OUTCOME_COLLECTED,
+            "commands": [],
+            "candidates": [],
+            "_bare_name": name,
+            "_master_version": master,
+            "_target_version": target,
+            "_channel": channel,
+            "_dns_endpoint": dns,
+            "_status": "RUNNING",
+        }
+
+    def test_seeded_crd_gate_on_1_35_emits_critical_finding_on_webhook_object(self):
+        entry = self._entry()
+        run = self._make_run(webhooks=[self._seeded_crd_gate()])
+        pr.collect_system_crd_webhooks("acme", [entry], run=run)
+        self.assertEqual([c["check"] for c in entry["commands"]], [pr.SYSTEM_CRD_WEBHOOK_CHECK])
+        self.assertEqual(len(entry["candidates"]), 1)
+        cand = entry["candidates"][0]
+        self.assertEqual(cand["check"], pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertEqual(cand["namespace"], "")
+        self.assertEqual(cand["object"], "ValidatingWebhookConfiguration/seeded-crd-gate")
+        self.assertEqual(cand["severity"], pr.CRITICAL)
+        self.assertIn("nonexistent-crd-gate", cand["excerpt"])
+        self.assertTrue(cand["impact_authoritative"])
+        self.assertEqual(cand["impact"], pr.SYSTEM_CRD_IMPACT_UNREACHABLE)
+
+    def test_current_1_36_cluster_is_also_checked(self):
+        entry = self._entry(name="seeded-a", master="1.36.4-gke.2377000", target="1.36.4-gke.2377000")
+        run = self._make_run(webhooks=[self._seeded_crd_gate()])
+        pr.collect_system_crd_webhooks("acme", [entry], run=run)
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["ValidatingWebhookConfiguration/seeded-crd-gate"])
+
+    def test_1_34_upgrading_to_1_35_is_checked_and_1_34_staying_below_is_not_applicable(self):
+        upgrading = self._entry(name="up", master="1.34.9-gke.100", target="1.35.2-gke.100")
+        staying = self._entry(name="old", master="1.34.9-gke.100", target="1.34.12-gke.100")
+        static_old = self._entry(name="static", master="1.34.9-gke.100", target="", channel="")
+        run = self._make_run(webhooks=[self._seeded_crd_gate()], crd_rc=1, crd_stderr='Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "capacitybuffers.autoscaling.x-k8s.io" not found')
+        pr.collect_system_crd_webhooks("acme", [upgrading, staying, static_old], run=run)
+        self.assertEqual([c["object"] for c in upgrading["candidates"]], ["ValidatingWebhookConfiguration/seeded-crd-gate"])
+        for e in (staying, static_old):
+            self.assertEqual([d["check"] for d in e["checks_not_applicable"]], [pr.SYSTEM_CRD_WEBHOOK_CHECK])
+            self.assertEqual(e["candidates"], [])
+
+    def test_1_34_with_missing_baseline_or_unparsable_version_is_unevaluated(self):
+        no_base = self._entry(name="nobase", master="1.34.9-gke.100", target="", channel="REGULAR")
+        bad_ver = self._entry(name="badver", master="not-a-version", target="", channel="REGULAR")
+        run = self._make_run()
+        pr.collect_system_crd_webhooks("acme", [no_base, bad_ver], run=run)
+        self.assertEqual(no_base["checks_unevaluated"], [{"check": pr.SYSTEM_CRD_WEBHOOK_CHECK, "reason": pr.SYSTEM_CRD_UNEVALUATED_BASELINE}])
+        self.assertEqual(bad_ver["checks_unevaluated"], [{"check": pr.SYSTEM_CRD_WEBHOOK_CHECK, "reason": pr.SYSTEM_CRD_UNEVALUATED_VERSION}])
+
+    def test_reachable_fail_closed_gatekeeper_emits_major_and_unestablished_crd_escalates_critical(self):
+        gatekeeper = {
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "gatekeeper-validating-webhook-configuration"},
+            "webhooks": [
+                {
+                    "name": "validation.gatekeeper.sh",
+                    "failurePolicy": "Fail",
+                    "clientConfig": {"service": {"namespace": "gatekeeper-system", "name": "gatekeeper-webhook-service", "port": 443}},
+                    "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "operations": ["CREATE", "UPDATE"], "resources": ["*"], "scope": "*"}],
+                }
+            ],
+        }
+        svc = {"kind": "Service", "metadata": {"namespace": "gatekeeper-system", "name": "gatekeeper-webhook-service"}, "spec": {"ports": [{"port": 443, "name": "https"}]}}
+        slc = {"kind": "EndpointSlice", "metadata": {"namespace": "gatekeeper-system", "name": "gk-1", "labels": {"kubernetes.io/service-name": "gatekeeper-webhook-service"}}, "ports": [{"name": "https", "port": 8443}], "endpoints": [{"conditions": {"ready": True}}]}
+
+        e_ok = self._entry(name="live-ok")
+        pr.collect_system_crd_webhooks("acme", [e_ok], run=self._make_run(webhooks=[gatekeeper], services=[svc], slices=[slc], crd_obj=self._established_crd(True)))
+        self.assertEqual(e_ok["candidates"][0]["severity"], pr.MAJOR)
+        self.assertEqual(e_ok["candidates"][0]["impact"], pr.SYSTEM_CRD_IMPACT_REACHABLE)
+
+        e_bad = self._entry(name="live-unestablished")
+        pr.collect_system_crd_webhooks("acme", [e_bad], run=self._make_run(webhooks=[gatekeeper], services=[svc], slices=[slc], crd_obj=self._established_crd(False)))
+        self.assertEqual(e_bad["candidates"][0]["severity"], pr.CRITICAL)
+        self.assertEqual(e_bad["candidates"][0]["impact"], pr.SYSTEM_CRD_IMPACT_REACHABLE_CRD_UNESTABLISHED)
+        self.assertIn("not Established", e_bad["candidates"][0]["excerpt"])
+        # Recorded command uses paged --raw commands plus the CRD read in a subshell.
+        cmd_312 = next(c["command"] for c in e_bad["commands"] if c["check"] == pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertIn("kubectl get --raw '/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?limit=500'", cmd_312)
+        self.assertIn("kubectl get crd capacitybuffers.autoscaling.x-k8s.io -o json", cmd_312)
+
+        # Absent CRD (NotFound) on GKE >= 1.35.2 escalates a matching reachable webhook to critical with "is absent",
+        # while emitting no standalone CRD finding when no webhook matches.
+        not_found_err = 'Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "capacitybuffers.autoscaling.x-k8s.io" not found'
+        e_absent_hook = self._entry(name="live-absent-crd", master="1.35.8-gke.1796000")
+        pr.collect_system_crd_webhooks("acme", [e_absent_hook], run=self._make_run(webhooks=[gatekeeper], services=[svc], slices=[slc], crd_rc=1, crd_stderr=not_found_err))
+        self.assertEqual(e_absent_hook["candidates"][0]["severity"], pr.CRITICAL)
+        self.assertEqual(e_absent_hook["candidates"][0]["impact"], pr.SYSTEM_CRD_IMPACT_REACHABLE_CRD_UNESTABLISHED)
+        self.assertIn("CRD is absent", e_absent_hook["candidates"][0]["excerpt"])
+
+        e_absent_clean = self._entry(name="clean-absent-crd", master="1.35.8-gke.1796000")
+        pr.collect_system_crd_webhooks("acme", [e_absent_clean], run=self._make_run(crd_rc=1, crd_stderr=not_found_err))
+        self.assertEqual(e_absent_clean["candidates"], [])
+
+        # RBAC 403 Forbidden on CRD read stays best-effort (crd_established=None): reachable webhook remains major.
+        forbidden_err = 'Error from server (Forbidden): customresourcedefinitions.apiextensions.k8s.io "capacitybuffers.autoscaling.x-k8s.io" is forbidden'
+        e_forbidden = self._entry(name="live-crd-forbidden", master="1.35.8-gke.1796000")
+        pr.collect_system_crd_webhooks("acme", [e_forbidden], run=self._make_run(webhooks=[gatekeeper], services=[svc], slices=[slc], crd_rc=1, crd_stderr=forbidden_err))
+        self.assertEqual(e_forbidden["candidates"][0]["severity"], pr.MAJOR)
+        self.assertEqual(e_forbidden["candidates"][0]["impact"], pr.SYSTEM_CRD_IMPACT_REACHABLE)
+
+    def test_unestablished_crd_alone_emits_critical_on_crd_object(self):
+        entry = self._entry()
+        pr.collect_system_crd_webhooks("acme", [entry], run=self._make_run(crd_obj=self._established_crd(False)))
+        self.assertEqual(len(entry["candidates"]), 1)
+        self.assertEqual(entry["candidates"][0]["object"], "CustomResourceDefinition/capacitybuffers.autoscaling.x-k8s.io")
+        self.assertEqual(entry["candidates"][0]["severity"], pr.CRITICAL)
+        self.assertEqual(entry["candidates"][0]["impact"], pr.SYSTEM_CRD_IMPACT_CRD_UNESTABLISHED)
+
+    def test_dns_endpoint_and_failure_modes_mark_unevaluated(self):
+        issued = []
+        e_dns = self._entry(name="dns-cluster", dns=True)
+        pr.collect_system_crd_webhooks("acme", [e_dns], run=self._make_run(issued=issued))
+        self.assertTrue(any(pr.DNS_ENDPOINT_FLAG in cmd for cmd in issued))
+        self.assertEqual(e_dns["candidates"], [])
+
+        e_cred = self._entry(name="no-creds")
+        pr.collect_system_crd_webhooks("acme", [e_cred], run=self._make_run(cred_rc=1))
+        self.assertEqual(e_cred["checks_unevaluated"][0]["check"], pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertIn("cred denied", e_cred["checks_unevaluated"][0]["reason"])
+
+        e_dump = self._entry(name="no-dump")
+        pr.collect_system_crd_webhooks("acme", [e_dump], run=self._make_run(dump_fail_path="validatingwebhookconfigurations"))
+        self.assertEqual(e_dump["checks_unevaluated"][0]["check"], pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertIn("forbidden", e_dump["checks_unevaluated"][0]["reason"])
+
+        e_budget = self._entry(name="no-budget")
+        pr.collect_system_crd_webhooks("acme", [e_budget], run=self._make_run(), deadline=time.monotonic() - 10)
+        self.assertEqual(e_budget["checks_unevaluated"][0]["check"], pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertIn("budget", e_budget["checks_unevaluated"][0]["reason"])
+
+    def test_3_11_does_not_mark_system_crd_only_webhook_block_as_unrecognised(self):
+        c = cluster(name="lag", master="1.35.8-gke.1796000")
+        row = UpgradeBlockedTest.member("lag", status="blocked")
+        row["readiness"]["webhooks"] = {
+            "blocking": [
+                {
+                    "webhook": "seeded-crd-gate/crd-gate.seeded.invalid",
+                    "upgrade_path": ["CREATE capacitybuffers in autoscaling.x-k8s.io"],
+                    "system_crd_matches": ["CREATE capacitybuffers in autoscaling.x-k8s.io"],
+                }
+            ],
+            "outage": [],
+        }
+        baseline = server_config(default="1.36.4-gke.2377000", valid_versions=["1.35.8-gke.1796000", "1.36.4-gke.2377000"])
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "clusters list" in joined:
+                return run_of(0, json.dumps([c]))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(baseline))
+            if REPORTER_NEEDLE in joined:
+                out_path = argv[argv.index("--output") + 1]
+                with open(out_path, "w", encoding="utf-8") as handle:
+                    json.dump({"narrowed_to": ["us-central1/lag"], "members": [row]}, handle)
+                return run_of(0, "")
+            return run_of(1, "", f"unstubbed: {joined}")
+
+        entries = collect_both("acme", run=run, now=NOW)
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, [cmd["check"] for cmd in entries[0]["commands"]])
+        self.assertNotIn("checks_unevaluated", entries[0])
+
+    def test_3_11_keeps_mixed_upgrade_path_and_system_crd_webhook_block_unrecognised(self):
+        c = cluster(name="lag-mixed", master="1.35.8-gke.1796000")
+        row = UpgradeBlockedTest.member("lag-mixed", status="blocked")
+        row["readiness"]["webhooks"] = {
+            "blocking": [
+                {
+                    "webhook": "mixed-gate/all.example.com",
+                    "upgrade_path": ["CREATE pods", "CREATE capacitybuffers in autoscaling.x-k8s.io"],
+                    "system_crd_matches": ["CREATE capacitybuffers in autoscaling.x-k8s.io"],
+                }
+            ],
+            "outage": [],
+        }
+        baseline = server_config(default="1.36.4-gke.2377000", valid_versions=["1.35.8-gke.1796000", "1.36.4-gke.2377000"])
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "clusters list" in joined:
+                return run_of(0, json.dumps([c]))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(baseline))
+            if REPORTER_NEEDLE in joined:
+                out_path = argv[argv.index("--output") + 1]
+                with open(out_path, "w", encoding="utf-8") as handle:
+                    json.dump({"narrowed_to": ["us-central1/lag-mixed"], "members": [row]}, handle)
+                return run_of(0, "")
+            return run_of(1, "", f"unstubbed: {joined}")
+
+        entries = collect_both("acme", run=run, now=NOW)
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, [cmd["check"] for cmd in entries[0]["commands"]])
+        self.assertEqual([u["check"] for u in entries[0]["checks_unevaluated"]], [pr.UPGRADE_BLOCKED_CHECK])
+
+    def test_3_12_deadline_expiry_mid_cluster_aborts_remaining_paged_reads(self):
+        entry = self._entry(name="slow-cluster")
+        calls = []
+        clock = [1000.0]
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs.get("timeout")))
+            if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                clock[0] = 1025.0  # Spend the entire 25s remaining budget inside get-credentials.
+                return run_of(0, "")
+            return run_of(0, json.dumps({"items": []}))
+
+        with mock.patch.object(pr.time, "monotonic", side_effect=lambda: clock[0]):
+            pr.collect_system_crd_webhooks("acme", [entry], run=fake_run, deadline=1025.0)
+        self.assertEqual(len(calls), 1)  # Stopped before issuing any paged kubectl read past deadline.
+        self.assertEqual(entry["checks_unevaluated"][0]["check"], pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertIn("budget", entry["checks_unevaluated"][0]["reason"])
+
+    def test_3_12_per_cluster_cap_aborts_slow_cluster_even_with_ample_fleet_budget(self):
+        entry = self._entry(name="slow-single")
+        calls = []
+        clock = [1000.0]
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs.get("timeout")))
+            if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                clock[0] = 1000.0 + pr.SYSTEM_CRD_WEBHOOK_TIMEOUT_S  # Exhausts per-cluster 60s cap.
+                return run_of(0, "")
+            return run_of(0, json.dumps({"items": []}))
+
+        with mock.patch.object(pr.time, "monotonic", side_effect=lambda: clock[0]):
+            pr.collect_system_crd_webhooks("acme", [entry], run=fake_run, deadline=1480.0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(entry["checks_unevaluated"][0]["check"], pr.SYSTEM_CRD_WEBHOOK_CHECK)
+        self.assertIn("per-cluster cap", entry["checks_unevaluated"][0]["reason"])
+
+    def test_3_12_reachable_webhook_on_1_35_1_with_absent_crd_stays_major_without_absent_note(self):
+        entry = self._entry(name="pre-1352", master="1.35.1-gke.1000")
+        live_cfg = {
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "live-crd-gate"},
+            "webhooks": [
+                {
+                    "name": "live-gate.example.com",
+                    "failurePolicy": "Fail",
+                    "clientConfig": {"service": {"namespace": "gatekeeper", "name": "hook", "port": 443}},
+                    "rules": [{"apiGroups": ["apiextensions.k8s.io"], "apiVersions": ["*"], "operations": ["CREATE"], "resources": ["customresourcedefinitions"]}],
+                }
+            ],
+        }
+        svc = {"kind": "Service", "metadata": {"namespace": "gatekeeper", "name": "hook"}, "spec": {"ports": [{"port": 443, "name": "https"}]}}
+        eps = {"kind": "EndpointSlice", "metadata": {"namespace": "gatekeeper", "name": "hook-1", "labels": {"kubernetes.io/service-name": "hook"}}, "ports": [{"name": "https", "port": 8443}], "endpoints": [{"conditions": {"ready": True}}]}
+        run = self._make_run(webhooks=[live_cfg], services=[svc], slices=[eps], crd_rc=1, crd_stderr="Error from server (NotFound)")
+        pr.collect_system_crd_webhooks("acme", [entry], run=run)
+        hits = [c for c in entry["candidates"] if c["check"] == pr.SYSTEM_CRD_WEBHOOK_CHECK]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], pr.MAJOR)
+        self.assertNotIn("CRD is absent", hits[0]["excerpt"])
+        self.assertNotIn("CRD is not Established", hits[0]["excerpt"])
+
+    def test_3_12_manifest_passes_audit_report_validate_and_cross_check(self):
+        import audit_report as ar
+
+        entry = self._entry(name="seeded-b")
+        run = self._make_run(webhooks=[self._seeded_crd_gate()])
+        pr.collect_system_crd_webhooks("acme", [entry], run=run)
+        for k in list(entry):
+            if k.startswith("_"):
+                entry.pop(k)
+        cand = [c for c in entry["candidates"] if c["check"] == pr.SYSTEM_CRD_WEBHOOK_CHECK][0]
+        cmd_entry = [cmd for cmd in entry["commands"] if cmd["check"] == pr.SYSTEM_CRD_WEBHOOK_CHECK][0]
+        manifest = {"audit": "security-patch-orchestrator", "clusters": [entry]}
+        finding = {
+            "check": pr.SYSTEM_CRD_WEBHOOK_CHECK,
+            "cluster": entry["name"],
+            "namespace": "",
+            "object": cand["object"],
+            "severity": cand["severity"],
+            "title": "Fail-closed webhook blocks GKE 1.35+ system CRD writes",
+            "impact": cand["impact"],
+            "evidence": {"command": cmd_entry["command"], "excerpt": cand["excerpt"]},
+            "recommendation": {
+                "action": "Point clientConfig.service at a live backend, set failurePolicy: Ignore, or exempt kube-system and system CRD groups.",
+                "rationale": "A fail-closed webhook without endpoints refuses GKE 1.35+ control-plane writes to capacitybuffers.autoscaling.x-k8s.io.",
+                "risk": "Relaxing the webhook reduces enforcement on matched resources until the backend is restored.",
+            },
+            "remediation": {
+                "kind": "manual",
+                "note": "Inspect and update ValidatingWebhookConfiguration/seeded-crd-gate.",
+            },
+        }
+        doc = {
+            "audit": "security-patch-orchestrator",
+            "run_date": "2026-11-28",
+            "scope": {
+                "clusters": [
+                    {
+                        "name": entry["name"],
+                        "project": entry["project"],
+                        "location": entry["location"],
+                        "checks_run": [{"check": cmd_entry["check"], "command": cmd_entry["command"]}],
+                    }
+                ],
+                "skipped": [],
+            },
+            "findings": [finding],
+        }
+        validated = ar.validate_findings(doc, "security-patch-orchestrator")
+        self.assertEqual(len(validated["findings"]), 1)
+        ar.cross_check_manifest(validated, manifest)
+
+    def test_collect_fleet_strips_internal_keys_and_guards_3_12_crash(self):
+        c = cluster(name="c1", master="1.35.8-gke.1796000")
+        baseline = server_config(default="1.35.8-gke.1796000", valid_versions=["1.35.8-gke.1796000"])
+        def run(argv, **kwargs):
+            joined = " ".join(argv)
+            if "projects list" in joined or "config get-value project" in joined:
+                return run_of(0, "p1\n")
+            if "clusters list" in joined:
+                return run_of(0, json.dumps([c]))
+            if "get-server-config" in joined:
+                return run_of(0, json.dumps(baseline))
+            return run_of(1, "", f"unstubbed: {joined}")
+
+        with mock.patch.object(pr, "collect_system_crd_webhooks", side_effect=RuntimeError("boom")):
+            manifest = pr.collect_fleet(run=run, now=NOW, max_workers=1)
+        entry = [e for e in manifest["clusters"] if e.get("outcome") == pr.OUTCOME_COLLECTED][0]
+        self.assertEqual([k for k in entry if k.startswith("_")], [])
+        self.assertEqual(
+            [u for u in entry["checks_unevaluated"] if u["check"] == pr.SYSTEM_CRD_WEBHOOK_CHECK],
+            [{"check": pr.SYSTEM_CRD_WEBHOOK_CHECK, "reason": pr.SYSTEM_CRD_UNEVALUATED_PHASE_CRASHED.format(error="RuntimeError")}],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

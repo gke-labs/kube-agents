@@ -23,3 +23,13 @@ every rule is pinned is told the server sends it no request at a served version 
 requests fail now; otherwise the live rules are named as failing now every request the server sends
 them, the pinned rules as sent nothing, and the unknown rules as failing only if the server still
 serves their version, so a failure now is asserted for the live rules alone.
+
+## GKE 1.35+ system CRD writes (`system_crd_write_matches`)
+
+On clusters running or upgrading to GKE `>= 1.35`, non-add-on Service-backed fail-closed webhooks are
+also checked against GKE 1.35+ system CRD writes: cluster-scoped `apiextensions.k8s.io/v1`
+`customresourcedefinitions` `CREATE`/`UPDATE` (regardless of `namespaceSelector`), namespaced
+`autoscaling.x-k8s.io` `capacitybuffers` `CREATE`/`UPDATE` (at `v1beta1`, `v1`, or `*`) when
+`namespaceSelector` admits `kube-system`, and `*.gke.io` or wildcard-resource `*.x-k8s.io` write
+rules when cluster-scoped or admitting `kube-system`. `objectSelector` and `matchConditions` are not
+evaluated. A dead backend on any of these writes grades the member `blocked` in `--readiness`.

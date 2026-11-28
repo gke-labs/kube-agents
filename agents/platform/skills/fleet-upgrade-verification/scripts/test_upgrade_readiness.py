@@ -1997,5 +1997,168 @@ class WebhookScopeTest(unittest.TestCase):
         configs, services, slices, namespaces = r.split_webhook_items(items)
         self.assertEqual(([c["metadata"]["name"] for c in configs], len(services), len(slices), [n["metadata"]["name"] for n in namespaces]), (["v", "m"], 1, 1, ["kube-system"]))
 
+
+class SystemCrdWebhookTest(unittest.TestCase):
+    """GKE 1.35+ system CRD webhook checks: capacitybuffers.autoscaling.x-k8s.io
+    and apiextensions.k8s.io customresourcedefinitions."""
+
+    def _seeded_crd_gate(self):
+        h = hook(
+            "crd-gate.seeded.invalid",
+            [rule(["capacitybuffers"], operations=("CREATE", "UPDATE"), groups=("autoscaling.x-k8s.io",), scope="Namespaced", versions=("*",))],
+            policy="Fail",
+            service=("seeded-upgrade", "nonexistent-crd-gate"),
+        )
+        h["objectSelector"] = {"matchLabels": {"managed-by": "kube-agents-seeded-fleet"}}
+        return webhook_config("ValidatingWebhookConfiguration", "seeded-crd-gate", [h])
+
+    def test_gke_system_crd_applies_thresholds(self):
+        self.assertTrue(r.gke_system_crd_applies((1, 35, 0, 0), None))
+        self.assertTrue(r.gke_system_crd_applies((1, 36, 4, 100), (1, 36, 4, 200)))
+        self.assertTrue(r.gke_system_crd_applies((1, 34, 9, 100), (1, 35, 2, 100)))
+        self.assertFalse(r.gke_system_crd_applies((1, 34, 9, 100), (1, 34, 12, 100)))
+        self.assertFalse(r.gke_system_crd_applies((1, 34, 9, 100), None))
+        self.assertFalse(r.gke_system_crd_applies(None, None))
+
+    def test_crd_is_established(self):
+        self.assertTrue(r.crd_is_established({"status": {"conditions": [{"type": "Established", "status": "True"}]}}))
+        self.assertFalse(r.crd_is_established({"status": {"conditions": [{"type": "Established", "status": "False"}]}}))
+        self.assertFalse(r.crd_is_established({"status": {"conditions": [{"type": "NamesAccepted", "status": "True"}]}}))
+        self.assertFalse(r.crd_is_established(None))
+
+    def test_seeded_crd_gate_blocks_on_1_35_and_stays_outage_below_1_35(self):
+        cfg = self._seeded_crd_gate()
+        on_135 = r.grade_webhooks([cfg], [], [], system_crd_applies=True)
+        self.assertEqual([f["webhook"] for f in on_135["blocking"]], ["seeded-crd-gate/crd-gate.seeded.invalid"])
+        self.assertEqual(on_135["outage"], [])
+        self.assertEqual(
+            on_135["blocking"][0]["system_crd_matches"],
+            ["CREATE capacitybuffers in autoscaling.x-k8s.io", "UPDATE capacitybuffers in autoscaling.x-k8s.io"],
+        )
+        below_135 = r.grade_webhooks([cfg], [], [], system_crd_applies=False)
+        self.assertEqual(below_135["blocking"], [])
+        self.assertEqual([f["webhook"] for f in below_135["outage"]], ["seeded-crd-gate/crd-gate.seeded.invalid"])
+
+    def test_grade_system_crd_webhooks_flags_seeded_crd_gate_critical_even_when_crd_established(self):
+        cfg = self._seeded_crd_gate()
+        findings = r.grade_system_crd_webhooks([cfg], [], [], crd_established=True, crd_present=True)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["object"], "ValidatingWebhookConfiguration/seeded-crd-gate")
+        self.assertEqual(findings[0]["severity"], "critical")
+        self.assertTrue(findings[0]["backend_unreachable"])
+        self.assertIn("nonexistent-crd-gate", findings[0]["excerpt"])
+        self.assertIn("capacitybuffers in autoscaling.x-k8s.io", findings[0]["excerpt"])
+
+    def test_apiextensions_crd_write_blocks_even_with_kube_system_namespace_exemption(self):
+        exempt = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]}
+        h = scoped(
+            hook("crd-policy.example.com", [rule(["customresourcedefinitions"], operations=("CREATE", "UPDATE"), groups=("apiextensions.k8s.io",), scope="Cluster", versions=("v1",))], policy="Fail"),
+            exempt,
+        )
+        cfg = webhook_config("ValidatingWebhookConfiguration", "crd-policy", [h])
+        live_findings = r.grade_system_crd_webhooks([cfg], *LIVE, crd_established=True, crd_present=True)
+        self.assertEqual(len(live_findings), 1)
+        self.assertEqual(live_findings[0]["severity"], "major")
+        self.assertIn("CREATE customresourcedefinitions in apiextensions.k8s.io", live_findings[0]["excerpt"])
+        unestablished = r.grade_system_crd_webhooks([cfg], *LIVE, crd_established=False, crd_present=True)
+        self.assertEqual(unestablished[0]["severity"], "critical")
+        self.assertIn("not Established", unestablished[0]["excerpt"])
+
+    def test_wildcard_gatekeeper_rule_and_kube_system_exemption(self):
+        wildcard_h = hook("gatekeeper.sh", [rule(["*"], operations=("CREATE", "UPDATE"), groups=("*",), scope="*")], policy="Fail")
+        cfg = webhook_config("ValidatingWebhookConfiguration", "gatekeeper-validating-webhook-configuration", [wildcard_h])
+        findings = r.grade_system_crd_webhooks([cfg], *LIVE, crd_established=True, crd_present=True)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "major")
+        self.assertIn("customresourcedefinitions in apiextensions.k8s.io", findings[0]["excerpt"])
+        self.assertIn("capacitybuffers in autoscaling.x-k8s.io", findings[0]["excerpt"])
+
+        exempt = {"matchExpressions": [{"key": "kubernetes.io/metadata.name", "operator": "NotIn", "values": ["kube-system"]}]}
+        namespaced_h = scoped(
+            hook("gatekeeper.sh", [rule(["*"], operations=("CREATE", "UPDATE"), groups=("*",), scope="Namespaced")], policy="Fail"),
+            exempt,
+        )
+        cfg_safe = webhook_config("ValidatingWebhookConfiguration", "gatekeeper-namespaced", [namespaced_h])
+        self.assertEqual(r.grade_system_crd_webhooks([cfg_safe], *LIVE, crd_established=True, crd_present=True), [])
+
+    def test_gke_io_and_xk8s_io_group_matching_and_exemptions(self):
+        gke_h = hook("gke-gate.example.com", [rule(["managedcertificates"], operations=("CREATE",), groups=("networking.gke.io",))], policy="Fail")
+        gke_cfg = webhook_config("MutatingWebhookConfiguration", "gke-gate", [gke_h])
+        findings = r.grade_system_crd_webhooks([gke_cfg], *LIVE, crd_established=True)
+        self.assertEqual([f["object"] for f in findings], ["MutatingWebhookConfiguration/gke-gate"])
+
+        # GKE-managed addon is skipped by label OR by components.gke.io/component-name annotation.
+        gke_cfg["metadata"]["labels"] = {"addonmanager.kubernetes.io/mode": "Reconcile"}
+        self.assertEqual(r.grade_system_crd_webhooks([gke_cfg], *LIVE, crd_established=True), [])
+
+        gke_ann_cfg = webhook_config("MutatingWebhookConfiguration", "gke-ann-gate", [gke_h])
+        gke_ann_cfg["metadata"]["annotations"] = {"components.gke.io/component-name": "gmp-operator"}
+        self.assertTrue(r.is_gke_managed_webhook(gke_ann_cfg))
+        self.assertEqual(r.grade_system_crd_webhooks([gke_ann_cfg], *LIVE, crd_established=True), [])
+        # Even a dead GKE-managed add-on webhook does not enter grade_webhooks blocking via system CRD rules.
+        graded_addon = r.grade_webhooks([gke_ann_cfg], [], [], system_crd_applies=True)
+        self.assertEqual(graded_addon["blocking"], [])
+        self.assertEqual([f["webhook"] for f in graded_addon["outage"]], ["gke-ann-gate/gke-gate.example.com"])
+
+        # Explicit apiVersions: v1beta1 matches capacitybuffers, v1alpha1 does not.
+        v1beta1_h = hook("cb-beta.example.com", [rule(["capacitybuffers"], operations=("CREATE",), groups=("autoscaling.x-k8s.io",), versions=("v1beta1",))], policy="Fail")
+        v1alpha1_h = hook("cb-alpha.example.com", [rule(["capacitybuffers"], operations=("CREATE",), groups=("autoscaling.x-k8s.io",), versions=("v1alpha1",))], policy="Fail")
+        self.assertEqual(r.system_crd_write_matches(v1beta1_h), ["CREATE capacitybuffers in autoscaling.x-k8s.io"])
+        self.assertEqual(r.system_crd_write_matches(v1alpha1_h), [])
+
+        # Specific third-party *.x-k8s.io resource (like kubeagents.x-k8s.io/platformagents) is NOT flagged.
+        own_op = webhook_config(
+            "ValidatingWebhookConfiguration",
+            "kube-agents-webhook",
+            [hook("vplatformagent.kb.io", [rule(["platformagents"], operations=("CREATE", "UPDATE"), groups=("kubeagents.x-k8s.io",), versions=("v1alpha1",))], policy="Fail")],
+        )
+        self.assertEqual(r.grade_system_crd_webhooks([own_op], *LIVE, crd_established=True), [])
+
+        # Wildcard resource on *.x-k8s.io IS flagged when admitting kube-system.
+        wild_xk8s = webhook_config(
+            "ValidatingWebhookConfiguration",
+            "wild-xk8s",
+            [hook("wild.example.com", [rule(["*"], operations=("CREATE",), groups=("cluster.x-k8s.io",))], policy="Fail")],
+        )
+        self.assertEqual([f["object"] for f in r.grade_system_crd_webhooks([wild_xk8s], *LIVE, crd_established=True)], ["ValidatingWebhookConfiguration/wild-xk8s"])
+
+    def test_fail_open_url_backend_and_unrelated_webhooks_are_not_flagged(self):
+        configs = [
+            webhook_config("ValidatingWebhookConfiguration", "fail-open", [hook("a", [rule(["capacitybuffers"], groups=("autoscaling.x-k8s.io",))], policy="Ignore")]),
+            webhook_config("ValidatingWebhookConfiguration", "warden", [hook("w", [rule(["*"], groups=("*",))], policy="Fail", service=None, url="https://localhost:5443/v")]),
+            webhook_config("ValidatingWebhookConfiguration", "seeded-fail-closed-gate", [hook("g", [rule(["configmaps"], groups=("",))], policy="Fail")]),
+        ]
+        self.assertEqual(r.grade_system_crd_webhooks(configs, [], [], crd_established=True, crd_present=True), [])
+
+    def test_unestablished_capacitybuffers_crd_with_no_offending_webhook_is_flagged_critical(self):
+        findings = r.grade_system_crd_webhooks([], [], [], crd_established=False, crd_present=True)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["object"], "CustomResourceDefinition/capacitybuffers.autoscaling.x-k8s.io")
+        self.assertEqual(findings[0]["severity"], "critical")
+
+    def test_multi_hook_configuration_folds_into_one_critical_finding_naming_both_hooks(self):
+        live_hook = hook(
+            "live-crd.example.com",
+            [rule(["customresourcedefinitions"], operations=("CREATE",), groups=("apiextensions.k8s.io",))],
+            policy="Fail",
+            service=("scen", "gate-svc"),
+        )
+        dead_hook = hook(
+            "dead-cb.example.com",
+            [rule(["capacitybuffers"], operations=("CREATE", "UPDATE"), groups=("autoscaling.x-k8s.io",))],
+            policy="Fail",
+            service=("scen", "missing-svc"),
+        )
+        cfg = webhook_config("ValidatingWebhookConfiguration", "multi-crd-gate", [live_hook, dead_hook])
+        findings = r.grade_system_crd_webhooks([cfg], *LIVE, crd_established=True, crd_present=True)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["object"], "ValidatingWebhookConfiguration/multi-crd-gate")
+        self.assertEqual(findings[0]["severity"], "critical")
+        self.assertEqual([h["name"] for h in findings[0]["hooks"]], ["live-crd.example.com", "dead-cb.example.com"])
+        self.assertTrue(findings[0]["backend_unreachable"])
+        self.assertIn("live-crd.example.com", findings[0]["excerpt"])
+        self.assertIn("dead-cb.example.com", findings[0]["excerpt"])
+
+
 if __name__ == "__main__":
     unittest.main()

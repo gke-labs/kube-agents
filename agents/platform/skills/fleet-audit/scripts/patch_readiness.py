@@ -5,7 +5,7 @@ Readiness Audit (`security-patch-orchestrator`).
 See docs/designs/fleet-audit-collector-manifest.md for the manifest this
 emits and governance/security_patch_orchestrator_sop.md for the checks.
 
-This stream's own collector, like `fleet_drift.py`. Ten of its eleven checks
+This stream's own collector, like `fleet_drift.py`. Ten of its twelve checks
 read only GKE control-plane and node-pool *metadata* through `gcloud
 container`, with no kubeconfig at all, and that collection is flatter than
 any `kubectl`-based stream's: one `clusters list` call per project already
@@ -16,9 +16,12 @@ actually issued, because `clusters list` already carries every field those
 describes would return. Only the version-currency checks (`master-behind`,
 `stale-image-type`) need a second call, `get-server-config`, and that one is
 cached per distinct `(project, location)` pair, not re-issued per cluster --
-the SOP's own §2 instruction. The eleventh, `upgrade-blocked`, is the
-exception described below: it reads PodDisruptionBudgets through the
-fleet-upgrade-verification reporter, which fetches a kubeconfig per member.
+the SOP's own §2 instruction. The eleventh, `upgrade-blocked`, reads
+PodDisruptionBudgets through the fleet-upgrade-verification reporter, which
+fetches a kubeconfig per member, and the twelfth,
+`upgrade-system-crd-webhook-block`, reads admission webhooks, Services,
+EndpointSlices, Namespaces and `capacitybuffers.autoscaling.x-k8s.io` on every
+cluster running or targeting GKE 1.35+.
 After the sweep, with `--config-connector`, `main` also fetches credentials for each collected cluster
 and makes one Config Connector read there (`kcc_health.py`), inside the
 collector's time budget, as `kcc_unready` or `kcc_unread` on its entry.
@@ -44,22 +47,25 @@ shape rules any of the first ten checks out -- Autopilot node pools carry
 every field the node-pool checks read -- so for those this collector never
 writes `checks_not_applicable`; see the comment above `collect_one_cluster`.
 
-The eleventh, `upgrade-blocked`, is the one check here that reads workload
-state, and the one that is inapplicable by construction on most clusters: it
-asks how the upgrade a cluster needs would go, so a cluster with no
-`master-behind` or `pool-skew` candidate -- current, or mid-upgrade with the
-version checks suppressed -- has no upgrade to schedule and gets a
-`checks_not_applicable` entry saying which; so does a behind cluster on no
-release channel whose only lag is a pool ahead of its control plane, where no
-budget can hold the control plane's move and the reporter row has no target
-version to grade the skew ceiling against (the SOP's 3.11 lists both); on any
-other lag that cluster's budget half is graded and the check runs. For each cluster that does, the
+The eleventh (`upgrade-blocked`) and twelfth (`upgrade-system-crd-webhook-block`)
+are the two checks here that read in-cluster state and are inapplicable by
+construction on clusters outside their scope: `upgrade-blocked` asks how the
+upgrade a cluster needs would go, so a cluster with no `master-behind` or
+`pool-skew` candidate -- current, or mid-upgrade with the version checks
+suppressed -- has no upgrade to schedule and gets a `checks_not_applicable`
+entry saying which; so does a behind cluster on no release channel whose only
+lag is a pool ahead of its control plane, where no budget can hold the control
+plane's move and the reporter row has no target version to grade the skew
+ceiling against (the SOP's 3.11 lists both); on any other lag that cluster's
+budget half is graded and the check runs. For each cluster that does, the
 collector runs the fleet-upgrade-verification skill's reporter once, for that
-cluster alone, instead of once per
-project with `--readiness` -- the grade already exists there, with its
-PodDisruptionBudget and skew rules, and is not re-implemented here -- and
-joins its `members[]` rows to the behind clusters; see
-`collect_upgrade_blocked`.
+cluster alone, instead of once per project with `--readiness` -- the grade
+already exists there, with its PodDisruptionBudget and skew rules, and is not
+re-implemented here -- and joins its `members[]` rows to the behind clusters;
+see `collect_upgrade_blocked`. Check 3.12 (`upgrade-system-crd-webhook-block`)
+is declared `checks_not_applicable` on clusters running below GKE 1.35 with no
+channel target at or above 1.35, and runs on every cluster at or targeting
+1.35+; see `collect_system_crd_webhooks`.
 
 Discovery follows `fleet_drift.py`'s: the declared scope the agent passes
 (`--scope-projects`) when it does, is in scope; a sandbox whose operator says a
@@ -436,10 +442,79 @@ _UNAUDITABLE_STATUSES = {
     "ERROR": "cluster status is ERROR; the object is broken and its reported version is not trustworthy",
 }
 
+# 3.12 `upgrade-system-crd-webhook-block`: on clusters running or targeting GKE
+# >= 1.35, verify `capacitybuffers.autoscaling.x-k8s.io` is established and flag
+# fail-closed Service-backed admission webhooks intercepting `apiextensions.k8s.io`
+# or `autoscaling.x-k8s.io` (`capacitybuffers`) / `*.gke.io` / wildcard `*.x-k8s.io`
+# without exempting `kube-system`. The matching predicate lives in
+# `fleet-upgrade-verification/scripts/upgrade_readiness.py` and is imported once.
+SYSTEM_CRD_WEBHOOK_CHECK = "upgrade-system-crd-webhook-block"
+UPGRADE_READINESS_SCRIPTS = Path(__file__).resolve().parents[2] / "fleet-upgrade-verification" / "scripts"
+UPGRADE_READINESS_MODULE = "upgrade_readiness"
+SYSTEM_CRD_WEBHOOK_KINDS = (
+    "validatingwebhookconfigurations",
+    "mutatingwebhookconfigurations",
+    "services",
+    "endpointslices",
+    "namespaces",
+)
+CRD_GET_PREFIX = ("kubectl", "get", "crd")
+CRD_GET_OUTPUT_FLAGS = ("-o", "json")
+SYSTEM_CRD_SUBSHELL_COMMAND_FORMAT = "( export {var}={kc}; {paged}; {crd} )"
+DNS_ENDPOINT_FLAG = "--dns-endpoint"
+CRD_NOT_FOUND_MARKERS = ("notfound", "not found", "doesn't have a resource type")
+SYSTEM_CRD_WEBHOOK_TIMEOUT_S = 60
+SYSTEM_CRD_WEBHOOK_FLEET_BUDGET_S = 480
+SYSTEM_CRD_WEBHOOK_MIN_TIMEOUT_S = 20
+SYSTEM_CRD_NOT_APPLICABLE_FORMAT = (
+    "cluster runs {master}{target_note}, below GKE 1.35 where capacitybuffers.autoscaling.x-k8s.io is introduced"
+)
+SYSTEM_CRD_NOT_APPLICABLE_TARGET_FORMAT = " (target {target})"
+SYSTEM_CRD_UNEVALUATED_VERSION = (
+    "currentMasterVersion could not be parsed, so whether GKE 1.35+ system CRD webhook rules apply is unknown"
+)
+SYSTEM_CRD_UNEVALUATED_BASELINE = (
+    "channel baseline was not fetched, so whether this cluster targets GKE 1.35+ is unknown"
+)
+SYSTEM_CRD_UNEVALUATED_BUDGET = (
+    "the collector's system-CRD webhook budget ({budget}s across the fleet) was spent before this cluster could be read"
+)
+SYSTEM_CRD_UNEVALUATED_CLUSTER_TIMEOUT = (
+    "the cluster's system-CRD webhook read exceeded its {timeout}s per-cluster cap"
+)
+SYSTEM_CRD_UNEVALUATED_CREDS = "could not fetch credentials for {cluster} ({error})"
+SYSTEM_CRD_UNEVALUATED_READ = "could not read admission webhooks and backends ({error})"
+SYSTEM_CRD_UNEVALUATED_MODULE = "could not import upgrade_readiness ({error})"
+SYSTEM_CRD_UNEVALUATED_PHASE_CRASHED = (
+    "the collector's 3.12 phase crashed before reaching this cluster ({error})"
+)
+SYSTEM_CRD_IMPACT_UNREACHABLE = (
+    "This fail-closed admission webhook has no reachable backend and intercepts GKE 1.35+ "
+    "system CRD writes (apiextensions.k8s.io or capacitybuffers.autoscaling.x-k8s.io), so "
+    "matching control-plane writes are refused and Cluster Autoscaler informer initialization "
+    "can hang across ComputeClass pools."
+)
+SYSTEM_CRD_IMPACT_REACHABLE = (
+    "This fail-closed admission webhook intercepts GKE 1.35+ system CRD writes "
+    "(apiextensions.k8s.io or capacitybuffers.autoscaling.x-k8s.io) without exempting "
+    "kube-system; a policy rejection or webhook timeout during a GKE 1.35+ upgrade can "
+    "stall Cluster Autoscaler informer initialization."
+)
+SYSTEM_CRD_IMPACT_REACHABLE_CRD_UNESTABLISHED = (
+    "This fail-closed admission webhook intercepts GKE 1.35+ system CRD writes "
+    "(apiextensions.k8s.io or capacitybuffers.autoscaling.x-k8s.io) without exempting "
+    "kube-system, and capacitybuffers.autoscaling.x-k8s.io is absent or not Established, "
+    "which can prevent Cluster Autoscaler from initializing CapacityBuffer informers."
+)
+SYSTEM_CRD_IMPACT_CRD_UNESTABLISHED = (
+    "The GKE 1.35+ system CRD capacitybuffers.autoscaling.x-k8s.io is not Established, "
+    "which prevents Cluster Autoscaler from watching CapacityBuffer resources."
+)
+
 # Default severity per check, mode-independent. A hit's own "severity" key
 # overrides this for the checks whose rule forks on which condition fired
-# (master-behind, pool-skew, blocking-exclusion) -- everything else here is
-# one severity always, so the default is the whole rule.
+# (master-behind, pool-skew, blocking-exclusion, upgrade-system-crd-webhook-block)
+# -- everything else here is one severity always, so the default is the whole rule.
 SEVERITY = {
     "master-behind": CRITICAL,  # always overridden per hit
     "pool-skew": CRITICAL,  # always overridden per hit
@@ -452,6 +527,7 @@ SEVERITY = {
     "stale-image-type": MAJOR,
     "no-notifications": MINOR,
     UPGRADE_BLOCKED_CHECK: CRITICAL,
+    SYSTEM_CRD_WEBHOOK_CHECK: CRITICAL,  # overridden to major when backend is reachable and CRD is established
 }
 
 # `master-behind`'s only severity whose impact is a different claim rather than a
@@ -461,7 +537,9 @@ SEVERITY = {
 # `upgrade-blocked`'s two arms make a different claim too: a budget holds
 # the node drain until GKE evicts the workload anyway, a skew ceiling has GKE
 # refuse the control-plane move.
-ARM_SPECIFIC_IMPACT_CHECKS = {"master-behind", UPGRADE_BLOCKED_CHECK}
+# `upgrade-system-crd-webhook-block`'s arms distinguish unreachable backend,
+# reachable fail-closed interception, and unestablished CRD.
+ARM_SPECIFIC_IMPACT_CHECKS = {"master-behind", UPGRADE_BLOCKED_CHECK, SYSTEM_CRD_WEBHOOK_CHECK}
 BEHIND_MASTER_IMPACT = "Control plane is behind its release channel's default {default} and carries whatever the intervening builds fixed until it moves; GKE is still patching it."
 UNSUPPORTED_MASTER_IMPACT = "Control plane runs a version no channel at this location offers; it is outside the supported window and receives no further patches."
 
@@ -477,6 +555,7 @@ IMPACT = {
     "stale-image-type": "This node pool's image type is no longer offered at this location and cannot take node-image patches.",
     "no-notifications": "This cluster publishes no GKE upgrade notifications; upgrade-available signals reach no one between audits.",
     UPGRADE_BLOCKED_CHECK: "This cluster is behind, and the upgrade it needs would not go through cleanly: a drain-blocking budget holds each node's drain for up to an hour before GKE evicts the workload anyway, a version-skew ceiling has GKE refuse the control-plane move, or a readiness rule blocks it (a load balancer draining longer than GKE waits per node, a Node whose instance is gone, a cluster held by an operation, a withdrawn target patch).",
+    SYSTEM_CRD_WEBHOOK_CHECK: SYSTEM_CRD_IMPACT_UNREACHABLE,
 }
 
 
@@ -487,7 +566,10 @@ def log(msg: str) -> None:
 Run = collector_run.Run
 TIMEOUT_RC = collector_run.TIMEOUT_RC
 Discovery = collector_run.Discovery
+KUBECONFIG_VAR = collector_run.KUBECONFIG_VAR
 run_and_gate = collector_run.run_and_gate
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
@@ -1257,6 +1339,8 @@ def attach_fleet_spread(entries: list[dict]) -> None:
         entry.pop("_in_flight", None)
         entry.pop("_channel", None)
         entry.pop("_master_version", None)
+        entry.pop("_target_version", None)
+        entry.pop("_dns_endpoint", None)
         entry.pop("_status", None)
 
 
@@ -1721,7 +1805,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             # Judged, and nothing due. A cluster mid-upgrade has no candidate
             # because §3 suppresses them, not because it is current: say which.
             reason = NOT_APPLICABLE_IN_FLIGHT_REASON if entry.get("_in_flight") else NOT_BEHIND_REASON
-            entry["checks_not_applicable"] = [{"check": UPGRADE_BLOCKED_CHECK, "reason": reason}]
+            entry.setdefault("checks_not_applicable", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": reason})
         elif not due.budget_applies and not entry.get("_channel"):
             # A static cluster whose only lag is a pool ahead of its control
             # plane: the control plane's move is due, which drains no node, so
@@ -1733,7 +1817,7 @@ def collect_upgrade_blocked(project: str, entries: list[dict], *, run: RunFn, de
             # costs no reporter run, and a run skipped, failed or stopped
             # cannot turn the declaration into a limitation. The version
             # finding itself stands. SOP 3.11's Not applicable bullet is this.
-            entry["checks_not_applicable"] = [{"check": UPGRADE_BLOCKED_CHECK, "reason": NOT_APPLICABLE_NO_TARGET_REASON}]
+            entry.setdefault("checks_not_applicable", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": NOT_APPLICABLE_NO_TARGET_REASON})
         else:
             behind.append(entry)
     if not behind:
@@ -1938,12 +2022,25 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         rule_unknowns = _rule_unknowns(readiness, due.moves)
         rule_ungraded = bool(rule_unknowns)
         # `blocked` for something that is neither a budget, skew, a readiness
-        # rule's block, nor an exclusion: a cause the reporter learned after
+        # rule's block, an exclusion (owned by 3.8), nor a system-CRD-only
+        # webhook block (owned by 3.12): a cause the reporter learned after
         # this join was written. Recording it as run-and-clean would publish an
         # all-clear over an upgrade the reporter says is blocked; it is
         # ungraded until this check knows the cause, on every row, the
         # no-target one included.
-        unrecognised_block = readiness.get("status") == READINESS_BLOCKED and _readiness_cause(readiness) is None and not (readiness.get("maintenance") or {}).get("blocking_exclusions")
+        webhooks_blocking = (readiness.get("webhooks") or {}).get("blocking") or []
+        system_crd_only_webhook_block = bool(webhooks_blocking) and all(
+            isinstance(item, dict)
+            and bool(item.get("system_crd_matches"))
+            and item.get("upgrade_path") == item.get("system_crd_matches")
+            for item in webhooks_blocking
+        )
+        unrecognised_block = (
+            readiness.get("status") == READINESS_BLOCKED
+            and _readiness_cause(readiness) is None
+            and not (readiness.get("maintenance") or {}).get("blocking_exclusions")
+            and not system_crd_only_webhook_block
+        )
         why = None
         if not members:
             why = no_report
@@ -2007,14 +2104,20 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             entry["candidates"].append(_emit(UPGRADE_BLOCKED_CHECK, hit))
 
 
+def _has_check_disposition(entry: dict, check: str) -> bool:
+    """Whether `check` already reached the entry: in `commands`,
+    `checks_not_applicable` or `checks_unevaluated`."""
+    return any(
+        any(c.get("check") == check for c in entry.get(field) or [])
+        for field in ("commands", "checks_not_applicable", "checks_unevaluated")
+    )
+
+
 def _has_disposition(entry: dict) -> bool:
     """Whether 3.11 already reached the entry: the check is in `commands`,
     `checks_not_applicable` or `checks_unevaluated`. What the crash fallback
     reads, so it fills every gap once and overwrites nothing."""
-    return any(
-        any(c.get("check") == UPGRADE_BLOCKED_CHECK for c in entry.get(field) or [])
-        for field in ("commands", "checks_not_applicable", "checks_unevaluated")
-    )
+    return _has_check_disposition(entry, UPGRADE_BLOCKED_CHECK)
 
 
 def _unevaluated(entry: dict, why: str, *, ran: bool = True) -> None:
@@ -2027,6 +2130,249 @@ def _unevaluated(entry: dict, why: str, *, ran: bool = True) -> None:
     published limitation names the real cause."""
     wrapper = UNEVALUATED_REASON_FORMAT if ran else UNEVALUATED_NOT_RUN_FORMAT
     entry.setdefault("checks_unevaluated", []).append({"check": UPGRADE_BLOCKED_CHECK, "reason": wrapper.format(why=why)})
+
+
+def _unevaluated_check(entry: dict, check: str, reason: str) -> None:
+    entry.setdefault("checks_unevaluated", []).append({"check": check, "reason": reason})
+
+
+@functools.lru_cache(maxsize=1)
+def _upgrade_readiness():
+    """The fleet-upgrade-verification skill's readiness module, imported once from the
+    sibling skill directory so `upgrade-system-crd-webhook-block` shares one predicate
+    with `fleet_upgrade_report.py --readiness`."""
+    import importlib  # noqa: PLC0415
+
+    scripts_dir = str(UPGRADE_READINESS_SCRIPTS)
+    if scripts_dir not in sys.path:
+        sys.path.append(scripts_dir)
+    return importlib.import_module(UPGRADE_READINESS_MODULE)
+
+
+def _dns_endpoint_enabled(cluster: dict) -> bool:
+    """Whether the cluster's DNS endpoint accepts external traffic."""
+    dns = (cluster.get("controlPlaneEndpointsConfig") or {}).get("dnsEndpointConfig") or {}
+    return bool(dns.get("endpoint") and dns.get("allowExternalTraffic") is True)
+
+
+def _channel_target_version(cluster: dict, baseline: dict | None) -> str:
+    """The release channel's `defaultVersion` for this cluster, or `""` when none."""
+    if baseline is None:
+        return ""
+    channel = _release_channel(cluster)
+    if not channel:
+        return ""
+    return str(((baseline.get("channels") or {}).get(channel) or {}).get("defaultVersion") or "")
+
+
+def _fetch_cluster_kubeconfig(
+    project: str,
+    cluster: str,
+    location: str,
+    *,
+    dns_endpoint: bool,
+    run: RunFn,
+    timeout: int,
+) -> tuple[Path, Run]:
+    """Fetch an isolated per-cluster kubeconfig into `collect.kubeconfig_path`."""
+    from collect import kubeconfig_path, prepare_kubeconfig  # noqa: PLC0415
+
+    kc = kubeconfig_path(project, cluster, location)
+    argv = [
+        "gcloud", "container", "clusters", "get-credentials", cluster,
+        "--location", location, "--project", project,
+    ]
+    if dns_endpoint:
+        argv.append(DNS_ENDPOINT_FLAG)
+    note = prepare_kubeconfig(kc)
+    if note:
+        return kc, Run(argv, -1, "", note, 0.0)
+    return kc, run(argv, env={**os.environ, KUBECONFIG_VAR: str(kc)}, timeout=timeout)
+
+
+def _read_capacity_buffer_crd(
+    master: tuple[int, int, int, int],
+    *,
+    run: RunFn,
+    env: dict[str, str],
+    timeout: int,
+    readiness,
+    argv: list[str],
+) -> tuple[bool | None, bool]:
+    """`(crd_established, crd_present)` for `capacitybuffers.autoscaling.x-k8s.io`.
+
+    Returns `(True/False, True)` when the CRD exists, `(False, False)` when absent
+    on GKE >= 1.35.2, `(None, False)` when absent pre-1.35.2 or when the CRD read
+    itself failed (best-effort so a restricted role never blinds webhook grading).
+    """
+    result = run(argv, env=env, timeout=timeout)
+    if result.rc == 0:
+        try:
+            crd = json.loads(result.stdout)
+        except ValueError:
+            return None, False
+        if isinstance(crd, dict):
+            return readiness.crd_is_established(crd), True
+        return None, False
+    lowered = result.stderr.lower()
+    if any(marker in lowered for marker in CRD_NOT_FOUND_MARKERS):
+        return (False if master[:3] >= readiness.GKE_CAPACITY_BUFFER_MIN_PATCH else None), False
+    return None, False
+
+
+def _system_crd_hit_impact(hit: dict, readiness) -> str:
+    if hit.get("config_kind") == readiness.CRD_KIND:
+        return SYSTEM_CRD_IMPACT_CRD_UNESTABLISHED
+    if hit.get("backend_unreachable"):
+        return SYSTEM_CRD_IMPACT_UNREACHABLE
+    if hit.get("crd_established") is False:
+        return SYSTEM_CRD_IMPACT_REACHABLE_CRD_UNESTABLISHED
+    return SYSTEM_CRD_IMPACT_REACHABLE
+
+
+def collect_system_crd_webhooks(
+    project: str,
+    entries: list[dict],
+    *,
+    run: RunFn,
+    deadline: float | None = None,
+) -> None:
+    """§3.12 (`upgrade-system-crd-webhook-block`) over one project's collected
+    entries, in place.
+
+    Applies to every collected cluster running or targeting GKE >= 1.35; clusters
+    running below 1.35 with no target >= 1.35 are declared `checks_not_applicable`.
+    Reads admission webhooks, Services, EndpointSlices and Namespaces through the
+    shared paged reader (`collector_run.paged_dump`), checks whether
+    `capacitybuffers.autoscaling.x-k8s.io` is Established, and grades with
+    `upgrade_readiness.grade_system_crd_webhooks`.
+    """
+    collected = [e for e in entries if e.get("outcome") == OUTCOME_COLLECTED]
+    if not collected:
+        return
+    try:
+        readiness = _upgrade_readiness()
+    except ImportError as exc:
+        reason = SYSTEM_CRD_UNEVALUATED_MODULE.format(error=str(exc)[:UNEVALUATED_REPORT_MESSAGE_CHARS])
+        for entry in collected:
+            _unevaluated_check(entry, SYSTEM_CRD_WEBHOOK_CHECK, reason)
+        return
+
+    applicable: list[tuple[dict, tuple[int, int, int, int]]] = []
+    for entry in collected:
+        master_text = str(entry.get("_master_version") or "")
+        target_text = str(entry.get("_target_version") or "")
+        master = parse_version(master_text)
+        target = parse_version(target_text) if target_text else None
+        if master is None:
+            _unevaluated_check(entry, SYSTEM_CRD_WEBHOOK_CHECK, SYSTEM_CRD_UNEVALUATED_VERSION)
+            continue
+        if readiness.gke_system_crd_applies(master, target):
+            applicable.append((entry, master))
+        elif target is None and entry.get("_channel"):
+            _unevaluated_check(entry, SYSTEM_CRD_WEBHOOK_CHECK, SYSTEM_CRD_UNEVALUATED_BASELINE)
+        else:
+            target_note = SYSTEM_CRD_NOT_APPLICABLE_TARGET_FORMAT.format(target=target_text) if target_text else ""
+            entry.setdefault("checks_not_applicable", []).append(
+                {
+                    "check": SYSTEM_CRD_WEBHOOK_CHECK,
+                    "reason": SYSTEM_CRD_NOT_APPLICABLE_FORMAT.format(master=master_text, target_note=target_note),
+                }
+            )
+
+    for entry, master in applicable:
+        cluster_started = time.monotonic()
+        cluster_deadline = cluster_started + SYSTEM_CRD_WEBHOOK_TIMEOUT_S
+        effective_deadline = min(deadline, cluster_deadline) if deadline is not None else cluster_deadline
+        timeout = int(effective_deadline - cluster_started)
+        if deadline is not None and timeout < SYSTEM_CRD_WEBHOOK_MIN_TIMEOUT_S:
+            _unevaluated_check(
+                entry,
+                SYSTEM_CRD_WEBHOOK_CHECK,
+                SYSTEM_CRD_UNEVALUATED_BUDGET.format(budget=SYSTEM_CRD_WEBHOOK_FLEET_BUDGET_S),
+            )
+            continue
+        bare_name = str(entry.get("_bare_name") or "")
+        location = str(entry.get("location") or "")
+        kc, cred_result = _fetch_cluster_kubeconfig(
+            project,
+            bare_name,
+            location,
+            dns_endpoint=bool(entry.get("_dns_endpoint")),
+            run=run,
+            timeout=timeout,
+        )
+        if cred_result.rc != 0:
+            _unevaluated_check(
+                entry,
+                SYSTEM_CRD_WEBHOOK_CHECK,
+                SYSTEM_CRD_UNEVALUATED_CREDS.format(
+                    cluster=bare_name,
+                    error=_stderr_excerpt(cred_result)[:UNEVALUATED_REPORT_MESSAGE_CHARS],
+                ),
+            )
+            continue
+        env = {**os.environ, KUBECONFIG_VAR: str(kc)}
+
+        def _paged_step(argv: list[str], *, env: dict | None = None) -> Run:
+            now_mono = time.monotonic()
+            remaining = int(effective_deadline - now_mono)
+            if remaining <= 0:
+                if deadline is not None and now_mono >= deadline:
+                    msg = SYSTEM_CRD_UNEVALUATED_BUDGET.format(budget=SYSTEM_CRD_WEBHOOK_FLEET_BUDGET_S)
+                else:
+                    msg = SYSTEM_CRD_UNEVALUATED_CLUSTER_TIMEOUT.format(timeout=SYSTEM_CRD_WEBHOOK_TIMEOUT_S)
+                return Run(argv, TIMEOUT_RC, "", msg, 0.0)
+            return run(argv, env=env, timeout=remaining)
+
+        parsed, dump_result = paged_dump(SYSTEM_CRD_WEBHOOK_KINDS, run=_paged_step, env=env)
+        if parsed is None:
+            _unevaluated_check(
+                entry,
+                SYSTEM_CRD_WEBHOOK_CHECK,
+                SYSTEM_CRD_UNEVALUATED_READ.format(
+                    error=_stderr_excerpt(dump_result)[:UNEVALUATED_REPORT_MESSAGE_CHARS],
+                ),
+            )
+            continue
+        crd_argv = [*CRD_GET_PREFIX, readiness.CAPACITY_BUFFER_CRD_NAME, *CRD_GET_OUTPUT_FLAGS]
+        crd_checked = False
+        crd_established: bool | None = None
+        crd_present = False
+        crd_timeout = max(0, int(effective_deadline - time.monotonic()))
+        if crd_timeout > 0:
+            crd_checked = True
+            crd_established, crd_present = _read_capacity_buffer_crd(
+                master, run=run, env=env, timeout=crd_timeout, readiness=readiness, argv=crd_argv
+            )
+        items = parsed.get("items") or []
+        hits = readiness.grade_system_crd_webhooks(
+            *readiness.split_webhook_items(items),
+            crd_established=crd_established,
+            crd_present=crd_present,
+        )
+        if crd_checked:
+            cmd_text = SYSTEM_CRD_SUBSHELL_COMMAND_FORMAT.format(
+                var=KUBECONFIG_VAR,
+                kc=shlex.quote(str(kc)),
+                paged=paged_command_text(SYSTEM_CRD_WEBHOOK_KINDS),
+                crd=shlex.join(crd_argv),
+            )
+        else:
+            cmd_text = paged_command_text(SYSTEM_CRD_WEBHOOK_KINDS, kubeconfig=kc)
+        entry["commands"].append({"check": SYSTEM_CRD_WEBHOOK_CHECK, **_record(cmd_text, dump_result)})
+        for hit in hits:
+            entry["candidates"].append(
+                _emit(
+                    SYSTEM_CRD_WEBHOOK_CHECK,
+                    {
+                        "object": hit["object"],
+                        "excerpt": hit["excerpt"],
+                        "severity": hit["severity"],
+                        "impact": _system_crd_hit_impact(hit, readiness),
+                    },
+                )
+            )
 
 
 def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
@@ -2146,6 +2492,10 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             # lag is a pool ahead of its control plane is declared from this and
             # `_due` before any reporter run.
             "_channel": _release_channel(c),
+            # Consumed by `collect_system_crd_webhooks`: whether the target
+            # crosses GKE 1.35 and whether get-credentials needs --dns-endpoint.
+            "_target_version": _channel_target_version(c, baseline),
+            "_dns_endpoint": _dns_endpoint_enabled(c),
             # Consumed and removed by `attach_incumbent_topic`, for the same
             # reason `_master_version` is: the fact is fleet-wide and this
             # worker only ever sees one project.
@@ -2165,19 +2515,23 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
+    started_mono = time.monotonic()
     # The clock for 3.11's budget starts here, before discovery: what the
     # reporters may spend is what is left of the terminal call once the
     # reads the manifest cannot do without have had their turn.
-    deadline = time.monotonic() + READINESS_FLEET_BUDGET_S
+    deadline = started_mono + READINESS_FLEET_BUDGET_S
+    webhook_deadline = started_mono + SYSTEM_CRD_WEBHOOK_FLEET_BUDGET_S
     discovery = discover_fleet(project, run=run)
     projects = discovery.projects
 
-    # Two phases, not one per project. The ten metadata checks run for every
+    # Three phases, not one per project. The ten metadata checks run for every
     # project first, under no budget, as they did before 3.11 existed; then
     # 3.11 runs over the projects that have a behind cluster, sharing one
-    # budget. Interleaving them put a reporter (up to four minutes) on a
-    # worker a later project was queued behind, so on a wide fleet the
-    # budget's cost landed on that project's ten checks rather than on 3.11.
+    # budget; then 3.12 runs over every project's collected clusters running or
+    # targeting GKE >= 1.35, sharing its own budget. Interleaving them put a
+    # reporter (up to four minutes) on a worker a later project was queued
+    # behind, so on a wide fleet the budget's cost landed on that project's ten
+    # checks rather than on 3.11 or 3.12.
     results: list[list[dict]] = [[] for _ in projects]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(collect_project, p, run=run, now=now): i for i, p in enumerate(projects)}
@@ -2216,6 +2570,26 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
                 for entry in results[index]:
                     if entry.get("outcome") == OUTCOME_COLLECTED and not _has_disposition(entry):
                         _unevaluated(entry, UNEVALUATED_PHASE_CRASHED.format(error=type(exc).__name__), ran=False)
+        # Phase 3: 3.12 (`upgrade-system-crd-webhook-block`) over every project's
+        # collected clusters running or targeting GKE >= 1.35, reusing Phase 2's
+        # least-recently-served project order so a tight budget rotates across weeks.
+        crd_webhooks = {
+            pool.submit(collect_system_crd_webhooks, projects[i], results[i], run=run, deadline=webhook_deadline): i
+            for i in order
+        }
+        for future in as_completed(crd_webhooks):
+            index = crd_webhooks[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 -- 3.12 must not cost a project its other eleven checks
+                log(f"{projects[index]}: {SYSTEM_CRD_WEBHOOK_CHECK} crashed ({exc!r}); unevaluated on the clusters it had not reached")
+                for entry in results[index]:
+                    if entry.get("outcome") == OUTCOME_COLLECTED and not _has_check_disposition(entry, SYSTEM_CRD_WEBHOOK_CHECK):
+                        _unevaluated_check(
+                            entry,
+                            SYSTEM_CRD_WEBHOOK_CHECK,
+                            SYSTEM_CRD_UNEVALUATED_PHASE_CRASHED.format(error=type(exc).__name__),
+                        )
 
     entries = [entry for group in results for entry in group]
     attach_fleet_spread(entries)

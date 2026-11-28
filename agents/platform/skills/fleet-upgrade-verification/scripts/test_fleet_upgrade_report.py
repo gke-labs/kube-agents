@@ -2207,6 +2207,32 @@ class ReadinessTest(unittest.TestCase):
         blocking = {f["webhook"]: f["upgrade_path"] for f in webhooks["robot-host"]["blocking"]}
         self.assertEqual(blocking["policy-gate/roles.example.com"], ["CREATE roles in kube-system,kube-public"])
 
+    def test_system_crd_webhook_blocks_on_gke_1_35_and_stays_outage_below_1_35(self):
+        crd_gate = k8s_webhook(
+            "ValidatingWebhookConfiguration",
+            "seeded-crd-gate",
+            "crd-gate.seeded.invalid",
+            "Fail",
+            ("seeded-upgrade", "nonexistent-crd-gate"),
+            ["capacitybuffers"],
+        )
+        crd_gate["webhooks"][0]["rules"][0]["apiGroups"] = ["autoscaling.x-k8s.io"]
+        crd_gate["webhooks"][0]["rules"][0]["apiVersions"] = ["*"]
+        crd_gate["webhooks"][0]["rules"][0]["operations"] = ["CREATE", "UPDATE"]
+        crd_gate["webhooks"][0]["rules"][0]["scope"] = "Namespaced"
+        objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [crd_gate]}
+        # Default self.clusters has seeded-a on 1.35.1-gke.1000 (self.TARGET >= 1.35): graded blocking.
+        _, _, on135_data = self._run(FakeReadinessCommands(self.clusters, {}, objects))
+        on135_a = next(m for m in on135_data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual([f["webhook"] for f in on135_a["webhooks"]["blocking"]], ["seeded-crd-gate/crd-gate.seeded.invalid"])
+        self.assertEqual(on135_a["status"], "blocked")
+        # Both master and target below 1.35: stays outage, not blocking.
+        below_clusters = {"p1": [cluster("seeded-a", "us-central1-a", "1.34.11-gke.1000", [("default-pool", "1.34.11-gke.1000")])]}
+        _, _, below_data = self._run(FakeReadinessCommands(below_clusters, {}, objects), "--target-version", "1.34.11-gke.1000")
+        below_a = next(m for m in below_data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual([f["webhook"] for f in below_a["webhooks"]["outage"]], ["seeded-crd-gate/crd-gate.seeded.invalid"])
+        self.assertEqual(below_a["webhooks"]["blocking"], [])
+
     def test_url_backend_is_counted_in_the_json_and_not_noted(self):
         url_hook = {"kind": "ValidatingWebhookConfiguration", "metadata": {"name": "warden"}, "webhooks": [{"name": "warden.example.com", "failurePolicy": "Fail", "rules": [{"apiGroups": [""], "operations": ["CREATE"], "resources": ["pods"]}], "clientConfig": {"url": "https://localhost:5443/validate"}}]}
         objects = {**self.objects, "seeded-a": self.objects["seeded-a"] + [url_hook]}

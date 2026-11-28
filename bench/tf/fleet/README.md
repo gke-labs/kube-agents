@@ -656,10 +656,11 @@ finding the background table does not carry and the hold's end clears), 3.2 `poo
 (any skew between them is the transient mid-reconcile lag 3.2 explicitly does
 not flag), the `NO_MINOR_UPGRADES` exclusion is the scope its 3.8 explicitly
 does not flag, and pools run default auto-upgrade/auto-repair on COS_CONTAINERD.
-One upgrade-audit finding is planted by design: 3.11 `upgrade-blocked` on `seeded-b`, joined
+Two upgrade-audit findings are planted by design on `seeded-b`: 3.11 `upgrade-blocked`, joined
 from the `pinned-batch-runner` budget above, the `drain-timeout-<prefix>-b` backend service's
-`lb-connection-draining` block once the stack is re-applied with it, and the version lag; the
-defects table names the case that asserts on it.
+`lb-connection-draining` block once the stack is re-applied with it, and the version lag; and 3.12
+`upgrade-system-crd-webhook-block` from `seeded-crd-gate` (`readiness-crd-webhook`) whenever
+`seeded-b` runs or targets GKE 1.35+; the defects table names the cases that assert on them.
 
 Implication for the scenarios (`feat/domain-scenarios`): each objective must
 assert the planted finding specifically — `debug-binding`, `cluster-admin` —

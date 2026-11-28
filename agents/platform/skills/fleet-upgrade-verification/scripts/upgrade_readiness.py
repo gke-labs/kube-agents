@@ -356,6 +356,43 @@ CONTROL_PLANE_CLUSTER_WRITES = (
 # server's fact, not the selector's; the selector decides which rows the webhook is graded
 # blocked on and whether a pinned namespaced write is labelled with the namespaces admitted.
 GRADED_TARGETS = UPGRADE_PATH_TARGETS + CONTROL_PLANE_CLUSTER_WRITES + CONTROL_PLANE_KUBE_SYSTEM_WRITES
+# GKE 1.35+ installs and watches `capacitybuffers.autoscaling.x-k8s.io` (served at v1beta1,
+# forward-compatible with v1) and reconciles system CRDs through `apiextensions.k8s.io/v1`
+# `customresourcedefinitions`. A fail-closed admission webhook intercepting either without
+# exempting `kube-system` (or on cluster-scoped CRDs, which `namespaceSelector` cannot
+# exempt) can stall Cluster Autoscaler informer initialization and upgrades across GKE 1.35+.
+GKE_SYSTEM_CRD_MIN_MINOR = (1, 35)
+GKE_CAPACITY_BUFFER_MIN_PATCH = (1, 35, 2)
+GROUP_APIEXTENSIONS = "apiextensions.k8s.io"
+GROUP_AUTOSCALING_XK8S = "autoscaling.x-k8s.io"
+VERSION_V1BETA1 = "v1beta1"
+RESOURCE_CRDS = "customresourcedefinitions"
+RESOURCE_CAPACITYBUFFERS = "capacitybuffers"
+SYSTEM_CRD_CAPACITYBUFFER_VERSIONS = (VERSION_V1BETA1, VERSION_V1)
+SYSTEM_CRD_WRITE_OPERATIONS = (OP_CREATE, OP_UPDATE)
+SYSTEM_CRD_CLUSTER_WRITES = (
+    (GROUP_APIEXTENSIONS, VERSION_V1, RESOURCE_CRDS, OP_CREATE, SCOPE_CLUSTER),
+    (GROUP_APIEXTENSIONS, VERSION_V1, RESOURCE_CRDS, OP_UPDATE, SCOPE_CLUSTER),
+)
+GROUP_SUFFIX_GKE_IO = ".gke.io"
+GROUP_SUFFIX_XK8S_IO = ".x-k8s.io"
+SYSTEM_CRD_ADDON_LABEL = "addonmanager.kubernetes.io/mode"
+SYSTEM_CRD_GKE_COMPONENT_ANNOTATION = "components.gke.io/component-name"
+CAPACITY_BUFFER_CRD_NAME = "capacitybuffers.autoscaling.x-k8s.io"
+CRD_KIND = "CustomResourceDefinition"
+CRD_CONDITION_ESTABLISHED = "Established"
+CRD_CONDITION_TRUE = "True"
+SYSTEM_CRD_MATCH_LABEL = "{operation} {resource} in {group}"
+SYSTEM_CRD_RULE_LABEL = "{operations} {resources} in {group}"
+SYSTEM_CRD_SEVERITY_CRITICAL = "critical"
+SYSTEM_CRD_SEVERITY_MAJOR = "major"
+SYSTEM_CRD_OBJECT_FORMAT = "{kind}/{name}"
+SYSTEM_CRD_HOOK_UNREACHABLE_FORMAT = "{name}: failurePolicy Fail and {problem}; intercepts {matches}"
+SYSTEM_CRD_HOOK_REACHABLE_FORMAT = "{name}: failurePolicy Fail (Service {service} reachable); intercepts {matches}"
+SYSTEM_CRD_HOOK_JOIN = " | "
+SYSTEM_CRD_UNESTABLISHED_SUFFIX = f"; {CAPACITY_BUFFER_CRD_NAME} CRD is not Established"
+SYSTEM_CRD_ABSENT_SUFFIX = f"; {CAPACITY_BUFFER_CRD_NAME} CRD is absent"
+SYSTEM_CRD_UNESTABLISHED_EXCERPT = f"{CAPACITY_BUFFER_CRD_NAME} CRD condition {CRD_CONDITION_ESTABLISHED} is not {CRD_CONDITION_TRUE}"
 KUBE_SYSTEM_WRITE_LABEL = "{operation} {resource} in {namespaces}"
 BOOTSTRAP_WRITE_LABEL = "{operation} {resource}"
 # A pinned rule whose operations (or scope) reach no graded row is labelled at the resource: the
@@ -1268,7 +1305,223 @@ def _rule_served_class(rule: dict, targets: tuple) -> str:
     return RULE_UNKNOWN if versions else RULE_LIVE
 
 
-def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict], namespaces: list[dict] | None = None) -> dict:
+def gke_system_crd_applies(master: tuple | None, target: tuple | None) -> bool:
+    """Whether the cluster runs or upgrades to GKE >= 1.35 (where GKE installs
+    and watches `capacitybuffers.autoscaling.x-k8s.io`)."""
+    return (master is not None and _minor(master) >= GKE_SYSTEM_CRD_MIN_MINOR) or (
+        target is not None and _minor(target) >= GKE_SYSTEM_CRD_MIN_MINOR
+    )
+
+
+def crd_is_established(crd: dict | None) -> bool:
+    """Whether a CustomResourceDefinition object reports condition Established=True."""
+    if not isinstance(crd, dict):
+        return False
+    conditions = (crd.get("status") or {}).get("conditions") or []
+    return any(
+        isinstance(cond, dict)
+        and cond.get("type") == CRD_CONDITION_ESTABLISHED
+        and cond.get("status") == CRD_CONDITION_TRUE
+        for cond in conditions
+    )
+
+
+def is_gke_managed_webhook(config: dict) -> bool:
+    """Whether a webhook configuration carries GKE's own add-on label or component annotation."""
+    meta = config.get("metadata") if isinstance(config, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
+    annotations = meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}
+    return SYSTEM_CRD_ADDON_LABEL in labels or bool(annotations.get(SYSTEM_CRD_GKE_COMPONENT_ANNOTATION))
+
+
+def _rule_write_ops(rule: dict) -> list[str]:
+    ops = set(rule.get("operations") or [])
+    if WILDCARD in ops:
+        return list(SYSTEM_CRD_WRITE_OPERATIONS)
+    return [op for op in SYSTEM_CRD_WRITE_OPERATIONS if op in ops]
+
+
+def system_crd_write_matches(hook: dict, namespace_labels: dict[str, dict] | None = None) -> list[str]:
+    """The GKE 1.35+ system CRD writes this webhook's rules can intercept, as labels.
+
+    Checks:
+    1. Cluster-scoped `apiextensions.k8s.io/v1` `customresourcedefinitions` CREATE/UPDATE
+       writes, regardless of `namespaceSelector` (admission matches cluster-scoped objects
+       before evaluating `namespaceSelector`).
+    2. Namespaced `autoscaling.x-k8s.io` `capacitybuffers` CREATE/UPDATE writes (at
+       `v1beta1`, `v1`, or `*`) when `namespaceSelector` admits `kube-system`.
+    3. Write rules targeting `*.gke.io` groups, or wildcard-resource write rules targeting
+       other `*.x-k8s.io` groups, when cluster-scoped or when `namespaceSelector` admits
+       `kube-system`.
+
+    `objectSelector` and `matchConditions` are not evaluated, matching `upgrade_readiness.py`'s
+    webhook rule convention.
+    """
+    rules = _rules(hook)
+    labels = namespace_labels or bootstrap_namespace_labels(None)
+    reaches_kube_system = namespace_selector_reaches(hook, labels[KUBE_SYSTEM_NAMESPACE])
+    matched: list[str] = []
+
+    def _add(label: str) -> None:
+        if label not in matched:
+            matched.append(label)
+
+    for group, version, resource, operation, scope in SYSTEM_CRD_CLUSTER_WRITES:
+        if any(_rule_reaches(rule, group, version, resource, operation, scope) for rule in rules):
+            _add(SYSTEM_CRD_MATCH_LABEL.format(operation=operation, resource=resource, group=group))
+
+    if reaches_kube_system:
+        for operation in SYSTEM_CRD_WRITE_OPERATIONS:
+            if any(
+                _rule_reaches(rule, GROUP_AUTOSCALING_XK8S, version, RESOURCE_CAPACITYBUFFERS, operation, SCOPE_NAMESPACED)
+                for rule in rules
+                for version in SYSTEM_CRD_CAPACITYBUFFER_VERSIONS
+            ):
+                _add(
+                    SYSTEM_CRD_MATCH_LABEL.format(
+                        operation=operation, resource=RESOURCE_CAPACITYBUFFERS, group=GROUP_AUTOSCALING_XK8S
+                    )
+                )
+
+    for rule in rules:
+        ops = _rule_write_ops(rule)
+        if not ops:
+            continue
+        rule_scope = rule.get("scope") or SCOPE_ANY
+        if rule_scope != SCOPE_CLUSTER and not reaches_kube_system:
+            continue
+        specs = [spec for spec in rule.get("resources") or [] if isinstance(spec, str) and spec]
+        if not specs:
+            continue
+        has_wildcard_resource = any(_resource_parent(spec) == WILDCARD for spec in specs)
+        ops_text = RULE_OPERATION_JOIN.join(ops)
+        resources_text = RULE_RESOURCE_JOIN.join(specs)
+        for group in rule.get("apiGroups") or []:
+            if not isinstance(group, str) or group in (WILDCARD, GROUP_APIEXTENSIONS, GROUP_AUTOSCALING_XK8S):
+                continue
+            if group.endswith(GROUP_SUFFIX_GKE_IO):
+                _add(SYSTEM_CRD_RULE_LABEL.format(operations=ops_text, resources=resources_text, group=group))
+            elif group.endswith(GROUP_SUFFIX_XK8S_IO) and has_wildcard_resource:
+                _add(SYSTEM_CRD_RULE_LABEL.format(operations=ops_text, resources=resources_text, group=group))
+
+    return matched
+
+
+def grade_system_crd_webhooks(
+    configs: list[dict],
+    services: list[dict],
+    slices: list[dict],
+    namespaces: list[dict] | None = None,
+    *,
+    crd_established: bool | None = None,
+    crd_present: bool | None = None,
+) -> list[dict]:
+    """Fail-closed Service-backed webhooks that can block GKE 1.35+ system CRDs, plus an
+    unestablished `capacitybuffers.autoscaling.x-k8s.io` CRD when present.
+
+    Returns one finding per offending webhook configuration (`ValidatingWebhookConfiguration/<name>`
+    or `MutatingWebhookConfiguration/<name>`), graded `critical` when any matching webhook's
+    backend Service is unreachable or `crd_established` is False, and `major` when its backend
+    is reachable and the CRD is established (or not yet expected pre-1.35.2). Skips fail-open
+    webhooks, URL-backed webhooks, webhooks with no rules, and GKE-managed add-on configurations.
+    """
+    namespace_labels = bootstrap_namespace_labels(namespaces)
+    findings: list[dict] = []
+    for config in configs:
+        if not isinstance(config, dict) or is_gke_managed_webhook(config):
+            continue
+        config_kind = config.get("kind") or ""
+        config_name = (config.get("metadata") or {}).get("name", "")
+        if not config_kind or not config_name:
+            continue
+        hook_entries: list[dict] = []
+        lines: list[str] = []
+        any_unreachable = False
+        for hook in config.get("webhooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            if hook.get("failurePolicy", FAILURE_POLICY_FAIL) != FAILURE_POLICY_FAIL:
+                continue
+            service_ref = (hook.get("clientConfig") or {}).get("service")
+            if not isinstance(service_ref, dict):
+                continue
+            if not _rules(hook):
+                continue
+            matches = system_crd_write_matches(hook, namespace_labels)
+            if not matches:
+                continue
+            service_label = WEBHOOK_SERVICE_FORMAT.format(
+                namespace=service_ref.get("namespace", ""), name=service_ref.get("name", "")
+            )
+            problem = backend_problem(service_ref, services, slices)
+            if problem is not None:
+                any_unreachable = True
+                lines.append(
+                    SYSTEM_CRD_HOOK_UNREACHABLE_FORMAT.format(
+                        name=hook.get("name", ""), problem=problem, matches=LIST_SEPARATOR.join(matches)
+                    )
+                )
+            else:
+                lines.append(
+                    SYSTEM_CRD_HOOK_REACHABLE_FORMAT.format(
+                        name=hook.get("name", ""), service=service_label, matches=LIST_SEPARATOR.join(matches)
+                    )
+                )
+            hook_entries.append(
+                {
+                    "name": hook.get("name", ""),
+                    "service": service_label,
+                    "backend_problem": problem,
+                    "matches": matches,
+                }
+            )
+        if not hook_entries:
+            continue
+        severity = (
+            SYSTEM_CRD_SEVERITY_CRITICAL
+            if any_unreachable or crd_established is False
+            else SYSTEM_CRD_SEVERITY_MAJOR
+        )
+        excerpt = SYSTEM_CRD_HOOK_JOIN.join(lines)
+        if crd_established is False:
+            excerpt += SYSTEM_CRD_ABSENT_SUFFIX if crd_present is False else SYSTEM_CRD_UNESTABLISHED_SUFFIX
+        findings.append(
+            {
+                "object": SYSTEM_CRD_OBJECT_FORMAT.format(kind=config_kind, name=config_name),
+                "config_kind": config_kind,
+                "config": config_name,
+                "severity": severity,
+                "backend_unreachable": any_unreachable,
+                "crd_established": crd_established,
+                "hooks": hook_entries,
+                "excerpt": excerpt,
+            }
+        )
+    if not findings and crd_present is True and crd_established is False:
+        findings.append(
+            {
+                "object": SYSTEM_CRD_OBJECT_FORMAT.format(kind=CRD_KIND, name=CAPACITY_BUFFER_CRD_NAME),
+                "config_kind": CRD_KIND,
+                "config": CAPACITY_BUFFER_CRD_NAME,
+                "severity": SYSTEM_CRD_SEVERITY_CRITICAL,
+                "backend_unreachable": False,
+                "crd_established": False,
+                "hooks": [],
+                "excerpt": SYSTEM_CRD_UNESTABLISHED_EXCERPT,
+            }
+        )
+    return sorted(findings, key=lambda item: item["object"])
+
+
+def grade_webhooks(
+    configs: list[dict],
+    services: list[dict],
+    slices: list[dict],
+    namespaces: list[dict] | None = None,
+    *,
+    system_crd_applies: bool = False,
+) -> dict:
     """Fail-closed webhooks whose backend is unreachable, split by whether they break an upgrade.
 
     `blocking`: the webhook's rules can match a write in `UPGRADE_PATH_TARGETS`, one the
@@ -1277,7 +1530,10 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     start-up reconciles and fatals without: a ClusterRole or ClusterRoleBinding write whatever
     the `namespaceSelector` says (`CONTROL_PLANE_CLUSTER_WRITES`), or a Role or RoleBinding
     write in `kube-system` or `kube-public` when the selector admits that namespace
-    (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either.
+    (`CONTROL_PLANE_KUBE_SYSTEM_WRITES`), so the control-plane upgrade cannot complete either;
+    or, when `system_crd_applies` is True (cluster running or upgrading to GKE >= 1.35) and
+    the configuration is not a GKE-managed add-on, its rules match a GKE 1.35+ system CRD
+    write (`system_crd_write_matches`).
     `outage`: the backend is unreachable but the rules match none of those; the member is not graded on it, with
     what it does match named so the operator can judge it, because the list is what this
     rule knows of the path, not a proof of safety. Each rule of a finding, blocking or outage, is
@@ -1304,6 +1560,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
     for config in configs:
         config_kind = config.get("kind")
         config_name = (config.get("metadata") or {}).get("name", "")
+        managed_addon = is_gke_managed_webhook(config)
         for hook in config.get("webhooks") or []:
             if not isinstance(hook, dict):
                 continue
@@ -1329,7 +1586,8 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
             if reason is None:
                 result["answered"].append(identity)
                 continue
-            matches = upgrade_path_matches(hook) + kube_system_write_matches(hook, namespace_labels)
+            crd_matches = system_crd_write_matches(hook, namespace_labels) if (system_crd_applies and not managed_addon) else []
+            matches = upgrade_path_matches(hook) + kube_system_write_matches(hook, namespace_labels) + crd_matches
             # Every rule is classed by what the server serves it, whichever bucket the finding
             # lands in: the cell describes a blocking webhook by the path writes it matches and an
             # outage one by its classes, and the record says of each rule what is true of it.
@@ -1342,6 +1600,7 @@ def grade_webhooks(configs: list[dict], services: list[dict], slices: list[dict]
                 **identity,
                 "reason": reason,
                 "upgrade_path": matches,
+                "system_crd_matches": crd_matches,
                 "version_pinned": version_pinned,
                 "unserved_pairs": unserved_pairs,
                 "rules": describe_rules(hook),

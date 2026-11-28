@@ -218,16 +218,19 @@ AUDITS: dict[str, AuditSpec] = {
             "stale-image-type",
             "no-notifications",
             "upgrade-blocked",
+            "upgrade-system-crd-webhook-block",
         ),
         # §4a of the SOP: the six checks that read a knob the owner sets —
         # channel enrolment, a pool's auto-upgrade and auto-repair, the
         # maintenance window, an exclusion, upgrade notifications — and so
         # the only six a repository declaration may keep off the ledger. The
-        # other five report where the fleet ended up, not what anyone chose:
+        # other six report where the fleet ended up, not what anyone chose:
         # a master behind its channel is the effect of an exclusion or a
         # rollout, a skewed pool and a withdrawn image can take no patches,
-        # the spread is a fleet-wide signal no one object owns, and a blocked
-        # upgrade is a drain held to a forced eviction or a move GKE refuses.
+        # the spread is a fleet-wide signal no one object owns, a blocked
+        # upgrade is a drain held to a forced eviction or a move GKE refuses,
+        # and a system-CRD-blocking admission webhook blocks GKE 1.35+ CRD
+        # installation or CapacityBuffer writes.
         declarable=(
             "no-channel",
             "no-autoupgrade",
@@ -1296,6 +1299,7 @@ CHECK_PHRASES = {
     "stale-image-type": "{object} node pool uses a retired node image",
     "no-notifications": "upgrade notifications are off",
     "upgrade-blocked": "an upgrade is blocked",
+    "upgrade-system-crd-webhook-block": "{object} can block GKE 1.35+ system CRDs during upgrades",
     # Workload Reliability Audit
     "no-requests": "{object} sets no resource requests",
     "no-memory-limit": "{object} has no memory limit",
