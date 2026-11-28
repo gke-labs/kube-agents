@@ -1,0 +1,77 @@
+# Probe for node-pool vs. shared-reservation zonal mismatch (#2900, #3006,
+# #6954, #7299, #7550). Graded on two standalone declaration lines with
+# fold_decoration: true. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: capacity-reservation-zonal-mismatch
+name: Node-pool vs. shared-reservation zonal mismatch diagnosis
+
+domain: capacity
+tool_calls_optional: true
+
+prompt: |-
+  A regional Standard GKE cluster in `us-central1` has an autoscaling GPU
+  node pool `gpu-train` configured with `--node-locations=us-central1-a,us-central1-b`
+  and `--reservation-affinity=specific --reservation=projects/corp-capacity-host/reservations/shared-a100-res`.
+  Inspecting Compute Engine shows `shared-a100-res` in `corp-capacity-host` is
+  shared with the cluster's project, has 16 unused `a2-highgpu-1g` instances,
+  and is located in zone `us-central1-c`. Pending GPU pods stay unscheduled,
+  and Cluster Autoscaler visibility logs record
+  `scale.up.error.reservation.not.found` for `us-central1-a` and
+  `us-central1-b`.
+  An engineer proposes requesting a GPU quota increase in `us-central1-a`.
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `CAUSE: PROJECT-QUOTA-EXHAUSTION`,
+  `CAUSE: ZONAL-RESERVATION-MISMATCH`,
+  `CAUSE: SHARED-RESERVATION-IAM-DENIED`, or `CAUSE: RESERVATION-DEPLETED`.
+  Second: `REMEDIATION: REQUEST-GPU-QUOTA-INCREASE`,
+  `REMEDIATION: SWITCH-TO-ANY-RESERVATION`, or
+  `REMEDIATION: ALIGN-POOL-AND-RESERVATION-ZONE`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  CAUSE: ZONAL-RESERVATION-MISMATCH
+  REMEDIATION: ALIGN-POOL-AND-RESERVATION-ZONE
+
+  The specific shared reservation `shared-a100-res` exists in `us-central1-c`,
+  whereas `gpu-train` only scales in `us-central1-a` and `us-central1-b`, so
+  the autoscaler cannot find the specific reservation in those zones and logs
+  `scale.up.error.reservation.not.found`. Requesting GPU quota in `us-central1-a`
+  will not help; align the node pool's zone with `us-central1-c` (or create a
+  reservation in the pool's zones).
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: cause-and-remediation-for-zonal-reservation-mismatch
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^cause: zonal-reservation-mismatch$"
+          forbidden_patterns:
+            - "(?m)^cause: (?:project-quota-exhaustion|shared-reservation-iam-denied|reservation-depleted)$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^remediation: align-pool-and-reservation-zone$"
+          forbidden_patterns:
+            - "(?m)^remediation: (?:request-gpu-quota-increase|switch-to-any-reservation)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
