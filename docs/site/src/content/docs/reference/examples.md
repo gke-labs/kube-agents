@@ -63,3 +63,4 @@ Both LiteLLM examples speak OpenAI-compatible Completions. `vllm-gemma` serves t
 
 - [Inference gateway](/kube-agents/concepts/inference-gateway/) — decision framework for picking a provider.
 - [Deploy → Network policies and Service](/kube-agents/deploy/kustomize/) — what the operator renders around the agent Pod.
+- [Concepts → Team runbooks](/kube-agents/concepts/runbooks/) — how to lay out, version, and review runbooks under `knowledge/runbook/`.

@@ -74,7 +74,8 @@ gitops-repo/
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
   notes (`knowledge/` here); without it, or when a named path has nothing behind it, the whole
   repository is read, and in content mode copied whole under the audit's file and byte caps, so naming paths is what keeps a large repository
-  searchable. A Terraform repository that
+  searchable. For how to lay out, version, and review runbooks under `knowledge/`, see
+  [Team runbooks](../../docs/site/src/content/docs/concepts/runbooks.md). A Terraform repository that
   is not this one is registered under the `context_repos` key of the agent's `gitops-state`
   ConfigMap, optionally pinned to a branch with `ref`, and is read the same way, never written to.
 - **Version pins:** kube-agents artifacts referenced from this repo are pinned to immutable SemVer
