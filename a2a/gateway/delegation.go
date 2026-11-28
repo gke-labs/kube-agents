@@ -181,7 +181,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// startRound, once set below, begins the request's delegation round
 	// for a profile parent, whose request uses a round whether it mints or
 	// is refused: it is called where the request is decided (noChild, the
-	// mints), so a request ignored without a decision uses none. It returns
+	// mints), so a request ignored without a decision uses none, nor does a
+	// busy refusal, which is decided before it is set. It returns
 	// the round as the parent's ends and refusals carry it.
 	startRound := func() int { return 0 }
 	noChild := func(reason string) {
@@ -1647,7 +1648,13 @@ func refusedEnd(notice string) string {
 // those children, or is already over, so the refusal goes out tagged with its
 // round (lib.DelegationRefusal.Round) and ends nothing. Only such a parent
 // gets one: one with no earlier request is a first refusal, and a batch cut
-// short and being finished has its entries' ends coming instead.
+// short and being finished has its entries' ends coming instead. overCap
+// marks such a later-round refusal (past the rounds, or busy).
+//
+// busy marks a refusal under delegation.busy (#7547): a request with rounds
+// left before the current round settled. Its round is the one the parent's
+// new request opened a wait for, so it does end that wait, and it carries
+// lib.DelegationRefusal.Busy because the gateway used no round for it.
 func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, round int, overCap, busy bool) {
 	parent, ok := rec.TaskRefFor(taskID)
 	if !ok || parent.Tier == "" || session != parent.Addressee {

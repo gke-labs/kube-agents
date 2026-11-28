@@ -921,10 +921,11 @@ type Config struct {
 
 	// DelegationRoundsMax bounds how many delegate requests one profile
 	// task may make (A2A_DELEGATION_ROUNDS_MAX), each minted or refused
-	// using up one; a request past it is refused under delegation.rounds.
-	// With rounds left, a request while the last round's children still run
-	// is no new round and is refused as busy (delegation.busy, using no round); with none left (the default
-	// of one) it is refused like any other. A profile task's delegateTargets part
+	// (but for a busy refusal) using up one; a request past it is refused
+	// under delegation.rounds. With rounds left, a request while the last
+	// round's children still run is no new round: it is refused as busy
+	// (delegation.busy) and uses none. With none left (the default of one)
+	// it is refused like any other. A profile task's delegateTargets part
 	// advertises it when over one.
 	//
 	// Zero means 1. New clamps it to 1 to lib.DelegateRoundsCeiling, and
