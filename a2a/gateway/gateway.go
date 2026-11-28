@@ -3426,8 +3426,8 @@ type taskStart struct {
 	// KeepActive mints the task beside the conversation's active task
 	// rather than in its place: rec.ActiveTask is left alone, and the
 	// task's rolling line is kept on its own entry (TaskRef.StatusMsgID),
-	// where the relay closes it on the task's terminal. Set for a batch
-	// child only.
+	// where the relay moves it with the task's own events and closes it on
+	// the task's terminal (liveLineOf). Set for a batch child only.
 	KeepActive bool
 	// BatchIndex and Target are a batch child's place in its batch, from 1,
 	// and its parameters as the wake names them (TaskRef.BatchIndex). Set
@@ -3462,9 +3462,10 @@ type taskStart struct {
 // working and progress events render only on a line. Without one the room
 // sees "delegated to <profile>" and then nothing until the answer. A child
 // to platform keeps the platform's own status; a batch child (KeepActive)
-// is left as it is, since the relay doesn't edit its line yet; and a child
-// of a profile task is left lineless, so the room never holds two live
-// lines, its parent's and its own.
+// stays lineless here, since a line each would put up to the fan-out's width
+// of live lines in a thread whose own status already says the batch runs;
+// and a child of a profile task is left lineless, so the room never holds
+// two live lines, its parent's and its own.
 func childKeepsLine(rec *SessionRecord, ts taskStart) bool {
 	if ts.Role != taskRoleChild || ts.Route == nil || ts.KeepActive {
 		return false
