@@ -58,6 +58,7 @@ func TestTheWorkerPodIsTheContractsShape(t *testing.T) {
 		"A2A_POD_NAME": "fieldRef:metadata.name", "A2A_MODEL": "model-x", "A2A_MAX_TURNS": "7",
 		"A2A_PROFILE_CONFIG_ROOT":          profileWorkerConfigPath,
 		"A2A_WORKDIR":                      profileWorkerScratchPath,
+		"FLEET_AUDIT_SCRATCH_DIR":          profileWorkerScratchPath,
 		"CREDENTIAL_PROXY_TASK_TOKEN_FILE": profileWorkerTaskTokenPath + "/token",
 		"NATS_URL":                         a2aNATSClientURL(agent),
 	} {
@@ -69,8 +70,8 @@ func TestTheWorkerPodIsTheContractsShape(t *testing.T) {
 		t.Error("a pool pod is one-shot")
 	}
 	// The root filesystem is read-only, so every place the worker and its
-	// harness write is an emptyDir: the working directory, $HOME, /tmp, the
-	// harness config root and the task token.
+	// harness write is an emptyDir: the working directory (the fleet-audit
+	// scripts' too), $HOME, /tmp, the harness config root and the task token.
 	if sc := c.SecurityContext; sc == nil || sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
 		t.Errorf("the worker container's root filesystem is writable: %+v", c.SecurityContext)
 	}
@@ -80,7 +81,7 @@ func TestTheWorkerPodIsTheContractsShape(t *testing.T) {
 			emptyDirs[v.Name] = true
 		}
 	}
-	for _, path := range []string{env["A2A_WORKDIR"], env["HOME"], "/tmp", env["A2A_PROFILE_CONFIG_ROOT"], strings.TrimSuffix(env["CREDENTIAL_PROXY_TASK_TOKEN_FILE"], "/token")} {
+	for _, path := range []string{env["A2A_WORKDIR"], env["FLEET_AUDIT_SCRATCH_DIR"], env["HOME"], "/tmp", env["A2A_PROFILE_CONFIG_ROOT"], strings.TrimSuffix(env["CREDENTIAL_PROXY_TASK_TOKEN_FILE"], "/token")} {
 		var writable bool
 		for _, m := range c.VolumeMounts {
 			if m.MountPath == path && !m.ReadOnly && emptyDirs[m.Name] {
