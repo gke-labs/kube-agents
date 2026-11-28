@@ -1043,8 +1043,8 @@ no reasoning_effort), plus apiBase (optional; passed by openai_compatible and,
 when platformAgent.harness.universeDomain is non-default, vertex_ai) and
 sslVerify (optional; passed only by openai_compatible), and the optional
 dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds,
-numRetries and retryAfterSeconds. Every optional input renders nothing when
-unset, so the default render is unchanged.
+numRetries, retryAfterSeconds and systemCacheTTL (5m or 1h; absent renders 1h).
+Every optional input renders nothing when unset, so the default render is unchanged.
 callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
@@ -1348,7 +1348,7 @@ router_settings:
         role: system
         control:
           type: ephemeral
-          ttl: 1h
+          ttl: {{ .systemCacheTTL | default "1h" }}
       - location: message
         index: -3
       - location: message
