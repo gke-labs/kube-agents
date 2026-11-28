@@ -864,7 +864,10 @@ waiting on them. The gateway mints nothing for that request, records nothing, an
 With rounds left (`roundsMax` above one, which this gateway doesn't take yet), a task's next request waits
 for its current round to settle: every child ended and no child still running (a batch child that asked is
 cancelled, and counts until that lands), every end sent to the task, and for a single child, the task
-holding the conversation again. A request before that is ignored as busy. The next round's children carry its
+holding the conversation again. A request before that is refused as busy (`delegation.busy`, #7547): a refusal
+for the round the request would have started, with `"busy": true`, which ends the parent's wait for that round.
+The gateway mints nothing, records nothing and uses no round for it, so a parent counting its rounds doesn't
+count it either. `busy` is a JSON boolean, absent on every other refusal. The next round's children carry its
 number, their entries start again at 1, and the earlier rounds' children stay on the record for a stop to
 reach.
 `round` is a JSON number from 0 to 16 (`lib.DelegateRoundsCeiling`); a part whose `round` is another type or
