@@ -37,7 +37,8 @@ Agent's card is found this way, and its session store is
 Each tool call becomes one devops-bench trajectory entry in the same shape
 ``parsing.parse_response`` emits (``name`` / ``args`` / ``result`` /
 ``status``) plus four tags: ``agent`` (the profile that made the call),
-``task`` (the card it was working), ``session`` and ``at`` (epoch seconds).
+``task`` (the card it was working), ``session`` and ``at`` (epoch seconds),
+and ``exit_code`` (integer exit code extracted from the result or recorded directly).
 A ``tool_call`` wrapper's entry also carries ``wrapped``, the tool names its
 arguments held before they were clipped (:func:`wrapped_tool_names`).
 Results and arguments are scrubbed and clipped inside the pod, in that order,
@@ -424,6 +425,20 @@ def failure(result):
     )
 
 
+def exit_code(result):
+    if isinstance(result, str):
+        try:
+            result = json.loads(result.strip())
+        except ValueError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    code = result.get("exit_code", result.get("returncode"))
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
 # The tools a ``tool_call`` wrapper names, read from its arguments before they
 # are clipped: a clipped wrapper no longer parses, and its tool was then
 # invisible by name. None for any other call and for arguments that are not a
@@ -602,6 +617,7 @@ def read_session(conn, card, profile, sid):
                     "wrapped": wrapped_names(str(fn.get("name") or ""), arguments),
                     "result": None,
                     "failed": None,
+                    "exit_code": None,
                     "agent": profile,
                     "task": card,
                     "session": sid,
@@ -636,6 +652,7 @@ def read_session(conn, card, profile, sid):
             pending.remove(target)
             result = decode(row["content"])
             target["failed"] = failed(result)
+            target["exit_code"] = exit_code(result)
             # Without a redactor nothing is readable; the read placeholder
             # would say this one result was recorded in a capture that is not.
             if target["_withhold"] and result is not None and redactor is not None:
@@ -901,6 +918,20 @@ def runs(summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
 
 
 
+def extract_exit_code(result: Any) -> int | None:
+    if isinstance(result, str):
+        try:
+            result = json.loads(result.strip())
+        except ValueError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    code = result.get("exit_code", result.get("returncode"))
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
 def _entry(call: dict[str, Any]) -> dict[str, Any]:
     """One trajectory entry in ``parsing.parse_response``'s shape, plus the tags.
 
@@ -916,11 +947,15 @@ def _entry(call: dict[str, Any]) -> dict[str, Any]:
         status = "error"
     else:
         status = "completed"
+    code = call.get("exit_code")
+    if code is None and isinstance(result, str):
+        code = extract_exit_code(result)
     entry = {
         "name": str(call.get("name") or ""),
         "args": _call_args(call.get("args")),
         "result": result,
         "status": status,
+        "exit_code": code,
         "agent": str(call.get("agent") or ""),
         "task": str(call.get("task") or ""),
         "session": str(call.get("session") or ""),
