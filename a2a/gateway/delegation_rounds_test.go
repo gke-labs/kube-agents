@@ -112,8 +112,8 @@ func TestARoundIsBusyWhileTheLastOneRuns(t *testing.T) {
 		t.Fatalf("parent = round %d earlier %v, want still round 1", p.DelegationRound, p.EarlierChildren)
 	}
 	waitFor(t, "the busy request refused to its parent", func() bool { return len(refusalsOn(t, r, "chat", origin.TaskID)) == 1 })
-	if got := refusalsOn(t, r, "chat", origin.TaskID)[0]; got.Round != 2 || got.Text != noticeDelegationRefusedFor+noticeDelegationRoundBusy {
-		t.Fatalf("busy refusal = %+v, want Round 2 and the busy notice", got)
+	if got := refusalsOn(t, r, "chat", origin.TaskID)[0]; got.Round != 2 || !got.Busy || got.Text != noticeDelegationRefusedFor+noticeDelegationRoundBusy {
+		t.Fatalf("busy refusal = %+v, want Round 2, Busy and the busy notice", got)
 	}
 	// The round's remaining child still reports back, after the refusal.
 	completeChild(t, r, first[1], "b is fine")
@@ -170,8 +170,8 @@ func TestARefusedFirstRoundLeavesTheSecondAndThePastCapAskStoresNothing(t *testi
 	}
 	waitFor(t, "three past-cap refusals", func() bool { return len(refusalsOn(t, r, "chat", origin.TaskID)) == 4 })
 	for _, got := range refusalsOn(t, r, "chat", origin.TaskID)[1:] {
-		if got.Round != 3 {
-			t.Fatalf("past-cap refusal carries Round %d, want 3", got.Round)
+		if got.Round != 3 || got.Busy {
+			t.Fatalf("past-cap refusal = %+v, want Round 3 and not busy", got)
 		}
 	}
 	rec, _ = r.g.reg.Get(ctx, conv)
@@ -311,12 +311,12 @@ func TestARoundTwoRefusalIsHeldBackWhenItsPlanWasWritten(t *testing.T) {
 	if err := r.g.reg.IndexTask(ctx, "task-rp", conv); err != nil { // still routed: it listens
 		t.Fatal(err)
 	}
-	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-not-started - x", 2, false)
+	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-not-started - x", 2, false, false)
 	time.Sleep(300 * time.Millisecond)
 	if got := refusalsOn(t, r, "chat", "task-rp"); len(got) != 0 {
 		t.Fatalf("a refusal went on top of the written plan's ends: %+v", got)
 	}
-	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-refused - rounds", 3, true)
+	r.g.tellProfileParentNoChild(ctx, rec, "chat", "task-rp", "reason: delegation-refused - rounds", 3, true, false)
 	waitFor(t, "the past-cap refusal", func() bool { return len(refusalsOn(t, r, "chat", "task-rp")) == 1 })
 }
 
@@ -369,5 +369,45 @@ func TestARequestAfterAWithdrawnBatchWithRoundsLeftIsAnswered(t *testing.T) {
 		if got.Round != 2 {
 			t.Fatalf("refusal after the withdrawn round carries Round %d, want 2", got.Round)
 		}
+	}
+}
+
+// TestAfterABusyRefusalTheNextRequestIsTheSameRound: the gateway half of
+// #7547's cross-side check. With three rounds, a request while round one
+// runs is refused busy, tagged round 2. Once round one settles, the next
+// request is round 2 on the gateway too: refused by a normal rule, its
+// refusal is tagged 2 and not busy. A worker that doesn't count the busy
+// refusal waits on round 2 here and is answered.
+func TestAfterABusyRefusalTheNextRequestIsTheSameRound(t *testing.T) {
+	t.Parallel()
+	r := startProfileRig(t)
+	ctx := context.Background()
+	conv := "console:tab-rounds-busy-then-refused"
+	parent, origin, first := profileBatchParent(t, r, conv, "a", "b")
+	r.g.cfg.DelegationRoundsMax = 3
+	completeChild(t, r, first[0], "a is fine")
+	waitFor(t, "one end", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 1 })
+	if err := parent.PublishArtifact(ctx, twoClusterBatch(t, "c", "d")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the busy refusal", func() bool { return len(refusalsOn(t, r, "chat", origin.TaskID)) == 1 })
+	if got := refusalsOn(t, r, "chat", origin.TaskID)[0]; got.Round != 2 || !got.Busy {
+		t.Fatalf("busy refusal = %+v, want Round 2 and busy", got)
+	}
+	completeChild(t, r, first[1], "b is fine")
+	waitFor(t, "round one settled", func() bool { return len(childResultsOn(t, r, "chat", origin.TaskID)) == 2 })
+	r.g.cfg.DelegationWidthMax = 1 // round two's two tasks are too wide
+	again := twoClusterBatch(t, "e", "f")
+	again.ArtifactID += "-again"
+	if err := parent.PublishArtifact(ctx, again); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "round two refused", func() bool { return len(refusalsOn(t, r, "chat", origin.TaskID)) == 2 })
+	if got := refusalsOn(t, r, "chat", origin.TaskID)[1]; got.Round != 2 || got.Busy {
+		t.Fatalf("round two's refusal = %+v, want Round 2 and not busy", got)
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if p, _ := rec.TaskRefFor(origin.TaskID); p.DelegationRound != 2 {
+		t.Fatalf("stored round = %d, want 2", p.DelegationRound)
 	}
 }

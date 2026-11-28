@@ -190,7 +190,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 			g.log.Error("session record write failed after a delegation minted no child", "conversation", rec.Key, "err", err)
 		}
-		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, wireRound(round), false)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, reason, wireRound(round), false, false)
 	}
 	// A refusal's notice waits for the delegating turn's terminal, so the
 	// room reads the session's "delegated to platform" first and the
@@ -228,7 +228,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	refuseRounds := func(notice string, extra ...any) {
 		used := roundsUsed(parent)
 		log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationRounds, "roundsUsed", used, "roundsMax", g.cfg.DelegationRoundsMax}, audit...), extra...)...)
-		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+fmt.Sprintf(noticeDelegationRounds, used, plural(used))+notice), used+1, true)
+		g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+fmt.Sprintf(noticeDelegationRounds, used, plural(used))+notice), used+1, true, false)
 	}
 	// A profile parent stays open after its request, so it can ask again
 	// after one that ended (DelegationEnd: refused, not started, or a batch
@@ -291,11 +291,11 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 				// that wait. Nothing is minted or recorded and no round
 				// is used here: starting one would move the unsettled
 				// round's children off the record its heal reads. The
-				// worker counts the refused request as a round, so it
-				// sees no more rounds left than the gateway does.
+				// refusal says Busy, so the worker doesn't count it
+				// either and its next request's round is the gateway's.
 				used := roundsUsed(parent)
 				log.Warn("delegation refused", append(append([]any{"rule", ruleDelegationBusy, "roundsUsed", used, "roundsMax", g.cfg.DelegationRoundsMax}, audit...), "child", last)...)
-				g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+noticeDelegationRoundBusy), used+1, true)
+				g.tellProfileParentNoChild(ctx, rec, session, taskID, refusedEnd(noticeDelegationRefusedFor+noticeDelegationRoundBusy), used+1, true, true)
 				return
 			}
 		} else {
@@ -1647,7 +1647,7 @@ func refusedEnd(notice string) string {
 // round (lib.DelegationRefusal.Round) and ends nothing. Only such a parent
 // gets one: one with no earlier request is a first refusal, and a batch cut
 // short and being finished has its entries' ends coming instead.
-func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, round int, overCap bool) {
+func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionRecord, session, taskID, reason string, round int, overCap, busy bool) {
 	parent, ok := rec.TaskRefFor(taskID)
 	if !ok || parent.Tier == "" || session != parent.Addressee {
 		return
@@ -1672,7 +1672,7 @@ func (g *Gateway) tellProfileParentNoChild(ctx context.Context, rec *SessionReco
 		return
 	}
 	text := delegationRefusalText(reason)
-	if err := g.publishDelegationRefusal(ctx, rec, parent, text, round); err != nil {
+	if err := g.publishDelegationRefusal(ctx, rec, parent, lib.DelegationRefusal{Text: text, Round: round, Busy: busy}); err != nil {
 		g.log.Error("delegation refusal not delivered to its parent", "parent", parent.ID, "round", max(round, 1), "err", err)
 		return
 	}
@@ -1693,11 +1693,11 @@ func delegationRefusalText(reason string) string {
 
 // publishDelegationRefusal publishes a lib.DelegationRefusal on the parent's
 // .in, under the parent's own capability, as publishChildResult does.
-func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionRecord, parent TaskRef, text string, round int) error {
-	if len(text) > lib.ChildResultTextCap {
-		text = truncateBytes(text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
+func (g *Gateway) publishDelegationRefusal(ctx context.Context, rec *SessionRecord, parent TaskRef, refusal lib.DelegationRefusal) error {
+	if len(refusal.Text) > lib.ChildResultTextCap {
+		refusal.Text = truncateBytes(refusal.Text, lib.ChildResultTextCap-len(childResultCutNote)) + childResultCutNote
 	}
-	part, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text, Round: round})
+	part, err := lib.DelegationRefusalPart(refusal)
 	if err != nil {
 		return fmt.Errorf("build: %w", err)
 	}

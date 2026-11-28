@@ -830,6 +830,33 @@ func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing
 // round-trips. A round that isn't a JSON number, or is out of bounds, makes
 // the part no refusal, rather than a round-one refusal that would end the
 // parent's wait; a later-round refusal is held to the same text bounds.
+// TestDelegationRefusalBusyIsOmittedWhenFalseAndRoundTrips: Busy (#7547) is
+// absent from every refusal but a busy one, so a reader that predates it
+// reads the same bytes it always did; set, it reads back, and a non-bool is
+// no refusal.
+func TestDelegationRefusalBusyIsOmittedWhenFalseAndRoundTrips(t *testing.T) {
+	plain, err := DelegationRefusalPart(DelegationRefusal{Text: "no", Round: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain.Data), "busy") {
+		t.Fatalf("a refusal that isn't busy carries the busy field: %s", plain.Data)
+	}
+	busy, err := DelegationRefusalPart(DelegationRefusal{Text: "wait", Round: 2, Busy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"delegationRefused":{"text":"wait","round":2,"busy":true}}`; string(busy.Data) != want {
+		t.Fatalf("busy refusal = %s, want %s", busy.Data, want)
+	}
+	if got, ok := DelegationRefusalOf([]Part{busy}); !ok || !got.Busy || got.Round != 2 {
+		t.Fatalf("busy refusal read back = %+v, %v", got, ok)
+	}
+	if got, ok := DelegationRefusalOf([]Part{{Kind: "data", Data: []byte(`{"delegationRefused":{"text":"x","round":2,"busy":"yes"}}`)}}); ok {
+		t.Errorf("a string busy read as %+v", got)
+	}
+}
+
 func TestDelegationRefusalRoundRoundTripsAndIsStrict(t *testing.T) {
 	first, err := DelegationRefusalPart(DelegationRefusal{Text: "no"})
 	if err != nil {
