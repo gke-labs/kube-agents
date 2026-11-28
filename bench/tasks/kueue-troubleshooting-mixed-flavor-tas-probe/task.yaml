@@ -1,0 +1,133 @@
+# Skill-guidance probe for gke-kueue-troubleshooting: an unannotated Job
+# submitted to a ClusterQueue combining a Topology Aware Scheduling (TAS)
+# ResourceFlavor and a non-TAS ResourceFlavor cannot implicitly use the TAS
+# flavor when the non-TAS flavor has no unused quota. The skill's Stage 3 rule
+# records that implicit TAS is disabled in a mixed-flavor ClusterQueue
+# (unannotated pod sets can use only non-TAS flavors), classifies Stages 1-4 as
+# "Kueue configuration", and prescribes
+# `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode
+# logs_archive --data-path <dir> --ledger-path <ledger>` followed by
+# `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/validate_report.py`
+# for offline exported log analysis (without piping raw exports into python3,
+# per the local Tirith overlay patch on SKILL.md and references/log-sources.md).
+#
+# Main does not ship gke-kueue-troubleshooting, so it cannot supply the skill's
+# script-backed offline log-compaction and validation workflow. The objective
+# checks both the standalone verdict line (IMPLICIT-TAS: DISABLED, forbidding
+# IMPLICIT-TAS: ALLOWED; fold_decoration handles bold, code, bullet, and quote
+# wrappers) and the skill's prescribed workflow flags and Scope classification.
+# bench/tests/test_kueue_troubleshooting_probe.py pins both positive and
+# negative report shapes.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: kueue-troubleshooting-mixed-flavor-tas-probe
+name: Unannotated Jobs cannot implicitly use a TAS flavor in a mixed-flavor ClusterQueue, and offline log triage follows the gke-kueue-troubleshooting script workflow
+
+owner: eLeontev
+domain: cluster-debugging
+
+prompt: >-
+  We are troubleshooting a GKE Kueue batch incident using only exported Cloud
+  Logging JSON files already saved in /tmp/kueue-logs (no live kubectl access
+  and no exported manifests). From the incident notes, ClusterQueue ml-cq
+  combines two ResourceFlavors in the same resourceGroup: tas-gpu (which sets
+  topologyName: default and has 16 unused GPUs) and std-gpu (which has no
+  topologyName and has 0 unused GPUs). An unannotated Job eval-run (no
+  kueue.x-k8s.io/podset-required-topology or
+  kueue.x-k8s.io/podset-preferred-topology annotation) stays Pending
+  (Admitted=False) because std-gpu has insufficient unused quota, even though
+  tas-gpu has 16 GPUs free. Load the relevant installed gke-* skill and its
+  log-sources reference, and answer from them before searching documentation. Start your answer with exactly one line on its own, with
+  nothing else on it: "IMPLICIT-TAS: DISABLED" or "IMPLICIT-TAS: ALLOWED". If
+  you hand this question to another agent, pass these instructions word for
+  word, and keep its verdict line at the start of your reply. Then: (1) give
+  the exact offline log-compaction command (with all flags) for the local
+  directory /tmp/kueue-logs and the report-validation script prescribed by the
+  skill; (2) explain why eval-run cannot use tas-gpu, state its Scope
+  classification using the skill's taxonomy, and list the remediation options.
+  Do not apply anything or run kubectl.
+expected_output: >-
+  IMPLICIT-TAS: DISABLED. In a ClusterQueue that combines TAS and non-TAS
+  ResourceFlavors, implicit TAS is disabled: unannotated pod sets can use only
+  non-TAS flavors (std-gpu) and TAS-annotated pod sets can use only TAS flavors
+  (tas-gpu), and a single pod set cannot mix TAS and non-TAS flavors across its
+  requested resources. Because std-gpu has 0 unused GPUs, eval-run stays
+  Pending even though tas-gpu has 16 free GPUs. Under the skill's Scope
+  taxonomy, Stage 3 flavor/TAS assignment is "Kueue configuration". For offline
+  log-archive triage on /tmp/kueue-logs without kubectl, run
+  `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py
+  --mode logs_archive --data-path /tmp/kueue-logs --ledger-path
+  "$WORK_DIR/ledger.json" --no-remote-schema` (with `WORK_DIR=$(mktemp -d
+  /tmp/kueue-triage.XXXXXX)`), then validate the final report with
+  `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/validate_report.py
+  --draft-file "$WORK_DIR/draft.md" --ledger-path "$WORK_DIR/ledger.json"
+  --no-remote-schema`. Remediation: either add a TAS annotation
+  (kueue.x-k8s.io/podset-required-topology or podset-preferred-topology) to
+  eval-run so it can use tas-gpu, free or increase quota on std-gpu, or
+  separate TAS and non-TAS flavors into distinct ClusterQueues.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: mixed-flavor-implicit-tas-and-skill-workflow-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns: ["(?m)^implicit-tas: disabled$"]
+          forbidden_patterns: ["(?m)^implicit-tas: allowed$"]
+          fold_decoration: true
+        - type: report_contains
+          required_phrases:
+            [
+              "/opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/",
+              "trace_logs.py",
+              "--mode",
+              "logs_archive",
+              "--data-path",
+              "/tmp/kueue-logs",
+              "--ledger-path",
+              "--no-remote-schema",
+              "validate_report.py",
+              "Kueue configuration",
+            ]
+          # ReportContainsVerifier strips underscores before regex matching
+          # when fold_decoration is false, so `trace_logs.py` normalizes to
+          # `tracelogs.py`. Forbid piping a shell command directly into
+          # python3 ... trace_logs.py (single-line or backslash-continued,
+          # removed by the local Tirith overlay patch) while allowing valid
+          # Markdown tables whose rows begin with `|`.
+          forbidden_patterns:
+            [
+              "(?m)^[^|\\n]*\\S\\s*\\|\\s*(?:\\\\\\n\\s*)?python3?\\b[^\\n]*tracelogs\\.py\\b",
+            ]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

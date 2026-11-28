@@ -1540,6 +1540,15 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# gke-kueue-troubleshooting skill probe: an unannotated Job in a ClusterQueue
+# combining a TAS ResourceFlavor and a non-TAS ResourceFlavor cannot implicitly
+# use the TAS flavor when the non-TAS flavor has no unused quota. Graded on the
+# standalone IMPLICIT-TAS verdict line, the skill's offline logs_archive
+# script workflow (trace_logs.py and validate_report.py, without piping into
+# python3), and the Kueue configuration Scope classification.
+# deployer: noop, transcript-only.
+./tasks/kueue-troubleshooting-mixed-flavor-tas-probe/task.yaml
+
 # Which GitOps repositories the agent manages, read from the install's
 # configured registry via gitops_preflight.py (`agents/platform/SOUL.md` §1)
 # rather than discovered through kubectl, gcloud, forge APIs, clones, MCP

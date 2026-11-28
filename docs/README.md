@@ -77,10 +77,10 @@ kube-agents/
 │   ├── README.md                                  this map
 │   ├── architecture/                              END-STATE spec set 01–09 + README
 │   ├── designs/                                   per-feature design documents
-│   ├── ci-pool-projects.md, environment-reconcile.md,
-│   │   security-requirements.md, credential-isolation-design.md,
-│   │   eval-gate-roster.md, ci-health.md, testing-map.md, ownership.md,
-│   │   pull-request-workflow.md                   standalone docs
+│   ├── ci-pool-projects.md, contributing-domain-expertise.md,
+│   │   environment-reconcile.md, security-requirements.md,
+│   │   credential-isolation-design.md, eval-gate-roster.md, ci-health.md,
+│   │   testing-map.md, ownership.md, pull-request-workflow.md  standalone docs
 │   ├── chatops/, samples/                         the Teams integration and its
 │   │                                              sample manifests
 │   └── site/                                      Astro + Starlight site: README +

@@ -1,0 +1,26 @@
+Subject: Align remediation posture with GitOps pull request workflow
+
+Why: Upstream always tells the user to apply fixes manually and omits kube-agents' GitOps pull-request workflow (`agents/platform/SOUL.md` section 3). Keeping diagnosis requests report-only while routing explicit fix requests for manifest or ConfigMap changes through `submit-suggestion` matches the Platform Agent persona.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Retire-When: never; the GitOps `submit-suggestion` workflow is this repository's
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -16,8 +16,13 @@ metadata:
+ > incident time window as described in
+ > [Log sources](references/log-sources.md) and
+ > [View GKE logs](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/view-logs.md.txt).
+-> Give the user any fix (remediation YAML, commands, or linked documentation
+-> steps) to apply themselves in the final `### Diagnostic Summary`.
++> For investigation and diagnosis requests, include any remediation YAML,
++> commands, or linked documentation steps in the final `### Diagnostic Summary`
++> without opening a pull request (`SOUL.md` §3). When the user explicitly asks
++> to submit or apply a manifest or ConfigMap fix ("fix it", "open a PR"),
++> propose the YAML change as a GitOps pull request via `submit-suggestion`,
++> leaving imperative controller restarts or external infrastructure steps for
++> the operator.
+ 
+ ## Prerequisites
+ 

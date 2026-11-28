@@ -1,0 +1,75 @@
+Subject: Use full script paths and per run temp dir for kanban workers
+
+Why: Kanban workers start in `/opt/data/kanban/workspaces/<task-id>` where relative `scripts/*.py` paths fail with `No such file or directory`, and concurrent workers share `/tmp` so fixed `/tmp/kueue-logs` and `/tmp/kueue-ledger.json` paths race across sessions (`agents/platform/AGENTS.md`). Invoking scripts by their full `/opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/<name>.py` path with literal `python3` and using a per-run `mktemp -d /tmp/kueue-triage.XXXXXX` directory fixes both.
+Local-Issue: none (adoption of gke-kueue-troubleshooting from google/skills)
+Eval-Case: kueue-troubleshooting-mixed-flavor-tas-probe
+Retire-When: never; the platform profile script path and shared-sandbox temp-dir rules are this repository's
+
+diff --git a/SKILL.md b/SKILL.md
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -28,7 +28,10 @@ MUST read and follow the instructions in
+ ## Prerequisites
+ 
+ - **Tools and cluster access**: Python 3.10+ with `PyYAML` (all diagnostic
+-  scripts live in `scripts/` next to this file and require no cloud SDKs); if
++  scripts live under
++  `/opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/` and
++  require no cloud SDKs; always invoke them by full path with `python3` because
++  kanban workers start in their card workspace, not the skill directory); if
+   `python3 -c "import yaml"` fails, ask the user for approval before running
+   `python3 -m pip install "PyYAML>=6,<7"`, and if the user declines or `pip`
+   fails, stop and tell the user that the scripts require `PyYAML`. In `live`
+@@ -126,19 +129,21 @@ required for namespaced kinds; at most **4** `get` calls, never the same
+ files (at most **twice**). Never read the skill's own Python scripts.
+ 
+ 1. **Step 1 — one-shot snapshot or log timeline (schema attached)**
+-   - `live` / `offline_data`: run `scripts/snapshot.py` with
+-     `--mode <mode> --action snapshot --ledger-path <ledger>` (add
++   - `live` / `offline_data`: run
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/snapshot.py`
++     with `--mode <mode> --action snapshot --ledger-path <ledger>` (add
+      `--namespace <ns>` if known; `--kueue-namespace` if not `kueue-system`;
+      `--ignore-namespaces ns1,ns2` for extra add-on namespaces). If no active
+      `Workload`/`Job` is present or controller/audit history is needed, also run
+-     `scripts/trace_logs.py --mode <mode> --ledger-path <ledger>` once (at most
+-     2 log commands total).
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode <mode> --ledger-path <ledger>`
++     once (at most 2 log commands total).
+    - `logs_archive`: run
+-     `scripts/trace_logs.py --mode logs_archive --ledger-path <ledger>` with
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py --mode logs_archive --ledger-path <ledger>` with
+      `--data-path <file-or-dir>` first (add `--workload <name>` to focus).
+      Never call `kubectl` in this mode.
+-   - **Schema lookup (optional):** `scripts/snapshot.py --action explain` with
+-     `--kind <Kind[.field.path]> --ledger-path <ledger>`.
++   - **Schema lookup (optional):**
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/snapshot.py --action explain`
++     with `--kind <Kind[.field.path]> --ledger-path <ledger>`.
+    - **If a script fails or skips files:** read the error once, follow
+      `next_step`, and continue with available files without retrying in a loop.
+      If `trace_logs.py` reports `skipped_inputs` (symlinks or non-regular files)
+@@ -384,8 +389,9 @@ files (at most **twice**). Never read the skill's own Python scripts.
+    - In `#### Observations`, wrap a multi-word phrase in backticks **only** when
+      it is a verbatim substring of tool output (synthesised summaries go in
+      plain text).
+-   - Save the draft beside the ledger and run `scripts/validate_report.py` with
+-     `--draft-file <draft.md> --ledger-path <ledger>`. It passes only with
++   - Save the draft beside the ledger and run
++     `python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/validate_report.py`
++     with `--draft-file <draft.md> --ledger-path <ledger>`. It passes only with
+      `passed: true` (exit 0); exit 2 means `ledger_missing` (wrong ledger path)
+      or a non-empty `missing_headers`, `uninspected_graph_objects`,
+      `fabricated_quotes`, `remediation_gaps`, `open_question_gaps`,
+diff --git a/references/log-sources.md b/references/log-sources.md
+--- a/references/log-sources.md
++++ b/references/log-sources.md
+@@ -29,7 +29,7 @@ to a local file first and point `--data-path` at the file or directory:
+ WORK_DIR=$(mktemp -d /tmp/kueue-triage.XXXXXX)
+ echo "$WORK_DIR"
+ <read-only export command> > "$WORK_DIR/controller.json"
+-python3 scripts/trace_logs.py \
++python3 /opt/data/profiles/platform/skills/gke-kueue-troubleshooting/scripts/trace_logs.py \
+   --mode logs_archive \
+   --data-path "$WORK_DIR" \
+   --ledger-path "$WORK_DIR/ledger.json"

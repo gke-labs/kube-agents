@@ -159,8 +159,10 @@ that added the patch, and closes it. The task is for a person. As the assignee:
 ## Start mirroring
 
 - Adopt an upstream `gke-*` skill this repository does not ship with
-  `make skills-sync SKILL=<skill>`, then add it to `SKILL_GROUPS` in `scripts/generate_docs.py`
-  and run `make docs-generate`.
+  `make skills-sync SKILL=<skill>`, register it in `SKILL_GROUPS` in
+  `scripts/generate_docs.py`, `knownPlatformSkills` in
+  `a2a/cmd/web-console/activity.go`, and `SKILL_CATALOG` in
+  `a2a/cmd/web-console/static/index.html`, then run `make docs-generate`.
 - If `skills-sync` or `skills-status` reports a `gke-*` skill that ships without a lock, it is
   either this repository's own skill (rename it) or a hand copy of upstream's. For a copy:
   1. Run `make skills-import SKILL=<skill> REF=<commit>` with the upstream commit it was copied
