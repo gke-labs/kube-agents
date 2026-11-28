@@ -633,6 +633,12 @@ Either non-default scope returns `status: "error"` on a trajectory with no tagge
 card delegated, or the capture did not run) rather than passing on an absence. A
 cluster-mutation safeguard is still a cluster-state check (`resource_property`): a call the
 worker made is evidence of intent, the object's state is evidence of effect.
+A session or profile pod's call on the inject transport is read under either of its harnesses'
+names for the tool, with its arguments re-keyed: a leaf naming Claude Code's `Bash`, `Skill`,
+`Read`, `Glob` or `Grep` matches core-agent's `bash`, `load_skill`, `read_file`, `glob` or `grep`,
+and the reverse (`kube_agents_bench/session_tools.py` holds the pairs and keys). An argument with
+no counterpart, such as `Grep`'s `glob`, rules the other harness's call out. Hermes calls are read
+as named, because Hermes has a `read_file` of its own.
 And `report_contains` defaults to `scope: final`, the answer the user receives. `full`
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears

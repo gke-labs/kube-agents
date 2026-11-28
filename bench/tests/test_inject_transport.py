@@ -2815,9 +2815,10 @@ def test_each_status_word_is_carried_and_a_part_without_one_is_called() -> None:
     """``completed``, ``error`` and ``interrupted`` pass through as the
     door's words; a part with no status (the worker adapter's bare
     ``{"tool", "input"}``) takes the api shape's ``called``. A part with
-    no input maps to empty args, a non-object input is kept under its key,
-    and a part naming no tool is counted as malformed rather than written
-    as a call to nothing."""
+    no input maps to empty args and is marked as sent without one (counted
+    on the marker), a non-object input is kept under its key, and a part
+    naming no tool is counted as malformed rather than written as a call
+    to nothing."""
     fold = inject.Fold("task-1")
     fold.note_activity(
         [
@@ -2835,13 +2836,13 @@ def test_each_status_word_is_carried_and_a_part_without_one_is_called() -> None:
     assert calls == [
         {"name": "a", "args": {"x": 1}, "result": None, "status": "completed"},
         {"name": "b", "args": {"x": 2}, "result": None, "status": "error"},
-        {"name": "c", "args": {}, "result": None, "status": "interrupted"},
+        {"name": "c", "args": {}, "result": None, "status": "interrupted", inject.ENTRY_INPUT_ABSENT_FIELD: True},
         {"name": "d", "args": {"x": 4}, "result": None, "status": "called"},
         {"name": "e", "args": {"input": "raw text"}, "result": None, "status": "called"},
     ]
-    assert marker["args"] == {"calls": 5, "dropped": 0, "malformed": 1}
-    # Every entry is exactly the api path's four keys.
-    assert all(set(e) == {"name", "args", "result", "status"} for e in calls)
+    assert marker["args"] == {"calls": 5, "dropped": 0, "malformed": 1, inject.ACTIVITY_INPUT_ABSENT_ARG: 1}
+    # Every entry with an input is exactly the api path's four keys.
+    assert all(set(e) == {"name", "args", "result", "status"} for e in calls if e["name"] != "c")
 
 
 def test_a_card_worker_s_calls_stay_out_of_the_router_trajectory() -> None:
@@ -2874,7 +2875,14 @@ def test_a_card_worker_s_calls_stay_out_of_the_router_trajectory() -> None:
     )
     marker, *calls = trace_block(fold.trajectory)
     assert [c["name"] for c in calls] == ["kanban_create", "kanban_list", "kanban_show"]
-    assert marker["args"] == {"calls": 3, "dropped": 0, "malformed": 1}
+    assert marker["args"] == {"calls": 3, "dropped": 0, "malformed": 1, inject.ACTIVITY_INPUT_ABSENT_ARG: 2}
+    # A labelled router part names the bridge as its origin; the unlabelled
+    # one carries no origin, so it reads as the worker adapter's.
+    assert [c.get(inject.ENTRY_ORIGIN_FIELD) for c in calls] == [
+        inject.ORIGIN_HERMES_BRIDGE,
+        None,
+        inject.ORIGIN_HERMES_BRIDGE,
+    ]
     transcript.set("answer", fold.trajectory)
     try:
         # The safeguard's inner check: ``fail`` is no worker verb in the
