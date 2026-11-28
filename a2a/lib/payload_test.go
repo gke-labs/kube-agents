@@ -825,11 +825,6 @@ func TestDelegationRefusalPartRoundTripsAndRefusesEmptyOrOversizeText(t *testing
 	}
 }
 
-// TestDelegationRefusalRoundRoundTripsAndIsStrict: a round-one refusal goes
-// out with no round field, as it did before the field, and a later round
-// round-trips. A round that isn't a JSON number, or is out of bounds, makes
-// the part no refusal, rather than a round-one refusal that would end the
-// parent's wait; a later-round refusal is held to the same text bounds.
 // TestDelegationRefusalBusyIsOmittedWhenFalseAndRoundTrips: Busy (#7547) is
 // absent from every refusal but a busy one, so a reader that predates it
 // reads the same bytes it always did; set, it reads back, and a non-bool is
@@ -857,6 +852,11 @@ func TestDelegationRefusalBusyIsOmittedWhenFalseAndRoundTrips(t *testing.T) {
 	}
 }
 
+// TestDelegationRefusalRoundRoundTripsAndIsStrict: a round-one refusal goes
+// out with no round field, as it did before the field, and a later round
+// round-trips. A round that isn't a JSON number, or is out of bounds, makes
+// the part no refusal, rather than a round-one refusal that would end the
+// parent's wait; a later-round refusal is held to the same text bounds.
 func TestDelegationRefusalRoundRoundTripsAndIsStrict(t *testing.T) {
 	first, err := DelegationRefusalPart(DelegationRefusal{Text: "no"})
 	if err != nil {
