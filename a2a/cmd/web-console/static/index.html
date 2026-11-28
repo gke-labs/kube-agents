@@ -10031,6 +10031,25 @@
             openFeedback(formKind, formTitle);
             return true;
           }
+          if (first.startsWith("summar")) {
+            const row = appendTo(
+              where === "side" ? $("side-body") : $("chat-stream"),
+              "agent",
+              feedbackContextMarkdown(),
+              "feedback summary",
+            );
+            markSideLocalRow(row, where);
+            fetchEnvironment().then(() => {
+              if (!row.isConnected) return;
+              const refreshed = messageRow(
+                "agent",
+                feedbackContextMarkdown(),
+                "feedback summary",
+              );
+              row.innerHTML = refreshed.innerHTML;
+            });
+            return true;
+          }
           if (!kindKey) {
             const helpMd =
               "**/feedback** drafts an email you can copy and paste to `" +
