@@ -320,7 +320,9 @@ func TestARoundTwoRefusalIsHeldBackWhenItsPlanWasWritten(t *testing.T) {
 	waitFor(t, "the past-cap refusal", func() bool { return len(refusalsOn(t, r, "chat", "task-rp")) == 1 })
 }
 
-// TestARequestAfterAWithdrawnBatchWithRoundsLeftIsAnswered: #7547's trigger.
+// TestARequestAfterAWithdrawnBatchWithRoundsLeftIsAnswered: a guard on
+// #7547's suspected trigger, not a repro: in this rig the withdrawn round
+// settles and round two mints, so it passes without the busy refusal too.
 // A batch cut short and withdrawn (endWithdrawnProfileBatch) ends every
 // entry; with rounds left, the parent's next request either starts round two
 // or, while the withdrawn round hasn't settled, is refused tagged round 2.
