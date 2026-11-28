@@ -6684,9 +6684,13 @@ class ServiceAccountAuthenticator:
             # the request as a dropped connection with no 401, where the
             # caller deserves one.
             context = ssl.create_default_context(cafile=self.ca_file or None)
-            with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds, context=context
-            ) as response:
+            # The API server is inside the cluster: a proxy from the environment
+            # must not be in the path of the review. The opener is built for each
+            # call, because it carries this call's TLS context.
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+            )
+            with opener.open(request, timeout=self.timeout_seconds) as response:
                 review = json.load(response)
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException, RecursionError) as exc:
             # A TokenReview that cannot be completed is a rejection, not an

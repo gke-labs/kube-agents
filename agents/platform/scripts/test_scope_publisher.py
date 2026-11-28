@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -591,13 +592,13 @@ class KubeApiTest(unittest.TestCase):
     def _urlopen(self, *answers):
         answers = list(answers)
 
-        def fake(request, timeout, context):
+        def fake(request, timeout):
             self.requests.append(request)
             answer = answers.pop(0)
             if isinstance(answer, Exception):
                 raise answer
             return FakeResponse(json.dumps(answer).encode())
-        return mock.patch.object(pub.urllib.request, "urlopen", side_effect=fake)
+        return mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=fake)
 
     def test_it_reads_the_previous_document_and_its_resource_version(self):
         doc = {"v": 1, "resolvedAt": "t", "memberHash": "h", "state": "ok", "excludedProjects": [], "projects": []}

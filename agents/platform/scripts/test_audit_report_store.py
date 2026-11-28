@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import time
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -970,7 +971,7 @@ class JWKSRequestTests(unittest.TestCase):
             def read(self, limit=-1):
                 return self.body
 
-        def fake_urlopen(request, timeout=None, context=None):
+        def fake_urlopen(request, timeout=None):
             seen.append((request.full_url, request.get_header("Accept")))
             if request.full_url.endswith("/openid/v1/jwks"):
                 if "application/jwk-set+json" not in (request.get_header("Accept") or ""):
@@ -978,7 +979,7 @@ class JWKSRequestTests(unittest.TestCase):
                 return Answer(b'{"keys": []}')
             return Answer(b'{"issuer": "https://issuer.example"}')
 
-        with mock.patch.object(store.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=fake_urlopen):
             issuer, keys = store.fetch_cluster_keys("https://api.example", "/nonexistent")
         self.assertEqual(("https://issuer.example", []), (issuer, keys))
         self.assertIn("application/jwk-set+json", dict(seen)["https://api.example/openid/v1/jwks"])

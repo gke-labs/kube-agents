@@ -15455,7 +15455,7 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
         def explode(request, *args, **kwargs):
             raise urllib.error.URLError("connection refused")
 
-        with mock.patch.object(credential_proxy.urllib.request, "urlopen", explode):
+        with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=explode):
             with self.assertRaises(credential_proxy.AuthenticationError):
                 authenticator.authenticate(self._headers("Bearer agent-token"))
 
@@ -15538,7 +15538,7 @@ class ServiceAccountAuthenticatorTest(unittest.TestCase):
             captured["authorization"] = request.get_header("Authorization")
             return Response(json.dumps({"status": self._ok_status()}).encode("utf-8"))
 
-        with mock.patch.object(credential_proxy.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=fake_urlopen):
             authenticator.authenticate(self._headers("Bearer agent-token"))
 
         self.assertEqual(
@@ -15679,7 +15679,7 @@ class AudienceRoleTest(unittest.TestCase):
             captured["body"] = json.loads(request.data.decode("utf-8"))
             return Response(json.dumps({"status": self._status([self.CHAT])}).encode())
 
-        with mock.patch.object(credential_proxy.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(urllib.request.OpenerDirector, "open", side_effect=fake_urlopen):
             authenticator.authenticate({"Authorization": "Bearer gateway-token"})
 
         self.assertEqual([self.SHELL, self.CHAT], captured["body"]["spec"]["audiences"])
