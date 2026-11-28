@@ -348,7 +348,7 @@ func TestNoToolLinesWritesNoLine(t *testing.T) {
 // entry can carry a scope in brackets after the tool's name; the name is the
 // part before it.
 func TestTheDriverReadsThePersonasSkillToolAsASkillCall(t *testing.T) {
-	out, skills, err := renderPersona(ProfileWorkerConfig{PersonaDir: examplePersona, Harness: persona.ClaudeCode},
+	out, skills, err := renderPersona(ProfileWorkerConfig{PersonaDir: examplePersona, Harness: persona.ClaudeCode}, persona.Delegate{},
 		slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)

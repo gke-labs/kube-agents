@@ -493,6 +493,10 @@ type adapter struct {
 	// delegateTargets part (delegateWidthOf); zero or one is the single
 	// shape only.
 	delegateWidth int
+	// delegateRounds is how many delegate calls a profile task may make, as
+	// the gateway advertised it on the submission's delegateTargets part
+	// (delegateRoundsOf); zero or one is one.
+	delegateRounds int
 
 	// dispatched is a task a profile worker took from the dispatcher
 	// (profile.go). The dispatcher checked the grant at admission
@@ -516,6 +520,12 @@ type adapter struct {
 	// model-written text the task publishes (scrub). The adapter is per
 	// task, so the set is too, and finalize clears and closes it.
 	seen answerscrub.Seen
+
+	// childCh carries a dispatched task's child ends from its .in
+	// (handleInMsg) to supervise, which waits on them once the task has
+	// delegated (childwait.go). Nil for every other task, whose .in drops
+	// them as it always has.
+	childCh chan childEnd
 }
 
 // errAbandoned is finalize's answer for an abandoned task: no terminal went
@@ -916,6 +926,9 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	// originSeq+1 means input published before this line still arrives.
 	steerCh := make(chan string, steerQueueDepth)
 	cancelCh := make(chan struct{}, 1)
+	if a.dispatched {
+		a.childCh = make(chan childEnd, childQueueDepth)
+	}
 	stopIn, err := a.consumeIn(ctx, originSeq+1, origin.EnvelopeID, steerCh, cancelCh)
 	if err != nil {
 		state := lib.StateFailed
@@ -987,6 +1000,7 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		// keeps up with profiles added and removed.
 		argv, _ = withDelegateTargetsFor(drv, argv, origin)
 		a.delegateWidth = delegateWidthOf(origin)
+		a.delegateRounds = delegateRoundsOf(origin)
 	}
 
 	if cfg.SessionReuse {
@@ -1201,10 +1215,24 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		reapTook      time.Duration
 		resultText    string
 		resultErr     string // failure subtype from the harness, if any
-		// delegated is set once a delegate request is published: the
-		// turn's deliverable is decided, and nothing the harness says
+		// delegated is set once a session's delegate request is published:
+		// the turn's deliverable is decided, and nothing the harness says
 		// after it changes that.
 		delegated bool
+		// wait is a dispatched task's open delegation (childwait.go): set
+		// when its delegate request is published, it keeps the task open
+		// until the children's ends are delivered as one more turn, whose
+		// result is the deliverable. Kept apart from delegated, which ends
+		// a session's turn, so a profile parent's answer is held to the
+		// same checks as any other.
+		wait *childWait
+		// roundsUsed counts a dispatched task's published delegate
+		// requests, each a delegation round (delegateRounds bounds it).
+		roundsUsed int
+		// reserve fires the wait's delivery ahead of the deadline
+		// (childWaitReserve); nil until the task delegates.
+		reserve  *time.Timer
+		reserveC <-chan time.Time
 		// pendingTurns counts user messages written minus result events
 		// seen: the opening prompt is turn one, every absorbed steer runs
 		// another turn, and the task's deliverable is the result that
@@ -1228,6 +1256,16 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// halted is every stop recorded for the task (halt). A respawn
 		// needs it empty.
 		halted []supervisorStop
+		// heldWhy is why a settled wait settled, while its delivery turn is
+		// held under a driver that holds steers because it settled mid-turn:
+		// the delivery is built and written at that turn's result, after
+		// PrepareTurn, so its close counts the rounds left then.
+		heldWhy string
+		// deliveryAhead is how many turns run before a written delivery's
+		// own: one written mid-turn under a driver that doesn't hold steers
+		// waits on stdin until the running turn (and any steer queued before
+		// it) ends. Until then, as while it is held, the model hasn't read it.
+		deliveryAhead int
 	)
 
 	// halt records a stop. Every place below that stops the task calls it.
@@ -1301,6 +1339,86 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		return true
 	}
+
+	// writeDelivery writes the children's ends onto stdin as one user turn,
+	// counted like a steer, so the result that settles it is the
+	// deliverable. A driver that holds steers prepares the turn first, as it
+	// does for a held steer; its failure ends the task.
+	writeDelivery := func(text string) {
+		if holdSteers {
+			if err := a.cfg.driver().PrepareTurn(ctx, a.turnDirs(proc.cmd.Env)); err != nil {
+				log.Warn("preparing the delivery turn failed; ending the task", "task", a.taskID, "err", err)
+				sawResult, resultErr, resultText = true, prepareFailedToken+reasonDetailSeparator+err.Error(), ""
+				halt(stopDecided)
+				proc.closeStdin()
+				return
+			}
+		}
+		if err := proc.writeUser(text); err != nil {
+			log.Warn("delivering the delegated tasks' results failed", "task", a.taskID, "err", err)
+			return
+		}
+		deliveryAhead = pendingTurns
+		pendingTurns++
+		log.Info("delegated tasks' results delivered as one turn", "task", a.taskID)
+	}
+
+	// deliver settles the wait once: all of its ends, or what has arrived
+	// when the request was refused or the reserve fired, scrubbed (a.scrub,
+	// which reads the seen-values set and never feeds it). Written at once
+	// when the harness is between turns or queues a mid-turn message; a
+	// driver that holds steers gets it at the running turn's result
+	// (heldWhy).
+	// reserveAt is when the deadline reserve fires (childWaitReserve). A
+	// round may start only before it: a later one's children couldn't
+	// report before the reserve delivers.
+	reserveAt := started.Add(a.cfg.TaskDeadline - childWaitReserve(a.cfg.TaskDeadline))
+	// roundsLeft is how many more delegation rounds a dispatched task may
+	// start now: the rounds the gateway advertised less those used, and none
+	// once the reserve's time has come.
+	roundsLeft := func() int {
+		if !time.Now().Before(reserveAt) {
+			return 0
+		}
+		return max(max(a.delegateRounds, 1)-roundsUsed, 0)
+	}
+	// deliveryText is the settled wait's delivery, built when it is
+	// written: its close offers the rounds left then, and none after the
+	// reserve delivered it.
+	deliveryText := func(why string) string {
+		left := 0
+		if why != "deadline-reserve" {
+			left = roundsLeft()
+		}
+		return wait.childDelivery(a.scrub, left)
+	}
+	// deliveryUnread is whether the settled wait's delivery has yet to reach
+	// the model: held for the turn's result, or written and queued behind
+	// the running turn.
+	deliveryUnread := func() bool { return heldWhy != "" || deliveryAhead > 0 }
+	deliver := func(why string) {
+		if wait == nil || wait.delivered {
+			return
+		}
+		wait.delivered = true
+		if reserve != nil {
+			reserve.Stop()
+			reserveC = nil
+		}
+		log.Info("delegated tasks' wait settled", "task", a.taskID, "why", why,
+			"results", len(wait.got), "asked", len(wait.asked), "refused", wait.refusal != nil)
+		if holdSteers && pendingTurns > 0 {
+			heldWhy = why
+			log.Info("delivery held until the turn boundary", "task", a.taskID)
+			return
+		}
+		writeDelivery(deliveryText(why))
+	}
+	defer func() {
+		if reserve != nil {
+			reserve.Stop()
+		}
+	}()
 
 	events := proc.events
 	for {
@@ -1414,6 +1532,9 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							}
 						}
 						pendingTurns--
+						if deliveryAhead > 0 {
+							deliveryAhead--
+						}
 						// Another turn follows when a steer is held and the turn
 						// neither failed nor was ended by cancel or the deadline,
 						// whose kill is already on its way. One steer per
@@ -1457,6 +1578,37 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							sawResult = true
 							resultErr = ev.Token
 							resultText = ev.Text
+						} else if pendingTurns <= 0 && wait != nil && !wait.delivered {
+							// A turn that ends while the children run is not the
+							// deliverable: stdin stays open for the delivery turn,
+							// and the stream says what the task is waiting on.
+							pendingTurns = 0
+							log.Info("turn result absorbed; waiting on delegated tasks",
+								"task", a.taskID, "outstanding", wait.outstanding())
+							// Not after a stop: the task isn't waiting any more.
+							if !canceled && !deadlineHit {
+								a.publishWorkingNote(waitingText(wait.outstanding()))
+							}
+							continue
+						} else if pendingTurns <= 0 && heldWhy != "" && !canceled && !deadlineHit {
+							// The children's ends arrived mid-turn under a driver
+							// that holds steers: this boundary is the delivery
+							// turn's, and its result is the deliverable unless
+							// that turn starts another round.
+							why := heldWhy
+							heldWhy = ""
+							writeDelivery(deliveryText(why))
+							continue
+						} else if pendingTurns <= 0 && heldWhy != "" {
+							// Cancel or the deadline came while the children's
+							// ends were held: the delivery turn won't run, and
+							// this result was written before they reported, so
+							// it isn't the deliverable. The stop decides the end.
+							heldWhy = ""
+							log.Info("held delivery dropped: the task was stopped first", "task", a.taskID,
+								"canceled", canceled, "deadline", deadlineHit)
+							proc.closeStdin()
+							continue
 						} else if pendingTurns <= 0 {
 							halt(stopDecided)
 							sawResult = true
@@ -1513,6 +1665,37 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					ask.reply <- delegateReply{Message: "a task is already delegated this turn"}
 					continue
 				}
+				// A profile task makes at most the rounds the gateway
+				// advertised (delegateRounds; one when it advertised none),
+				// so at one a second call is refused as it always was. With
+				// rounds left, a call while the last round's children run is
+				// refused (their results come first), and so is one after the
+				// reserve's time (a new round's children couldn't report); a
+				// call once their results are delivered starts the next round.
+				// Once the children's results are delivered, every refusal says
+				// so: promising them as the next turn would send the model
+				// waiting for something it already has.
+				if a.dispatched && roundsUsed >= max(a.delegateRounds, 1) {
+					msg := refuseSecondDelegation
+					if a.delegateRounds > 1 {
+						msg = fmt.Sprintf(refuseRoundsUsed, a.delegateRounds)
+					}
+					if wait != nil && wait.delivered && !deliveryUnread() {
+						msg = refuseAfterDelivery
+					}
+					ask.reply <- delegateReply{Message: msg}
+					continue
+				}
+				// A delivery held for the turn boundary hasn't reached the model
+				// yet: the round it settled is still the one being waited on.
+				if wait != nil && (!wait.delivered || deliveryUnread()) {
+					ask.reply <- delegateReply{Message: refuseWhileWaiting}
+					continue
+				}
+				if wait != nil && roundsLeft() == 0 {
+					ask.reply <- delegateReply{Message: refuseNoTimeForRound}
+					continue
+				}
 				// Cancel and the deadline end the turn when they fire, not when
 				// the harness finally dies: a call in that window would publish
 				// a child and turn the canceled task into a completed one.
@@ -1531,9 +1714,25 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					ask.reply <- delegateReply{Message: "could not publish the delegation; try again"}
 					continue
 				}
+				line := delegatedTo(ask.req)
+				if a.dispatched {
+					// A profile task stays open: no deliverable, no kill, no
+					// final. Its children's ends arrive on its .in, and the
+					// reserve delivers what has arrived ahead of the deadline.
+					roundsUsed++
+					wait = newChildWait(ask.req, roundsUsed)
+					next := profileDelegatedOne
+					if len(wait.asked) > 1 {
+						next = profileDelegatedMany
+					}
+					ask.reply <- delegateReply{OK: true, Message: line + next}
+					reserve = time.NewTimer(max(time.Until(started.Add(a.cfg.TaskDeadline-childWaitReserve(a.cfg.TaskDeadline))), 0))
+					reserveC = reserve.C
+					log.Info("delegation published; the task waits on its children", "task", a.taskID, "tasks", len(wait.asked), "delegated", line)
+					continue
+				}
 				delegated = true
 				halt(stopDelegated)
-				line := delegatedTo(ask.req)
 				next := "; this turn ends now and the result arrives as your next turn"
 				if ask.req.IsBatch() {
 					next = "; this turn ends now and the results arrive together as your next turn"
@@ -1548,6 +1747,53 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				// it before the terminal decision below.
 				proc.closeStdin()
 				proc.kill(a.cfg.KillGrace)
+
+			case end := <-a.childCh:
+				if stopForAbandon() {
+					continue
+				}
+				if wait == nil || wait.delivered || sawResult || exited || canceled || deadlineHit || refused != nil {
+					log.Warn("child result with no open wait dropped", "task", a.taskID)
+					continue
+				}
+				if end.refusal != nil && !wait.refusalEnds(*end.refusal) {
+					// A refusal for another round (lib.DelegationRefusal.Round):
+					// a lower one is stale, and a higher one refused a request
+					// made after the one the wait is on, whose children are
+					// still running or have reported. It ends nothing.
+					log.Info("delegation refusal for another round dropped; the wait goes on",
+						"task", a.taskID, "round", roundOf(end.refusal.Round), "waitRound", wait.round,
+						"notice", truncate(end.refusal.Text, otherRoundRefusalLogCap))
+					continue
+				}
+				if end.refusal != nil {
+					// Nothing was minted: the whole wait ends. A busy
+					// refusal (the last round hadn't settled on the gateway,
+					// #7547) used no round there, so it uses none here: the
+					// delivery offers the round again, and the next request
+					// is numbered as the gateway numbers it.
+					wait.refusal = end.refusal
+					if end.refusal.Busy && roundsUsed > 0 {
+						roundsUsed--
+					}
+					deliver("refused")
+					continue
+				}
+				if !wait.add(*end.result) {
+					log.Info("child result not counted (a duplicate, or an entry not asked for)",
+						"task", a.taskID, "child", end.result.ChildTaskID, "entry", end.result.Entry)
+					continue
+				}
+				if wait.complete() {
+					deliver("complete")
+				}
+
+			case <-reserveC:
+				reserveC = nil
+				if sawResult || exited || canceled || deadlineHit || refused != nil || stopForAbandon() {
+					continue
+				}
+				deliver("deadline-reserve")
 
 			case reason := <-a.abandon:
 				// The dispatcher took the task back (deadline, lease expiry, a
@@ -1987,6 +2233,31 @@ func (a *adapter) publishSteerRefusal(steer, reason string) {
 	if echo := truncateRunes(strings.TrimSpace(steer), steerEchoCap); echo != "" {
 		text += "\nrefused message: " + echo
 	}
+	if err := a.publishWorking(ctx, text); err != nil {
+		// Loud: the user's correction is now lost with nothing on the
+		// stream saying so, which is exactly the failure this publish
+		// exists to prevent.
+		a.log.Error("steer refusal publish failed; the refused message is now silent",
+			"task", a.taskID, "err", err)
+		return
+	}
+	a.log.Info("steer refusal published", "task", a.taskID)
+}
+
+// publishWorkingNote publishes text as a non-final working status-update,
+// best-effort like publishSteerRefusal: a dispatched task's word, mid-wait,
+// of what it is waiting on.
+func (a *adapter) publishWorkingNote(text string) {
+	ctx, cancel := context.WithTimeout(context.Background(), steerRefusalPublishTimeout)
+	defer cancel()
+	if err := a.publishWorking(ctx, text); err != nil {
+		a.log.Warn("working note publish failed", "task", a.taskID, "err", err)
+	}
+}
+
+// publishWorking publishes one non-final status-update in state working
+// carrying text: never the thing that moves the task, and never final.
+func (a *adapter) publishWorking(ctx context.Context, text string) error {
 	update := lib.StatusUpdate{
 		TaskID:    a.taskID,
 		ContextID: a.contextID,
@@ -2002,23 +2273,13 @@ func (a *adapter) publishSteerRefusal(steer, reason string) {
 	}
 	payload, err := json.Marshal(update)
 	if err != nil {
-		a.log.Error("steer refusal marshal failed", "task", a.taskID, "err", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 	env, err := lib.NewStatusUpdateEnvelope(a.from, a.taskID, a.contextID, a.correlationID, payload)
 	if err != nil {
-		a.log.Error("steer refusal envelope failed", "task", a.taskID, "err", err)
-		return
+		return fmt.Errorf("envelope: %w", err)
 	}
-	if err := a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env); err != nil {
-		// Loud: the user's correction is now lost with nothing on the
-		// stream saying so, which is exactly the failure this publish
-		// exists to prevent.
-		a.log.Error("steer refusal publish failed; the refused message is now silent",
-			"task", a.taskID, "err", err)
-		return
-	}
-	a.log.Info("steer refusal published", "task", a.taskID)
+	return a.c.Publish(ctx, lib.TaskEventsSubject(a.cfg.Addressee(), a.taskID), env)
 }
 
 // truncateRunes cuts on a rune boundary. The steer echo is user text and may
@@ -2638,6 +2899,22 @@ func (a *adapter) handleInMsg(msg jetstream.Msg, subject string, seen map[string
 			var m lib.Message
 			if err := json.Unmarshal(env.Payload, &m); err != nil {
 				a.log.Error("follow-up message unparseable", "err", err)
+				return
+			}
+			// A child's end, or the refusal of the task's delegation, is the
+			// gateway's word to a dispatched task that waits on its
+			// children (childwait.go); supervise decides whether a wait is
+			// open for it, and whether a refusal is for its round.
+			if end, ok := childEndOf(m.Parts); ok {
+				if a.childCh == nil {
+					a.log.Warn("child result on a task that waits on no children dropped", "task", a.cfg.TaskID)
+					return
+				}
+				select {
+				case a.childCh <- end:
+				default:
+					a.log.Error("child result queue full; the end is dropped and the deadline reserve bounds the wait", "task", a.cfg.TaskID)
+				}
 				return
 			}
 			text := textFromParts(m.Parts)

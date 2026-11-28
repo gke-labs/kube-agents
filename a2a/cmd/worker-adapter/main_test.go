@@ -665,9 +665,9 @@ func TestAProfileWorkersBaseArgvLeavesToolsToThePersona(t *testing.T) {
 	}
 }
 
-// A profile worker binds no delegate socket: its harness argv is the
-// persona's, which carries no delegate MCP server, so a listener would serve
-// a tool the harness is never told of.
+// A profile worker whose profile doesn't delegate binds no delegate socket:
+// its harness argv is the persona's, which carries no delegate MCP server, so
+// a listener would serve a tool the harness is never told of.
 func TestAProfileWorkerBindsNoDelegateSocket(t *testing.T) {
 	t.Setenv("TASK_ID", "task-profile")
 	t.Setenv("PROFILE", "chat")
@@ -686,6 +686,50 @@ func TestAProfileWorkerBindsNoDelegateSocket(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.HarnessCommand, profileHarnessCommand()) || got.HarnessCommandNoDelegate != nil {
 		t.Errorf("profile mode argv = %q / %q, want the persona's base argv and no no-delegate variant", got.HarnessCommand, got.HarnessCommandNoDelegate)
+	}
+}
+
+// A profile that delegates keeps the socket, but only with both switches: the
+// operator's opt-in and the tool's own switch not off. An operator that
+// predates the opt-in turns the tool off on every profile pod, and a pod with
+// the opt-in alone (the tool switched off by hand) gets no tool either.
+func TestAProfileWorkerKeepsTheDelegateSocketOnlyWhenItsProfileDelegates(t *testing.T) {
+	for _, tc := range []struct {
+		name, delegates, tool string
+		want                  bool
+	}{
+		{"opted in", "true", "", true},
+		{"no opt-in", "", "", false},
+		{"opt-in but the tool off", "true", "off", false},
+		{"no opt-in, the tool off (an older operator)", "", "off", false},
+		{"opt-in not literal true", "yes", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TASK_ID", "task-profile")
+			t.Setenv("PROFILE", "chat")
+			t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+			t.Setenv("A2A_CAPABILITY_REQUIRED", "false")
+			t.Setenv(lib.EnvProfileDelegates, tc.delegates)
+			t.Setenv(lib.EnvDelegateTool, tc.tool)
+			cfg, ok := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+			if !ok {
+				t.Fatal("configFromEnv rejected the environment")
+			}
+			got := profileModeConfig(cfg)
+			if (got.DelegateSocket != "") != tc.want {
+				t.Fatalf("delegate socket = %q, want one: %v", got.DelegateSocket, tc.want)
+			}
+			d := workeradapter.ProfileDelegate("/self", got.DelegateSocket)
+			if (d.Command != "") != tc.want {
+				t.Fatalf("persona delegate server = %+v, want one: %v", d, tc.want)
+			}
+			if tc.want && (d.Tool != workeradapter.DelegateToolName || d.Env[workeradapter.EnvDelegateSocket] != got.DelegateSocket) {
+				t.Fatalf("persona delegate server = %+v", d)
+			}
+			if !reflect.DeepEqual(got.HarnessCommand, profileHarnessCommand()) || got.HarnessCommandNoDelegate != nil {
+				t.Errorf("profile mode argv = %q / %q", got.HarnessCommand, got.HarnessCommandNoDelegate)
+			}
+		})
 	}
 }
 

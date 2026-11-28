@@ -85,9 +85,10 @@ const defaultDelegationWidthMax = 10
 const delegationRoundsEnv = "A2A_DELEGATION_ROUNDS_MAX"
 
 // delegationRoundsSupportedMax is the most rounds New lets DelegationRoundsMax
-// keep: one, until a profile parent's later rounds (a new batch after the
-// first's ends are delivered) land. A higher setting is clamped to it, with a
-// warning, rather than advertised to a worker the gateway would then refuse.
+// keep: one for now. The gateway and the worker both take a profile
+// parent's later rounds (a new batch after the last one's ends are
+// delivered); lifting this is a later change. A higher setting is clamped to
+// it, with a warning.
 const delegationRoundsSupportedMax = 1
 
 // delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
@@ -928,9 +929,8 @@ type Config struct {
 	// advertises it when over one.
 	//
 	// Zero means 1. New clamps it to 1 to lib.DelegateRoundsCeiling, and
-	// then to delegationRoundsSupportedMax (1) with a warning, until rounds
-	// past the first are supported. FromEnv refuses a value that is not an
-	// integer.
+	// then to delegationRoundsSupportedMax (1, for now) with a warning.
+	// FromEnv refuses a value that is not an integer.
 	DelegationRoundsMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
@@ -1740,7 +1740,7 @@ var sessionHarnesses = map[string]bool{string(persona.ClaudeCode): true}
 // clampDelegationRounds is the DelegationRoundsMax New keeps: unset is one, a
 // value outside 1 to lib.DelegateRoundsCeiling is clamped into it, and any
 // value over delegationRoundsSupportedMax is clamped to that, with a warning
-// naming the variable, until rounds past the first are supported.
+// naming the variable.
 func clampDelegationRounds(n int, log *slog.Logger) int {
 	if n == 0 {
 		return 1

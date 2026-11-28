@@ -1023,7 +1023,7 @@ off a real install, and a listed member's posts through any app in the workspace
 
 How many delegate requests one AgentProfile task may make, each minted or refused using one up;
 the A2A gateway refuses one past it under its `delegation.rounds` rule. `1`, the default, is the
-only value supported until a profile task's later rounds ship: the values schema and the render
+only value supported for now (lifting it is a later change): the values schema and the render
 refuse any other. The controller manager renders `A2A_DELEGATION_ROUNDS_MAX=1` onto the gateway,
 and an `A2A_DELEGATION_ROUNDS_MAX` it carries from `operator.extraEnv` other than `1` is refused
 in its startup log and rendered as `1`.

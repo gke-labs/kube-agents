@@ -80,6 +80,14 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 	}) {
 		return persona.Output{}, fmt.Errorf("the relay's args do not carry %s, so no server would know its target", urlPlaceholder)
 	}
+	// The worker's delegate tool owns this name; a persona server under it
+	// would be configured as, or beside, the worker's own.
+	if _, ok := p.MCP.Servers[persona.DelegateServer]; ok {
+		return persona.Output{}, fmt.Errorf("mcp.yaml: servers.%s: the name is reserved for the worker's delegate tool", persona.DelegateServer)
+	}
+	if t.Delegate.Command != "" && t.Delegate.Tool == "" {
+		return persona.Output{}, fmt.Errorf("the worker's delegate server names no tool")
+	}
 	out := persona.Output{Model: p.Manifest.Model}
 	warn := func(format string, args ...any) { out.Warnings = append(out.Warnings, fmt.Sprintf(format, args...)) }
 
@@ -119,6 +127,17 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 			delete(servers, name)
 			warn("mcp.yaml: servers.%s: dropped, no tools entry grants any of its tools", name)
 		}
+	}
+
+	// The worker's delegate tool, for a profile that delegates: its server
+	// and its one tool, after the persona's own.
+	if d := t.Delegate; d.Command != "" {
+		entry := map[string]any{"command": d.Command, "args": append([]string{}, d.Args...)}
+		if len(d.Env) > 0 {
+			entry["env"] = d.Env
+		}
+		servers[persona.DelegateServer] = entry
+		allowed = append(allowed, mcpTool(persona.DelegateServer, d.Tool))
 	}
 
 	// No grant, no flag: an empty --allowedTools is not "nothing".

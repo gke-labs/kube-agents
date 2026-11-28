@@ -824,8 +824,9 @@ credential-proxy token.
   would change what runs.
 
 **Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
-carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?, "round"?}}`. The parent's per-task
-reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?, "entry"?, "round"?}}`. The parent's worker
+collects its children's ends and hands them to its model together, as one turn, once each entry has
+one (`spec-chatops-gateway.md`, "The profile parent's wait"). `state` is the child's terminal state. `text` is its deliverable
 when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
 `result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
 
@@ -924,7 +925,7 @@ unchanged, and a worker that predates the part ignores it.
 - `roundsMax` is how many `delegate` requests a profile task may make, the gateway's
   `A2A_DELEGATION_ROUNDS_MAX`. Only a profile task's list carries it, and only when it is over one;
   absent means one. It is at most 16 (`lib.DelegateRoundsCeiling`). The gateway holds the setting to
-  one until a profile task's later rounds ship, so no list carries it yet.
+  one until a later change lifts it (the worker already takes later rounds), so no list carries it yet.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 

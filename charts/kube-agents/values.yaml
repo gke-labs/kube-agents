@@ -207,7 +207,7 @@ operator:
   slackTestUsers: []
   # How many delegate requests one AgentProfile task may make, each minted or
   # refused using one up (the A2A gateway's delegation.rounds rule). 1, the
-  # only value supported until a profile task's later rounds ship: the schema
+  # only value supported for now (lifting it is a later change): the schema
   # and the render refuse anything else. Rendered onto the gateway as
   # A2A_DELEGATION_ROUNDS_MAX by the controller manager, which renders 1 for
   # any other value it carries and says so in its log.

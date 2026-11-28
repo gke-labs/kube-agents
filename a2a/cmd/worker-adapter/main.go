@@ -191,7 +191,7 @@ func run() int {
 	}
 	// `worker-adapter mcp` forwards the session's one delegate tool call to
 	// this adapter process over a unix socket (worker-adapter/mcp.go).
-	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.DelegateMCPCommand {
 		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)
 			return 1
@@ -268,7 +268,10 @@ func run() int {
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
 			// The persona's MCP servers through the broker's relay (#5495).
-			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
+			Relay: workeradapter.ProfileRelay(selfPath(), os.Getenv),
+			// The delegate tool, for a profile that delegates: none when
+			// profileModeConfig cleared the socket.
+			Delegate:   workeradapter.ProfileDelegate(selfPath(), cfg.DelegateSocket),
 			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
 			// What a script-run task's credential is verified against
 			// (#5622): rendered into Job templates only.
@@ -350,17 +353,29 @@ func resetPaths(v string) []string {
 }
 
 // profileModeConfig is cfg for a profile worker. The persona supplies the
-// tool flags, so the base argv carries none, and the delegate tool is not
-// among them, so no delegate socket is bound for a harness that would never
-// be told of it.
+// tool flags, so the base argv carries none. The delegate tool is rendered
+// into the persona's flags only for a profile that delegates
+// (profileDelegates); for any other no delegate socket is bound, since its
+// harness is never told of one.
 func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
 	cfg.HarnessCommand = profileHarnessCommand()
 	cfg.HarnessCommandNoDelegate = nil
 	// The persona is a profile worker's instruction layer; the session
 	// lines are not its own.
 	cfg.Driver = workeradapter.WithInstructions(cfg.Driver, nil)
-	cfg.DelegateSocket = ""
+	if !profileDelegates() {
+		cfg.DelegateSocket = ""
+	}
 	return cfg
+}
+
+// profileDelegates reports a profile worker whose AgentProfile sets
+// spec.delegates: the operator renders lib.EnvProfileDelegates "true" for it
+// and leaves the tool's own switch on. Both must hold, so an operator that
+// predates the variable, which turns the tool off on every profile pod,
+// gets no tool.
+func profileDelegates() bool {
+	return os.Getenv(lib.EnvProfileDelegates) == "true" && delegateToolEnabled()
 }
 
 // configFromEnv is the whole environment contract in one place, split out of

@@ -1,0 +1,46 @@
+# WHAT THIS GRADES: a profile task that delegates (#6789). An ask goes to a
+# throwaway AgentProfile that sets spec.delegates (the harness makes it per run:
+# delegating_profile, bench/kube_agents_bench/delegating_profile.py), asking it
+# to hand a read of the install's own cluster to the `cluster` profile, wait
+# for the result, and answer from it. The task stays open while its child
+# runs, gets the child's result as its next turn, and reports.
+#
+# RED ON MAIN: main's AgentProfile CRD has no spec.delegates, so the copy has
+# no delegate tool. It can't delegate; if it reads the cluster itself, the
+# delegated_to check still fails, since no child ran.
+#
+# TRANSPORT: inject only (the [bench:profile] directive), against a
+# `spec.mode: next` install with the profile dispatcher on and the `cluster`
+# profile enabled.
+id: profile-delegates-a-read-and-uses-it
+name: A delegating profile hands a cluster read to the cluster agent, waits, and answers from its result
+delegating_profile: true
+prompt: >-
+  [bench:profile name={{BENCH_DELEGATING_PROFILE}} project={{AGENT_CLUSTER_PROJECT}}
+  location={{AGENT_CLUSTER_LOCATION}} cluster={{AGENT_CLUSTER_NAME}}]
+  Use your delegate tool to hand this to the cluster agent: list the namespaces
+  of the GKE cluster {{AGENT_CLUSTER_NAME}} (project {{AGENT_CLUSTER_PROJECT}},
+  location {{AGENT_CLUSTER_LOCATION}}), names only. Do not read the cluster
+  yourself. When its report arrives, answer with how many namespaces there are
+  and name kubeagents-system among them if it is there.
+expected_output: >-
+  The task delegates the listing to the cluster agent and does not read the
+  cluster itself. Its answer comes from the cluster agent's report: it gives a
+  namespace count for that cluster and says kubeagents-system is among them.
+  It does not say it is still waiting, and does not invent namespaces the
+  report did not list.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: incident-triage
+
+owner: bnaylor
+
+verification_spec:
+  - name: the-profile-task-delegates-to-the-cluster-agent
+    role: objective
+    mode: assert
+    check:
+      type: delegated_to
+      required_addressees: ["cluster"]

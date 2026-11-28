@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"io"
 	"log/slog"
 	"net"
@@ -389,5 +390,18 @@ func TestDelegateMCPForwardsABatch(t *testing.T) {
 	reqs := got()
 	if len(reqs) != 1 || len(reqs[0].Tasks) != 2 || reqs[0].Tasks[0].Parameters["cluster"] != "dev" || reqs[0].Tasks[1].Text != "b" {
 		t.Fatalf("adapter got %+v", reqs)
+	}
+}
+
+// The delegate server's name is one name in two places: the worker serves
+// and wires it as DelegateMCPServer, a literal here that the integration
+// contract test reads, and the persona render reserves it and renders the
+// profile tool under it as persona.DelegateServer (persona.ReservedServer).
+// Apart, a persona could declare a server the worker treats as its own, or
+// a profile's tool would render under a name the worker doesn't serve.
+func TestTheDelegateServerNameIsThePersonasReservedName(t *testing.T) {
+	if DelegateMCPServer != persona.DelegateServer || persona.DelegateServer != persona.ReservedServer {
+		t.Fatalf("DelegateMCPServer %q, persona.DelegateServer %q, persona.ReservedServer %q: want one name",
+			DelegateMCPServer, persona.DelegateServer, persona.ReservedServer)
 	}
 }
