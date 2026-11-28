@@ -598,5 +598,95 @@ class KubeDnsAutoscalingDiagnosticsTest(unittest.TestCase):
                 self.assertIn(expected, content, f"{rel} missing {expected!r}")
 
 
+class PlatformWorkloadTroubleshootingBatchingTest(unittest.TestCase):
+    """Pins #3226 batched read-only shell fallback and gke MCP preference."""
+
+    def test_platform_gke_workload_troubleshooting_prefers_gke_mcp_and_batches_cli(self):
+        import re
+
+        skill = (
+            REPO_ROOT / "agents/platform/skills/gke-workload-troubleshooting/SKILL.md"
+        ).read_text(encoding="utf-8")
+        flat = " ".join(skill.split())
+        defaults = yaml.safe_load(
+            (REPO_ROOT / "deploy/shared/defaults/config.yaml").read_text(encoding="utf-8")
+        )
+        offered_gke_tools = set(defaults["mcp_servers"]["gke"]["tools"]["include"])
+        expected_mcp_tools = {
+            "get_k8s_resource",
+            "describe_k8s_resource",
+            "get_k8s_logs",
+            "list_k8s_events",
+        }
+        self.assertLessEqual(expected_mcp_tools, offered_gke_tools)
+
+        mcp_header = re.search(
+            r"^> \*\*MCP Tools:\*\*(.*(?:\n>[^\n]*\S[^\n]*)*)", skill, re.MULTILINE
+        )
+        self.assertIsNotNone(mcp_header, "missing > **MCP Tools:** blockquote")
+        listed_tools = {
+            tok.rpartition(":")[2]
+            for tok in re.findall(r"`([^`\s]+)`", mcp_header.group(1))
+        }
+        self.assertEqual(listed_tools, expected_mcp_tools)
+
+        kubeconfig_export = (
+            'export KUBECONFIG="$HERMES_HOME/.kubeconfigs/'
+            'kubeconfig_{project_id}_{cluster_name}_{cluster_location}.yaml"'
+        )
+        for expected in (
+            'parent="projects/{project_id}/locations/{cluster_location}/clusters/{cluster_name}"',
+            "without running `gcloud container clusters get-credentials`",
+            "parallel tool calls in a single turn",
+            "batch independent read-only commands",
+            "per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/`",
+            "one compound `terminal` call",
+            kubeconfig_export,
+            "kubectl logs {pod_name} -n {workload_namespace} --all-containers --tail=100 || true",
+            "kubectl logs {pod_name} -n {workload_namespace} --all-containers -p --tail=100 || true",
+        ):
+            self.assertIn(expected, flat)
+
+        step0 = skill[skill.index("### Step 0:") : skill.index("### Step 1:")]
+        step1 = skill[skill.index("### Step 1:") : skill.index("### Step 2:")]
+        step2 = skill[skill.index("### Step 2:") : skill.index("### Step 3:")]
+        step3 = skill[skill.index("### Step 3:") : skill.index("### Step 4:")]
+        step4 = skill[skill.index("### Step 4:") : skill.index("### Step 5:")]
+
+        for name, section in (
+            ("Step 0", step0),
+            ("Step 1", step1),
+            ("Step 2", step2),
+            ("Step 3", step3),
+            ("Step 4", step4),
+        ):
+            self.assertIn(kubeconfig_export, section, f"{name} missing per-target KUBECONFIG export")
+
+        self.assertIn("describe_k8s_resource(", step1)
+        self.assertIn("get_k8s_resource(", step1)
+        self.assertIn('resourceType="pod"', step1)
+        self.assertIn('outputFormat="yaml"', step1)
+        self.assertIn("list_k8s_events(", step1)
+        self.assertIn("DEPLOY_JSON=$(kubectl get deploy/{workload_name}", step1)
+        self.assertEqual(step1.count("kubectl get deploy"), 1)
+        for col in (
+            "READY:.status.containerStatuses[*].ready",
+            "WAITING:.status.containerStatuses[*].state.waiting.reason",
+            "TERM:.status.containerStatuses[*].state.terminated.reason",
+            "LAST_TERM:.status.containerStatuses[*].lastState.terminated.reason",
+            "EXIT:.status.containerStatuses[*].lastState.terminated.exitCode",
+            "INIT:.status.initContainerStatuses[*].state.waiting.reason",
+        ):
+            self.assertIn(col, step1)
+
+        self.assertIn("list_k8s_events(", step2)
+        self.assertIn("describe_k8s_resource(", step2)
+        self.assertIn("get_k8s_logs(", step3)
+        self.assertIn("allContainers=true", step3)
+        self.assertIn('container="{container_name}", previous=true', step3)
+        self.assertIn('resourceType="endpoints"', step4)
+        self.assertIn('resourceType="networkpolicy", namespace="{workload_namespace}", outputFormat="yaml"', step4)
+
+
 if __name__ == "__main__":
     unittest.main()

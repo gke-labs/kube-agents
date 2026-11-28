@@ -1,0 +1,112 @@
+# Skill-guidance probe for agents/platform/skills/gke-workload-troubleshooting:
+# Steps 1-4 prefer the read-only gke MCP tools (get_k8s_resource,
+# describe_k8s_resource, get_k8s_logs, list_k8s_events) in parallel and batch
+# independent read-only CLI fallback commands into one compound terminal call
+# instead of sequential single-command kubectl/gcloud turns (#3226).
+#
+# On main without the overlay patch, agents/platform/skills/gke-workload-troubleshooting/SKILL.md
+# names only sequential kubectl and gcloud commands and requires
+# `gcloud container clusters get-credentials` up front, with no mention of the
+# four gke MCP read tools or batched/parallel calls.
+#
+# The prompt names neither the MCP tools nor parallel/batched execution, so the
+# agent cannot copy the answer from the prompt; it must load the installed
+# gke-workload-troubleshooting skill and report strictly what the skill itself
+# prescribes.
+#
+# bench/tests/test_workload_troubleshooting_mcp_batching_verdict.py pins the
+# deterministic regexes in both directions.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: workload-troubleshooting-mcp-batching-probe
+name: Platform workload troubleshooting skill prefers gke MCP read tools in parallel and batches CLI fallbacks
+
+owner: fkc1e100
+domain: cluster-debugging
+
+fixtures: []
+
+prompt: >-
+  A Deployment billing-worker in namespace payments on an unmanaged GKE cluster
+  staging-eu-1 (europe-west4, project acme-prod, no Cluster Agent profile) is
+  in CrashLoopBackOff and logs egress connection timeouts to ledger-db in
+  namespace core. Load the installed gke-workload-troubleshooting skill and
+  answer strictly from what that skill itself prescribes for Steps 0 through 4
+  -- do not run live cluster commands, do not search documentation, and do not
+  add tools or commands that are not written in that skill. If you hand this
+  question to another agent, pass these instructions word for word and keep its
+  lines verbatim in your reply. Start your answer with exactly two lines, one
+  per line: first "STEP-1-TO-4-TOOLS: " followed by a comma-separated list of
+  every tool or CLI program the skill names for Steps 1 through 4; second
+  "CALL-PATTERN: " followed by one sentence stating how the skill says to
+  invoke independent reads across Steps 1 through 4. Then briefly summarize the
+  Steps 1 through 4 diagnostic calls and how Step 0 handles credentials. Do not
+  apply anything.
+expected_output: >-
+  The answer loads the installed gke-workload-troubleshooting skill and reports
+  what Steps 0 through 4 prescribe. STEP-1-TO-4-TOOLS lists the four read-only
+  gke MCP tools (get_k8s_resource, describe_k8s_resource, get_k8s_logs,
+  list_k8s_events) along with the kubectl and gcloud CLI fallbacks (and no
+  mutating write tools). CALL-PATTERN states that independent gke MCP reads are
+  emitted as parallel tool calls in a single turn, and that CLI fallback reads
+  are batched into one compound terminal call instead of sequential
+  single-command turns. Step 0 notes that gke MCP reads take the cluster parent
+  path directly without running gcloud container clusters get-credentials,
+  which is needed only for the CLI fallback (with a per-target KUBECONFIG).
+infrastructure:
+  deployer: noop
+validated: true
+
+verification_spec:
+  - name: skill-names-preferred-gke-mcp-read-tools
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # Under fold_decoration=true, ReportContainsVerifier folds inner
+      # underscores to hyphens (get_k8s_resource -> get-k8s-resource) and
+      # strips double-underscore runs (mcp__gke__get_k8s_resource ->
+      # mcpgkeget-k8s-resource).
+      required_patterns:
+        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])get-k8s-resource\\b"
+        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])describe-k8s-resource\\b"
+        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])get-k8s-logs\\b"
+        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])list-k8s-events\\b"
+      forbidden_patterns:
+        - "(?m)^step-1-to-4-tools:.*(?:[\\s,:(\\[\"'/.-]|mcpgke|gke[-:.])(?:apply-k8s-manifest|patch-k8s-resource|delete-k8s-resource|create-cluster|update-cluster|create-node-pool|update-node-pool|cancel-operation)\\b"
+      fold_decoration: true
+  - name: skill-prescribes-parallel-mcp-and-batched-cli
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - "(?m)^call-pattern:.*\\b(?:parallel|same turn|single turn|one turn)\\b"
+        - "(?m)^call-pattern:.*\\b(?:batch(?:ed|ing)?|compound|single\\s+(?:compound\\s+)?(?:shell|terminal)|one\\s+(?:compound\\s+)?(?:shell|terminal))\\b"
+      forbidden_patterns:
+        - "(?m)^call-pattern:.*\\b(?:not|no|never|neither|nor|does\\s+not|doesn't|do\\s+not|don't|cannot|can't)\\b(?:(?!\\bbut\\b)[^,.;()—–\\n]){0,50}\\b(?:parallel|batch(?:ed|ing)?|compound)\\b"
+        - "(?m)^call-pattern:.*\\b(?:without\\s+(?:any\\s+|using\\s+|running\\s+)?|(?:rather\\s+than|instead\\s+of)\\s+(?:in\\s+)?)(?:parallel|batch(?:ed|ing)?|compound)\\b"
+      fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]
