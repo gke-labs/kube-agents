@@ -17,26 +17,47 @@
 
 The class names a reservation that does not exist. Its shape was chosen so
 that the stockout audit files exactly one finding on it, the status that GKE
-writes. These tests ask the collectors themselves, with the class as GKE holds
-it, so a change of a check that adds a second finding on the fixture, or that
-drops the one, fails here and not on a pool project.
+writes, under the reservation check (`reservation-mismatch-risk`). These tests
+ask the collectors themselves, with the class as GKE holds it, so a change of
+a check that adds a second finding on the fixture, or that drops the one,
+fails here and not on a pool project.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts"
 # Slot c's other class as GKE reports it, captured live: `general-ccc`.
 GENERAL_CAPTURE = SCRIPTS / "testdata" / "computeclass_taint_missing.json"
+# The case that grades the stockout finding on the class, and its check.
+CASE_FILE = REPO_ROOT / "bench" / "tasks" / "stockout-pinned-pool" / "task.yaml"
+CASE_CHECK = "a-reservation-finding-was-filed-against-the-class-with-no-reservation"
+# The case's check that the class is not filed under the class-status check.
+CASE_MOVE_CHECK = "the-class-with-no-reservation-is-not-filed-as-a-broken-class"
+# A project ID of the longest length, which makes the finding id longer than
+# the ledger's limit, so the id is shortened.
+LONGEST_PROJECT = "p" * 30
+ROLE = "missing-reservation-compute-class"
+# The stockout check that files the class, and the check that files a class
+# which GKE reports for another cause (slot c's `general-ccc`).
+RESERVATION_CHECK = "reservation-mismatch-risk"
+CLASS_STATUS_CHECK = "dangling-compute-class"
+CLASS_OBJECT = "ComputeClass/reserved-ccc"
 
 sys.path.insert(0, str(SCRIPTS))
 
+import audit_report  # noqa: E402
 import collect  # noqa: E402
 import fleet_stockout  # noqa: E402
 
@@ -69,6 +90,9 @@ RESERVED = {
 }
 # Slot c's one node pool: the class label of `general-ccc`, and no taint.
 DEFAULT_POOL = {"name": "default-pool", "config": {"machineType": "e2-standard-2", "labels": {"cloud.google.com/compute-class": "general-ccc"}}}
+# Slot c as the stockout collector gets it from the cluster list: one zone.
+PROJECT = "acme"
+SLOT_C = {"name": "seeded-c", "project": PROJECT, "location": "us-central1-a", "autopilot": False, "locations": ["us-central1-a"]}
 # The same pool as the obtainability audit reads it: running, autoscaling on.
 SLOT_C_POOL = {**DEFAULT_POOL, "status": "RUNNING", "autoscaling": {"enabled": True, "minNodeCount": 1, "maxNodeCount": 1}}
 # Slot c's Deployment with no class selector (role untargeted-compute-class-workload).
@@ -87,26 +111,99 @@ def _reserved(**spec) -> dict:
     return changed
 
 
+def _collected(*classes: dict) -> dict:
+    """The stockout collector's entry for slot c with these classes and the
+    slot's one node pool. The reads are answered here; no command runs."""
+
+    def run(argv, **_):
+        if argv[:3] == ["kubectl", "get", fleet_stockout.COMPUTECLASS_KIND]:
+            return fleet_stockout.Run(argv, 0, json.dumps({"items": list(classes)}), "", 0.0)
+        if argv[:2] == ["kubectl", "get"]:
+            return fleet_stockout.Run(argv, 0, json.dumps({"items": []}), "", 0.0)
+        if argv[:3] == ["gcloud", "container", "node-pools"]:
+            return fleet_stockout.Run(argv, 0, json.dumps([DEFAULT_POOL]), "", 0.0)
+        return fleet_stockout.Run(argv, 0, "", "", 0.0)
+
+    with TemporaryDirectory() as tmp, patch.object(fleet_stockout, "KUBECONFIG_DIR", Path(tmp)):
+        return fleet_stockout.collect_cluster(SLOT_C, run=run)
+
+
+def _filed_on_the_class(entry: dict) -> list[dict]:
+    return [candidate for candidate in entry["candidates"] if candidate["object"] == CLASS_OBJECT]
+
+
 class StockoutFindingsTest(unittest.TestCase):
-    def test_the_status_of_the_class_is_one_finding_with_the_reservation_in_its_text(self):
-        hit = fleet_stockout.check_compute_class_status(RESERVED)
-        self.assertEqual(hit["object"], "ComputeClass/reserved-ccc")
+    def test_the_collector_files_one_finding_on_the_class_under_the_reservation_check(self):
+        general = json.loads(GENERAL_CAPTURE.read_text(encoding="utf-8"))
+        entry = _collected(general, RESERVED)
+        [hit] = _filed_on_the_class(entry)
+        self.assertEqual(hit["check"], RESERVATION_CHECK)
         self.assertIn("CrdMisconfigured", hit["excerpt"])
         self.assertIn("ReservationNotFound", hit["excerpt"])
         self.assertIn("seeded-absent-reservation", hit["excerpt"])
+        # GKE named the reservation, so the fleet step gets no rule to compare.
+        self.assertNotIn(fleet_stockout.RESERVED_CLASSES_KEY, entry)
 
     def test_the_two_classes_of_slot_c_each_get_their_own_finding(self):
         general = json.loads(GENERAL_CAPTURE.read_text(encoding="utf-8"))
-        hits = [fleet_stockout.check_compute_class_status(cc) for cc in (general, RESERVED)]
-        self.assertEqual([hit["object"] for hit in hits], ["ComputeClass/general-ccc", "ComputeClass/reserved-ccc"])
-        self.assertNotIn("ReservationNotFound", hits[0]["excerpt"])
-        self.assertNotEqual(hits[0]["excerpt"], hits[1]["excerpt"])
+        entry = _collected(general, RESERVED)
+        filed = sorted((c["check"], c["object"]) for c in entry["candidates"] if c["check"] in (CLASS_STATUS_CHECK, RESERVATION_CHECK))
+        self.assertEqual(filed, [(CLASS_STATUS_CHECK, "ComputeClass/general-ccc"), (RESERVATION_CHECK, CLASS_OBJECT)])
 
-    def test_a_class_with_no_status_yet_is_not_judged(self):
-        # The minutes after the plant: GKE did not write the status yet.
+    def test_a_class_with_no_status_yet_is_filed_by_the_comparison(self):
+        # The minutes after the plant: GKE did not write the status yet. The
+        # fleet step then compares the rule with the project's reservations.
         young = copy.deepcopy(RESERVED)
         del young["status"]
-        self.assertIsNone(fleet_stockout.check_compute_class_status(young))
+        entry = _collected(young)
+        self.assertEqual(_filed_on_the_class(entry), [])
+        fleet_stockout.file_reserved_classes(entry, {PROJECT: {}}, frozenset({PROJECT}))
+        [hit] = _filed_on_the_class(entry)
+        self.assertEqual(hit["check"], RESERVATION_CHECK)
+        # The rule names no zone, so the comparison is in the slot's one zone.
+        self.assertEqual(
+            hit["excerpt"],
+            "priority 1: reservations.affinity=Specific; reservation seeded-absent-reservation, "
+            "compared in cluster zones us-central1-a: found in no zone of project acme",
+        )
+
+    def test_the_case_check_names_the_collectors_check_and_object(self):
+        # The case `stockout-pinned-pool` grades the finding. The phrase is in
+        # the case file and the object is in the collector; this joins the two.
+        case = yaml.safe_load(CASE_FILE.read_text(encoding="utf-8"))
+        [check] = [c["check"] for c in case["verification_spec"] if c.get("name") == CASE_CHECK]
+        [hit] = _filed_on_the_class(_collected(RESERVED))
+        self.assertIn(ROLE, case["fixtures"])
+        self.assertEqual(check["scope"], "finding")
+        self.assertEqual(check["finding_check"], hit["check"])
+        self.assertEqual(check["required_phrases"], [hit["object"]])
+
+    def test_the_case_s_second_check_fails_on_the_class_status_id_only(self):
+        # The pattern is in the case file, and the id is derived in
+        # `audit_report.py` from the collector's check and object. This joins
+        # them, as the bench check reads them: lowercase ids, one on each line.
+        case = yaml.safe_load(CASE_FILE.read_text(encoding="utf-8"))
+        [check] = [c["check"] for c in case["verification_spec"] if c.get("name") == CASE_MOVE_CHECK]
+        self.assertEqual(check["scope"], "finding_ids")
+        [pattern] = check["forbidden_patterns"]
+        general = json.loads(GENERAL_CAPTURE.read_text(encoding="utf-8"))
+
+        def ids(entry: dict, candidates: list[dict]) -> str:
+            return "\n".join(audit_report.published_id({**c, "cluster": entry["name"]}) for c in candidates).lower()
+
+        for project in (PROJECT, LONGEST_PROJECT):
+            with self.subTest(project=project), patch.dict(SLOT_C, {"project": project}):
+                entry = _collected(general, RESERVED)
+                # What the collector files on slot c: the reservation finding
+                # on the class, and the class-status finding on `general-ccc`.
+                self.assertNotRegex(ids(entry, entry["candidates"]), re.compile(pattern, re.IGNORECASE))
+                # The class-status hit on the class, which the collector files
+                # when it does not file the status under the reservation check.
+                status_hit = {**fleet_stockout.check_compute_class_status(RESERVED), "check": CLASS_STATUS_CHECK}
+                self.assertEqual(status_hit["object"], CLASS_OBJECT)
+                self.assertRegex(ids(entry, [status_hit]), re.compile(pattern, re.IGNORECASE))
+                shortened = len(audit_report.derive_finding_id({**status_hit, "cluster": entry["name"]})) > audit_report.MAX_FINDING_ID
+                self.assertEqual(shortened, project == LONGEST_PROJECT)
 
     def test_the_second_rule_is_a_fallback_for_each_zone_count(self):
         # A machine type of another family and another size: the two rules
@@ -132,7 +229,7 @@ class StockoutFindingsTest(unittest.TestCase):
     def test_with_auto_creation_on_the_class_is_not_an_unbacked_manual_class(self):
         self.assertIsNone(fleet_stockout.check_ccc_unbacked_manual_fallback(RESERVED, [DEFAULT_POOL]))
 
-    def test_with_auto_creation_off_the_class_gets_a_second_finding(self):
+    def test_with_auto_creation_off_the_class_gets_the_manual_fallback_finding_too(self):
         # Why the stack has auto-creation on in this class.
         off = _reserved(nodePoolAutoCreation={"enabled": False})
         hit = fleet_stockout.check_ccc_unbacked_manual_fallback(off, [DEFAULT_POOL])
@@ -144,8 +241,8 @@ class StockoutFindingsTest(unittest.TestCase):
         self.assertIsNone(fleet_stockout.check_ccc_priority_starvation(RESERVED))
         self.assertIsNone(fleet_stockout.check_ccc_mixed_disk_generations(RESERVED, stateful_referencing=False))
         self.assertIsNone(fleet_stockout.check_ccc_hyperdisk_incompatible(RESERVED, uses_hyperdisk=False))
-        # The reservation check of the class loop files only an affinity that
-        # goes round the rules of the class. `Specific` is not one.
+        # 3.10(a) files only an affinity that goes round the rules of the
+        # class. `Specific` is not one.
         self.assertIsNone(fleet_stockout.check_reservation_affinity(RESERVED))
 
 

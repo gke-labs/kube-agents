@@ -3379,7 +3379,10 @@ UNCORROBORATED_FINDINGS_KEY = "uncorroborated_findings"
 # marker keeps a `manifest` the model wrote anyway out of the sweep. The
 # stockout collector also sets `class-status` on a §3.12(b) finding, a
 # ComputeClass that GKE reports misconfigured: the fix taints or relabels a
-# node pool, which decides where every other Pod on it can schedule. The
+# node pool, which decides where every other Pod on it can schedule. It sets
+# `reserved-class` on a §3.10(b) finding, a ComputeClass rule whose named
+# reservation is missing: one fix is a new reservation, which is billed, and
+# the other fix changes the reservation rule of the class. The
 # compliance collector sets `default-deny` on every §2.6 finding: each arm's
 # fix leaves the namespace denying ingress by default, which drops every
 # connection no allow rule names until the team writes those rules. The
@@ -3399,6 +3402,7 @@ TRIAGE_REASONS = {
     "new-computeclass": "needs a new ComputeClass and a workload that selects it",
     "class-status": "changes a node pool or a ComputeClass, and the audit did not read what else runs on that pool",
     "reserved-pool": "creates a billed reservation or replaces the node pool",
+    "reserved-class": "creates a billed reservation or changes the reservation rule of the ComputeClass",
     "autopilot-bumped": "is graded `major` by the Autopilot bump, not by its saving",
     "scale-to-zero": "scales the controller to zero replicas",
     "guaranteed-qos": "resizes a `Guaranteed` pod, whose request is also its limit",

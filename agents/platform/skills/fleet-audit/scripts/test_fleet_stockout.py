@@ -858,6 +858,122 @@ class DanglingComputeClassTest(unittest.TestCase):
         excerpt = fs.check_compute_class_status(self.class_with_status(long_message))["excerpt"]
         self.assertLess(len(excerpt), 300)
 
+    # The conditions of two classes on a throwaway cluster (GKE
+    # 1.35.8-gke.1796000) on 2026-11-24, with the names replaced. The first
+    # class: node pool auto-creation on, and the first rule names a
+    # reservation that does not exist. The tests below put its condition on
+    # `general-ccc`, which has another spec: the status checks do not read
+    # the spec. tests/test_fleet_reserved_ccc_findings.py has the class with
+    # the spec that GKE reports it for. The pair of this condition with
+    # `TAINT_MISSING` is made by hand; no read holds the two together.
+    RESERVATION_NOT_FOUND = (
+        "CrdMisconfigured", "True", "ReservationNotFound",
+        'Reservation "acme/no-such-reservation" either does not exist or not accessible.',
+    )
+    # The second class: the same rule, auto-creation off and no matching node
+    # pool. GKE does not name the reservation here.
+    NO_MATCHING_POOL = (
+        "CrdMisconfigured", "True", "NapDisabledAndNoMatchingNodegroups",
+        "Crd with NAP disabled should have at least one matching nodepool with autoscaling enabled.",
+    )
+    RESERVATION_EXCERPT = (
+        "status condition CrdMisconfigured is True (ReservationNotFound): "
+        'Reservation "acme/no-such-reservation" either does not exist or not accessible.'
+    )
+
+    def test_a_reservation_that_gke_does_not_find_is_a_reservation_hit(self):
+        """SOP 3.10(b), from GKE's own verdict on the class."""
+        hit = fs.check_class_reservation_status(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))
+        self.assertEqual(hit["object"], "ComputeClass/general-ccc")
+        self.assertEqual(hit["excerpt"], self.RESERVATION_EXCERPT)
+        self.assertEqual(hit["severity"], "critical")
+        self.assertEqual(hit["impact"], fs.CLASS_RESERVATION_NOT_FOUND_IMPACT)
+        # The sweep opens no pull request for it, under the marker of this
+        # form: a fix can be a new reservation, which is billed.
+        self.assertEqual(hit["needs_triage"], fs.RESERVED_CLASS_TRIAGE)
+        self.assertIn(fs.RESERVED_CLASS_TRIAGE, audit_report.NO_SWEEP_TRIAGE)
+
+    def test_the_ledger_gives_the_reason_of_the_reservation_marker(self):
+        """The row of a 3.10(b) finding in the ledger's "fix needs a decision"
+        block names the billed reservation. It names no node pool: the fix of
+        a class rule changes none."""
+        marker = fs.check_class_reservation_status(self.class_with_status(self.RESERVATION_NOT_FOUND))["needs_triage"]
+        finding = {"id": "f1", "title": "ComputeClass general-ccc names a reservation that does not exist"}
+        rows = audit_report._render_withheld([], [finding], needs_triage=["f1"], triage_reasons={"f1": marker})
+        [row] = [line for line in rows if line.startswith("- `f1`")]
+        self.assertIn(f"(`{marker}`: the fix creates a billed reservation or changes the reservation rule of the ComputeClass)", row)
+        self.assertNotIn("node pool", row)
+
+    def test_the_two_reservation_sentences_name_the_setting_that_decides_the_wait(self):
+        """The collector does not read `whenUnsatisfiable`, so the sentence
+        must not say that the workloads wait for each value of it."""
+        for impact in (fs.CLASS_RESERVATION_NOT_FOUND_IMPACT, fs.CLASS_RESERVATION_MISSING_IMPACT):
+            with self.subTest(impact=impact):
+                self.assertIn("they wait, unless the class sets `whenUnsatisfiable: ScaleUpAnyway`", impact)
+
+    def test_other_conditions_are_not_a_reservation_hit(self):
+        for conditions in (
+            (self.TAINT_MISSING, self.NOT_HEALTHY),
+            (self.NO_MATCHING_POOL, self.NOT_HEALTHY),
+            (("CrdMisconfigured", "False", "ReservationNotFound", ""),),
+            # `Health` is the summary; it does not name a reservation.
+            (("Health", "False", "ReservationNotFound", "Crd is not healthy."),),
+            (),
+        ):
+            with self.subTest(conditions=conditions):
+                self.assertIsNone(fs.check_class_reservation_status(self.class_with_status(*conditions)))
+        self.assertIsNone(fs.check_class_reservation_status(compute_class("cc1", [{"machineFamily": "n4"}])))
+        self.assertIsNone(fs.check_class_reservation_status({**compute_class("cc1", []), "status": {"conditions": ["junk", None]}}))
+
+    def test_one_fault_is_one_finding(self):
+        """`Health` at False is the summary of the reservation fault when no
+        other condition says that the class is misconfigured."""
+        only_reservation = self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY)
+        self.assertIsNone(fs.check_compute_class_status(only_reservation, reservation_filed=True))
+        both = self.class_with_status(self.RESERVATION_NOT_FOUND, self.TAINT_MISSING, self.NOT_HEALTHY)
+        excerpt = fs.check_compute_class_status(both, reservation_filed=True)["excerpt"]
+        self.assertIn("(TaintMissing)", excerpt)
+        self.assertIn("status condition Health is False", excerpt)
+        self.assertNotIn("ReservationNotFound", excerpt)
+
+    def test_a_reservation_fault_that_was_not_filed_stays_in_the_status_hit(self):
+        """A non-production class: 3.10 does not flag it, and 3.12(b) reports
+        the class as it did before."""
+        excerpt = fs.check_compute_class_status(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))["excerpt"]
+        self.assertEqual(excerpt, f"{self.RESERVATION_EXCERPT}; status condition Health is False (Health): Crd is not healthy.")
+
+    def test_a_class_with_auto_creation_off_is_a_status_hit_and_no_reservation_hit(self):
+        cc = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
+        self.assertIsNone(fs.check_class_reservation_status(cc))
+        self.assertIn("(NapDisabledAndNoMatchingNodegroups)", fs.check_compute_class_status(cc, reservation_filed=False)["excerpt"])
+
+    def filed_for_class(self, cc):
+        entry = CollectClusterTest().run_with(dump_items=[cc])
+        name = f"ComputeClass/{cc['metadata']['name']}"
+        return [c for c in entry["candidates"] if c["object"] == name and c["check"] in ("dangling-compute-class", "reservation-mismatch-risk")]
+
+    def test_the_collector_files_the_reservation_fault_under_the_reservation_check(self):
+        [candidate] = self.filed_for_class(self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY))
+        self.assertEqual((candidate["check"], candidate["severity"]), ("reservation-mismatch-risk", "critical"))
+        self.assertEqual(candidate["excerpt"], self.RESERVATION_EXCERPT)
+        self.assertTrue(candidate["impact_authoritative"])
+        # Stamped with the read of the classes.
+        self.assertIn("kubectl get", candidate["command"])
+
+    def test_the_collector_keeps_the_status_finding_for_the_other_conditions(self):
+        both = self.class_with_status(self.RESERVATION_NOT_FOUND, self.TAINT_MISSING, self.NOT_HEALTHY)
+        self.assertEqual(sorted(c["check"] for c in self.filed_for_class(both)), ["dangling-compute-class", "reservation-mismatch-risk"])
+        off = self.class_with_status(self.NO_MATCHING_POOL, self.NOT_HEALTHY)
+        self.assertEqual([c["check"] for c in self.filed_for_class(off)], ["dangling-compute-class"])
+
+    def test_a_non_production_class_keeps_the_status_finding_only(self):
+        """§3.10 does not flag non-production."""
+        cc = self.class_with_status(self.RESERVATION_NOT_FOUND, self.NOT_HEALTHY)
+        cc["metadata"]["name"] = "dev-ccc"
+        [candidate] = self.filed_for_class(cc)
+        self.assertEqual(candidate["check"], "dangling-compute-class")
+        self.assertIn("(ReservationNotFound)", candidate["excerpt"])
+
     def test_the_collector_files_the_class_and_stamps_the_read(self):
         cc = self.class_with_status(self.TAINT_MISSING, self.NOT_HEALTHY)
         for pools_rc in (0, 1):
@@ -4218,7 +4334,11 @@ class ReservedPoolTest(unittest.TestCase):
         self.assertEqual(entry["candidates"], [])
         self.assertNotIn("checks_unevaluated", entry)
         self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
-        self.assertIn("owner project is not a project ID of this run: shared (project host)", entry["limitations"])
+        self.assertEqual(
+            entry["limitations"],
+            "reservation-mismatch-risk did not compare these node pools with the reservation they name, because its "
+            "owner project is not a project ID of this run: shared (project host)",
+        )
 
     def test_one_of_two_named_reservations_in_a_zone_is_enough(self):
         entry = self.filed(reserved_node_pool("two", "r1,r2"), reservations=[listed_reservation("r2", "us-central1-c")])
@@ -4270,7 +4390,11 @@ class ReservedPoolTest(unittest.TestCase):
         )
         self.assertEqual([c["object"] for c in entry["candidates"]], ["NodePool/res-missing"])
         self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG, "spot-scarcity-risk"])
-        self.assertIn("were not read in this run: shared (project host)", entry["checks_unevaluated"][0]["reason"])
+        self.assertEqual(
+            entry["checks_unevaluated"][0]["reason"],
+            "these node pools consume only a named reservation, and the reservations of its owner project were not "
+            "read in this run: shared (project host)",
+        )
         self.assertEqual(entry["commands"], [])
         self.assertTrue(entry["limitations"].startswith("an earlier limitation; reservation-mismatch-risk could not be judged: "))
 
@@ -4379,6 +4503,549 @@ class ReservedPoolTest(unittest.TestCase):
         claimed["checks_run"].append({"check": self.SLUG, "command": "kubectl get computeclasses -A -o json"})
         with self.assertRaises(audit_report.ValidationError):
             audit_report.cross_check_manifest(data, manifest)
+
+
+class ReservedClassTest(unittest.TestCase):
+    """§3.10(b), the part that GKE's status does not report: a ComputeClass
+    rule with `affinity: Specific` whose named reservations exist in no zone
+    in which the rule can use them. A throwaway cluster (GKE
+    1.35.8-gke.1796000) accepted on 2026-11-24 a rule of this affinity that
+    names a reservation and no zone. No read holds a rule with zones. The
+    field `reservations.specific[].zones` is from the `gke-compute-classes`
+    reference and its templates, and `location.zones` is the other zone field
+    of a rule. The tests with zones show what the collector does with each
+    field. They do not show that GKE accepts the rule."""
+
+    SLUG = "reservation-mismatch-risk"
+    CLASSES_COMMAND = "kubectl get computeclasses"
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    A, B, C, F = "us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"
+
+    @staticmethod
+    def in_zones(name, *zones):
+        """A reservation with the zones of its own `specific[]` item."""
+        return {"name": name, "zones": list(zones)}
+
+    @staticmethod
+    def rule(*reservations, zones=None, machine_type="n2-standard-2"):
+        """One priority rule. A reservation is a name, `owner/name`, or the
+        item as the rule holds it."""
+        specific = [
+            r if isinstance(r, dict) else {"name": r.split("/")[-1], **({"project": r.split("/")[0]} if "/" in r else {})}
+            for r in reservations
+        ]
+        rule = {"machineType": machine_type, "reservations": {"affinity": "Specific", "specific": specific}}
+        if zones:
+            rule["location"] = {"zones": list(zones)}
+        return rule
+
+    def reserved_class(self, *rules, name="reserved-ccc"):
+        """Auto-creation off, and one rule below. GKE's status does not name
+        the reservation of such a class. The seeded fleet's class of this name
+        has auto-creation on, so GKE's status names its reservation."""
+        return compute_class(name, [*rules, {"machineType": "e2-standard-4"}], node_pool_auto_creation=False)
+
+    def entry(self, *classes, cluster_zones=(), **extra):
+        return {
+            "name": "acme/us-central1/c1", "project": "acme", "location": "us-central1", "outcome": "collected",
+            "commands": [{"check": self.SLUG, "command": self.CLASSES_COMMAND, "rc": 0}],
+            "candidates": [],
+            fs.RESERVED_CLASSES_KEY: [
+                {**rule, "command": self.CLASSES_COMMAND} for cc in classes for rule in fs.reserved_class_rules(cc, "acme", cluster_zones)
+            ],
+            **extra,
+        }
+
+    @staticmethod
+    def zones_read(reservations, read):
+        return {project: fs.reservation_zones([r for r in reservations if f"/projects/{project}/" in r["zone"]]) for project in read}
+
+    def filed(self, *classes, reservations=(), swept=("acme",), read=("acme",), cluster_zones=(), **extra):
+        entry = self.entry(*classes, cluster_zones=cluster_zones, **extra)
+        fs.file_reserved_classes(entry, self.zones_read(reservations, read), frozenset(swept))
+        self.assertNotIn(fs.RESERVED_CLASSES_KEY, entry)
+        return entry
+
+    def test_the_rule_that_gke_accepted_names_no_zone(self):
+        cc = self.reserved_class(self.rule("r1"))
+        self.assertEqual(fs.reserved_class_rules(cc, "acme"), [{"class": "reserved-ccc", "rule": 1, "reservations": [("acme", "r1", [], "")]}])
+
+    def test_the_zones_of_a_rule_go_to_each_reservation_with_none_of_its_own(self):
+        cc = self.reserved_class(self.rule("r1"), self.rule("host/r2", "r3", zones=(self.F, self.A)))
+        [_, second] = fs.reserved_class_rules(cc, "acme", [self.B])
+        self.assertEqual(
+            second,
+            {"class": "reserved-ccc", "rule": 2, "reservations": [("acme", "r3", [self.A, self.F], "rule"), ("host", "r2", [self.A, self.F], "rule")]},
+        )
+
+    def test_the_zones_of_a_reservation_s_own_item_come_first(self):
+        """The rule shape of the `gke-compute-classes` templates: the zones
+        are on each `specific[]` item. One rule can name each reservation in
+        another zone, so each reservation keeps its own zones."""
+        cc = self.reserved_class(self.rule(self.in_zones("r-a", self.A), self.in_zones("r-b", self.B), "r-c"))
+        [rule] = fs.reserved_class_rules(cc, "acme", [self.C, self.F])
+        self.assertEqual(
+            rule["reservations"],
+            [("acme", "r-a", [self.A], "its own"), ("acme", "r-b", [self.B], "its own"), ("acme", "r-c", [self.C, self.F], "cluster")],
+        )
+        # A rule that holds the two zone fields: the item's zones decide.
+        both = self.reserved_class(self.rule(self.in_zones("r-a", self.A), zones=(self.F,)))
+        self.assertEqual(fs.reserved_class_rules(both, "acme")[0]["reservations"], [("acme", "r-a", [self.A], "its own")])
+
+    def test_two_items_of_one_name_in_two_zones_are_two_reservations(self):
+        cc = self.reserved_class(self.rule(self.in_zones("r1", self.A), self.in_zones("r1", self.B)))
+        self.assertEqual(
+            fs.reserved_class_rules(cc, "acme")[0]["reservations"],
+            [("acme", "r1", [self.A], "its own"), ("acme", "r1", [self.B], "its own")],
+        )
+
+    def test_a_rule_with_no_zones_takes_the_cluster_s_zones(self):
+        """GKE makes a node for such a rule in a zone of the cluster."""
+        cc = self.reserved_class(self.rule("r1"), self.rule("r2", zones=(self.F,)))
+        first, second = fs.reserved_class_rules(cc, "acme", [self.B, self.A])
+        self.assertEqual(first["reservations"], [("acme", "r1", [self.A, self.B], "cluster")])
+        self.assertEqual(second["reservations"], [("acme", "r2", [self.F], "rule")])
+
+    def test_a_name_that_is_a_path_is_read_as_a_node_pool_s_value_is(self):
+        """One parser for the two paths: the owner project and the name come
+        from the path, and a part of a reservation is the reservation."""
+        cc = self.reserved_class(self.rule({"name": "projects/host/reservations/r1"}, {"name": "r2/reservationBlocks/b1"}))
+        self.assertEqual(fs.reserved_class_rules(cc, "acme")[0]["reservations"], [("acme", "r2", [], ""), ("host", "r1", [], "")])
+        # The owner in the path is not a project of the run: a limitation, and
+        # no finding that names the cluster's own project.
+        entry = self.filed(self.reserved_class(self.rule({"name": "projects/host/reservations/r1"})))
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("ComputeClass/reserved-ccc (project host)", entry["limitations"])
+
+    def test_a_reservation_outside_the_cluster_s_zones_is_a_finding(self):
+        entry = self.filed(self.reserved_class(self.rule("r1")), reservations=[listed_reservation("r1", self.F)], cluster_zones=[self.A])
+        [candidate] = entry["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; "
+            "reservation r1, compared in cluster zones us-central1-a: found only in us-central1-f of project acme",
+        )
+
+    def test_a_reservation_in_the_zone_of_its_own_item_is_not_flagged(self):
+        """The item's zone is outside the cluster's zones. The collector does
+        not know that GKE makes no node there, so it files nothing."""
+        cc = self.reserved_class(self.rule(self.in_zones("r-a", self.A)))
+        entry = self.filed(cc, reservations=[listed_reservation("r-a", self.A)], cluster_zones=[self.B, self.C])
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("limitations", entry)
+
+    def test_a_reservation_outside_the_zone_of_its_own_item_is_a_finding(self):
+        """The reservation is in a zone of the cluster, and the rule can use
+        it only in the zone that its item names."""
+        cc = self.reserved_class(self.rule(self.in_zones("r-a", self.A)))
+        entry = self.filed(cc, reservations=[listed_reservation("r-a", self.B)], cluster_zones=[self.A, self.B])
+        [candidate] = entry["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; "
+            "reservation r-a, compared in its own zones us-central1-a: found only in us-central1-b of project acme",
+        )
+
+    def test_three_items_whose_reservations_are_each_in_the_zone_of_another_item(self):
+        """The template's rule: one item for each zone. Each reservation
+        exists, in a zone of the rule, and not in the zone of its own item."""
+        rule = self.rule(self.in_zones("r-a", self.A), self.in_zones("r-b", self.B), self.in_zones("r-c", self.C))
+        zones = [self.A, self.B, self.C]
+        moved = [listed_reservation("r-a", self.B), listed_reservation("r-b", self.C), listed_reservation("r-c", self.A)]
+        [candidate] = self.filed(self.reserved_class(rule), reservations=moved, cluster_zones=zones)["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; "
+            "reservation r-a, compared in its own zones us-central1-a: found only in us-central1-b of project acme; "
+            "reservation r-b, compared in its own zones us-central1-b: found only in us-central1-c of project acme; "
+            "reservation r-c, compared in its own zones us-central1-c: found only in us-central1-a of project acme",
+        )
+        # One item whose reservation is in its zone: the rule can add a node.
+        one_in_place = [listed_reservation("r-a", self.A), listed_reservation("r-b", self.C)]
+        self.assertEqual(self.filed(self.reserved_class(rule), reservations=one_in_place, cluster_zones=zones)["candidates"], [])
+
+    def test_an_item_with_zones_beside_an_item_with_none(self):
+        cc = self.reserved_class(self.rule(self.in_zones("r-a", self.A), "r-b"))
+        elsewhere = [listed_reservation("r-a", self.F), listed_reservation("r-b", self.F)]
+        [candidate] = self.filed(cc, reservations=elsewhere, cluster_zones=[self.B])["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; "
+            "reservation r-a, compared in its own zones us-central1-a: found only in us-central1-f of project acme; "
+            "reservation r-b, compared in cluster zones us-central1-b: found only in us-central1-f of project acme",
+        )
+        # The item with no zones takes the cluster's zones, not its neighbour's.
+        neighbour = [listed_reservation("r-b", self.A)]
+        self.assertEqual(len(self.filed(cc, reservations=neighbour, cluster_zones=[self.B])["candidates"]), 1)
+        in_the_cluster = [listed_reservation("r-b", self.B)]
+        self.assertEqual(self.filed(cc, reservations=in_the_cluster, cluster_zones=[self.B])["candidates"], [])
+
+    def class_pool(self, name, zone, labelled):
+        """A node pool in one zone, with or without the label of `reserved-ccc`."""
+        return {"name": name, "locations": [zone], "config": {"labels": {"cloud.google.com/compute-class": "reserved-ccc"} if labelled else {}}}
+
+    def compared_on_a_cluster(self, **pools):
+        """The comparison for a class whose rule names `r1` and no zone, on a
+        cluster whose node locations are zone a. `r1` is in zone f."""
+        cluster = {**self.CLUSTER, "locations": [self.A]}
+        entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("r1"))], cluster=cluster, **pools)
+        zones = [zones for rule in entry.get(fs.RESERVED_CLASSES_KEY, []) for _, _, zones, _ in rule["reservations"]]
+        fs.file_reserved_classes(entry, self.zones_read([listed_reservation("r1", self.F)], ("acme",)), frozenset({"acme"}))
+        return zones, [c["object"] for c in entry["candidates"] if c["check"] == self.SLUG]
+
+    def test_a_node_pool_of_the_class_adds_its_zones_to_the_cluster_s(self):
+        """A class with auto-creation off gets its nodes from the node pools
+        that carry its label, and a pool can be in a zone that is not a node
+        location of the cluster."""
+        zones, filed = self.compared_on_a_cluster(pools=[self.class_pool("reserved-pool", self.F, labelled=True)])
+        self.assertEqual(zones, [[self.A, self.F]])
+        self.assertEqual(filed, [])
+
+    def test_a_node_pool_of_no_class_adds_no_zone(self):
+        zones, filed = self.compared_on_a_cluster(pools=[self.class_pool("other-pool", self.F, labelled=False)])
+        self.assertEqual(zones, [[self.A]])
+        self.assertEqual(filed, ["ComputeClass/reserved-ccc"])
+
+    def test_an_unread_pool_list_gives_a_rule_no_zones(self):
+        """The zones of the class's pools are not known, so the reservation
+        counts in each zone."""
+        zones, filed = self.compared_on_a_cluster(pools_rc=1)
+        self.assertEqual(zones, [[]])
+        self.assertEqual(filed, [])
+
+    def test_the_procedure_does_not_send_the_class_arm_to_a_by_hand_read(self):
+        """The collector files 3.10(b), so the procedure's by-hand list and the
+        sentence after it must not name the arm."""
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        by_hand = text.split("These sub-conditions are not in the collector")[1].split("**A cluster the collector covered")[0]
+        self.assertNotIn("3.10(b)", by_hand)
+        after = text.split("**A cluster the collector covered")[1].split("\n")[0]
+        self.assertNotIn("3.10(b)", after)
+
+    def test_the_procedure_says_how_the_collector_files_the_class_arm(self):
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        section = text.split(f"(`{self.SLUG}`)")[1].split("\n#### ")[0]
+        lines = {line.split(":**")[0]: line for line in section.splitlines() if line.startswith("- **")}
+        self.assertIn(f"the reason `{fs.CCC_RESERVATION_NOT_FOUND_REASON}`", lines["- **Flag when"])
+        self.assertIn(f"`reservations.affinity: {fs.SPECIFIC_RESERVATION_AFFINITY}`", lines["- **Flag when"])
+        # The three homes of a reservation's zones, in the collector's order.
+        homes = ("`reservations.specific[]` item", "the rule's `location.zones`", "the node pools that carry the class label")
+        places = [lines["- **Flag when"].index(home) for home in homes]
+        self.assertEqual(places, sorted(places))
+        self.assertIn("For (b) and (d) the collector writes the arm's own Impact", lines["- **Impact"])
+        self.assertIn(f"`needs_triage: {fs.RESERVED_CLASS_TRIAGE}`", lines["- **Remediation"])
+
+    def test_the_procedure_keeps_the_reservation_status_out_of_the_class_status_check(self):
+        """3.12(b) is a rule for a by-hand read too. Without the exception, a
+        class with the reason `ReservationNotFound` matches 3.12(b) and
+        3.10(b): two findings for one fault."""
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        section = text.split("(`dangling-compute-class`)")[1].split("\n#### ")[0]
+        [flag_when] = [line for line in section.splitlines() if line.startswith("- **Flag when")]
+        self.assertIn(f"a condition with the reason `{fs.CCC_RESERVATION_NOT_FOUND_REASON}` is 3.10(b) and is not flagged here", flag_when)
+
+    def test_the_procedure_names_the_four_forms_of_the_check(self):
+        text = (Path(__file__).resolve().parents[3] / "governance" / "stockout_prevention_sop.md").read_text()
+        [forms] = [line for line in text.splitlines() if f"`{self.SLUG}`'s four forms" in line]
+        self.assertIn("a ComputeClass with a `Specific` rule whose named reservation GKE reports missing", forms)
+        self.assertIn("a class that has the two gets one candidate", forms)
+
+    def test_collect_cluster_gives_the_cluster_s_zones_to_a_rule_with_none(self):
+        cluster = {**self.CLUSTER, "locations": ["us-central1-c"], "autoprovisioning_locations": ["us-central1-a"]}
+        entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("no-such-reservation"))], cluster=cluster)
+        [reserved] = entry[fs.RESERVED_CLASSES_KEY]
+        self.assertEqual(reserved["reservations"], [("acme", "no-such-reservation", ["us-central1-a", "us-central1-c"], "cluster")])
+
+    def test_other_rules_are_not_reserved(self):
+        any_affinity = self.rule("r1")
+        any_affinity["reservations"]["affinity"] = "AnyBestEffort"
+        no_names = self.rule()
+        for rules in (
+            [{"machineFamily": "n4"}],
+            [any_affinity],
+            [no_names],
+            [{"machineType": "n2-standard-2", "reservations": None}],
+            [{"machineType": "n2-standard-2", "reservations": ["junk"]}],
+            ["junk"],
+            # An item that is no map, or that has no name.
+            [{"reservations": {"affinity": "Specific", "specific": ["r1", None]}}],
+            [{"reservations": {"affinity": "Specific", "specific": [{"zones": ["us-central1-a"]}]}}],
+            # A name or a project that is not text.
+            [self.rule({"name": ["x"]})],
+            [self.rule({"name": "r1", "project": ["p"]})],
+        ):
+            with self.subTest(rules=rules):
+                self.assertEqual(fs.reserved_class_rules(compute_class("cc1", rules), "acme"), [])
+
+    def test_a_value_of_the_wrong_type_gives_no_zone(self):
+        """`location: null`, a `zones` that is text, or a list that holds
+        something else: the rule is still a reserved rule, with no zone from
+        that field. Such a value must not raise in the fleet step."""
+        for rule in (
+            {**self.rule("r1"), "location": None},
+            {**self.rule("r1"), "location": "us-central1-a"},
+            {**self.rule("r1"), "location": {"zones": "us-central1-a"}},
+            {**self.rule("r1"), "location": {"zones": ["us-central1-a", 1]}},
+            self.rule({"name": "r1", "zones": "us-central1-a"}),
+            self.rule({"name": "r1", "zones": [None]}),
+        ):
+            with self.subTest(rule=rule):
+                [reserved] = fs.reserved_class_rules(compute_class("cc1", [rule]), "acme")
+                self.assertEqual(reserved["reservations"], [("acme", "r1", [], "")])
+
+    def test_a_reservation_that_does_not_exist_is_a_critical_finding(self):
+        entry = self.filed(self.reserved_class(self.rule("no-such-reservation")))
+        [candidate] = entry["candidates"]
+        self.assertEqual((candidate["check"], candidate["object"], candidate["severity"]), (self.SLUG, "ComputeClass/reserved-ccc", "critical"))
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; reservation no-such-reservation: found in no zone of project acme",
+        )
+        self.assertEqual(candidate["impact"], fs.CLASS_RESERVATION_MISSING_IMPACT)
+        self.assertTrue(candidate["impact_authoritative"])
+        self.assertEqual(candidate["needs_triage"], fs.RESERVED_CLASS_TRIAGE)
+        self.assertEqual(candidate["command"], f"{self.CLASSES_COMMAND}; gcloud compute reservations list --project acme --format json")
+        self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertNotIn("limitations", entry)
+
+    def test_a_reservation_in_a_zone_is_enough_for_a_rule_with_no_zones(self):
+        entry = self.filed(self.reserved_class(self.rule("r1")), reservations=[listed_reservation("r1", "us-central1-f")])
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("limitations", entry)
+
+    def test_a_rule_with_zones_needs_the_reservation_in_one_of_them(self):
+        cc = self.reserved_class(self.rule("r1", zones=("us-central1-a", "us-central1-b")))
+        elsewhere = self.filed(cc, reservations=[listed_reservation("r1", "us-central1-f")])
+        [candidate] = elsewhere["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; "
+            "reservation r1, compared in rule zones us-central1-a, us-central1-b: found only in us-central1-f of project acme",
+        )
+        inside = self.filed(cc, reservations=[listed_reservation("r1", "us-central1-b")])
+        self.assertEqual(inside["candidates"], [])
+
+    def test_one_of_two_named_reservations_is_enough(self):
+        entry = self.filed(self.reserved_class(self.rule("r1", "r2")), reservations=[listed_reservation("r2", "us-central1-c")])
+        self.assertEqual(entry["candidates"], [])
+
+    def test_two_rules_of_one_class_are_one_finding(self):
+        """The second rule names a reservation of a second project of the
+        run. The command holds the read of each owner project."""
+        entry = self.filed(self.reserved_class(self.rule("r1"), self.rule("host/r2")), swept=("acme", "host"), read=("acme", "host"))
+        [candidate] = entry["candidates"]
+        self.assertEqual(
+            candidate["excerpt"],
+            "priority 1: reservations.affinity=Specific; reservation r1: found in no zone of project acme; "
+            "priority 2: reservations.affinity=Specific; reservation r2: found in no zone of project host",
+        )
+        self.assertEqual(
+            candidate["command"],
+            f"{self.CLASSES_COMMAND}; gcloud compute reservations list --project acme --format json; "
+            "gcloud compute reservations list --project host --format json",
+        )
+
+    def test_an_unread_owner_decides_before_an_owner_outside_the_run(self):
+        """One rule names a reservation of a swept project that was not read
+        and one of a project outside the run: the check is not evaluated."""
+        entry = self.filed(self.reserved_class(self.rule("host/r1", "far/r2")), swept=("acme", "host"))
+        self.assertEqual(entry["candidates"], [])
+        self.assertEqual([e["check"] for e in entry["checks_unevaluated"]], [self.SLUG])
+        self.assertIn("ComputeClass/reserved-ccc (project host)", entry["checks_unevaluated"][0]["reason"])
+        self.assertEqual(entry["commands"], [])
+
+    def test_an_owner_outside_the_run_stops_a_finding_for_the_other_name(self):
+        """The reservation that could not be compared can be the one that the
+        rule can use."""
+        entry = self.filed(self.reserved_class(self.rule("far/r2", "r1")))
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertEqual([c["check"] for c in entry["commands"]], [self.SLUG])
+        self.assertIn("ComputeClass/reserved-ccc (project far)", entry["limitations"])
+
+    def both_forms(self, name="mixed-ccc"):
+        """A production class with the affinity form (a) on its second rule
+        and a `Specific` rule that names a missing reservation."""
+        return self.reserved_class(self.rule("no-such-reservation"), {"machineType": "n2-standard-4", "reservations": {"affinity": "AnyBestEffort"}}, name=name)
+
+    AFFINITY_EXCERPT = "reservations.affinity='AnyBestEffort' bypasses this ComputeClass's priority chain"
+
+    def assert_one_candidate_with_the_two_forms(self, entry, missing_excerpt, missing_impact):
+        """One identity can hold one finding: `finish` refuses two, and takes
+        the evidence and the Impact of one candidate only."""
+        of_the_class = [c for c in entry["candidates"] if c["check"] == self.SLUG and c["object"] == "ComputeClass/mixed-ccc"]
+        self.assertEqual(len({audit_report._candidate_identity(entry, c) for c in entry["candidates"]}), len(entry["candidates"]))
+        [candidate] = of_the_class
+        self.assertEqual(candidate["excerpt"], f"{self.AFFINITY_EXCERPT}; {missing_excerpt}")
+        self.assertEqual(candidate["impact"], f"{fs.IMPACT[self.SLUG]} {missing_impact}")
+        self.assertTrue(candidate["impact_authoritative"])
+        self.assertEqual(candidate["severity"], "critical")
+        # The marker of (b) holds the sweep for the fix of (a) too.
+        self.assertEqual(candidate["needs_triage"], fs.RESERVED_CLASS_TRIAGE)
+        audit_report.validate_check_command(candidate["command"], entry["name"], self.SLUG)
+        # What `finish` publishes for the one finding: the two faults.
+        finding = {"id": "f1", "check": self.SLUG, "cluster": entry["name"], "object": "ComputeClass/mixed-ccc", "impact": "x", "evidence": {"command": "x", "excerpt": "x"}}
+        audit_report.adopt_collector_evidence([finding], {"clusters": [entry]})
+        audit_report.adopt_arm_impact([finding], {"clusters": [entry]})
+        self.assertEqual(finding["evidence"]["excerpt"], candidate["excerpt"])
+        self.assertEqual(finding["impact"], candidate["impact"])
+        return candidate
+
+    def test_a_class_with_the_affinity_form_and_the_status_form_is_one_candidate(self):
+        cc = self.both_forms()
+        cc["status"] = {"conditions": [{"type": "CrdMisconfigured", "status": "True", "reason": "ReservationNotFound", "message": "x"}]}
+        entry = CollectClusterTest.run_with(self, dump_items=[cc])
+        self.assert_one_candidate_with_the_two_forms(
+            entry, "status condition CrdMisconfigured is True (ReservationNotFound): x", fs.CLASS_RESERVATION_NOT_FOUND_IMPACT
+        )
+
+    def test_a_class_with_the_affinity_form_and_a_missing_reservation_is_one_candidate(self):
+        """The cluster step files the affinity form, and the fleet step finds
+        the missing reservation later."""
+        _, cluster = self.fleet(self.both_forms())
+        candidate = self.assert_one_candidate_with_the_two_forms(
+            cluster,
+            "priority 1: reservations.affinity=Specific; reservation no-such-reservation: found in no zone of project acme",
+            fs.CLASS_RESERVATION_MISSING_IMPACT,
+        )
+        self.assertIn("gcloud compute reservations list --project acme", candidate["command"])
+
+    def test_the_affinity_form_alone_keeps_its_own_candidate(self):
+        """No marker and the check's own Impact, so the sweep can open its fix."""
+        bypassing = compute_class("cc1", [{"machineFamily": "n4", "reservations": {"affinity": "AnyBestEffort"}}])
+        entry = CollectClusterTest.run_with(self, dump_items=[bypassing])
+        [candidate] = [c for c in entry["candidates"] if c["check"] == self.SLUG]
+        self.assertEqual((candidate["excerpt"], candidate["impact"]), (self.AFFINITY_EXCERPT, fs.IMPACT[self.SLUG]))
+        self.assertIsNone(candidate["needs_triage"])
+        self.assertNotIn("impact_authoritative", candidate)
+
+    def test_a_shared_reservation_of_a_swept_project_is_compared(self):
+        cc = self.reserved_class(self.rule("host/r1"))
+        missing = self.filed(cc, swept=("acme", "host"), read=("acme", "host"))
+        [candidate] = missing["candidates"]
+        self.assertIn("found in no zone of project host", candidate["excerpt"])
+        self.assertTrue(candidate["command"].endswith("gcloud compute reservations list --project host --format json"))
+        present = self.filed(cc, reservations=[listed_reservation("r1", "us-central1-c", project="host")], swept=("acme", "host"), read=("acme", "host"))
+        self.assertEqual(present["candidates"], [])
+
+    def test_an_owner_project_outside_the_run_is_a_limitation_and_no_finding(self):
+        entry = self.filed(self.reserved_class(self.rule("host/r1")))
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertEqual(
+            entry["limitations"],
+            "reservation-mismatch-risk did not compare these ComputeClasses with the reservation they name, because its "
+            "owner project is not a project ID of this run: ComputeClass/reserved-ccc (project host)",
+        )
+
+    CLASS_UNREAD_REASON = (
+        "these ComputeClasses have a rule that consumes only a named reservation, and the reservations of its owner "
+        "project were not read in this run: ComputeClass/reserved-ccc (project host)"
+    )
+    POOL_UNREAD_REASON = (
+        "these node pools consume only a named reservation, and the reservations of its owner project were not read "
+        "in this run: shared (project host)"
+    )
+
+    def test_an_owner_project_whose_reservations_were_not_read_is_unevaluated(self):
+        entry = self.filed(
+            self.reserved_class(self.rule("host/r1")), self.reserved_class(self.rule("no-such-reservation"), name="other-ccc"),
+            swept=("acme", "host"), limitations="an earlier limitation",
+        )
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["ComputeClass/other-ccc"])
+        self.assertEqual(entry["checks_unevaluated"], [{"check": self.SLUG, "reason": self.CLASS_UNREAD_REASON}])
+        self.assertEqual(entry["commands"], [])
+        self.assertTrue(entry["limitations"].startswith("an earlier limitation; reservation-mismatch-risk could not be judged: "))
+
+    def test_a_pool_and_a_class_with_an_unread_owner_are_one_unevaluated_record(self):
+        """`collect_fleet` runs the pool comparison and then the class
+        comparison on one entry. `finish` reads one record for a check, so the
+        second reason joins the first."""
+        entry = self.entry(self.reserved_class(self.rule("host/r1")))
+        entry[fs.RESERVED_POOLS_KEY] = [{**fs.reserved_pool(reserved_node_pool("shared", "projects/host/reservations/r1"), "acme"), "command": "x"}]
+        swept = frozenset({"acme", "host"})
+        fs.file_reserved_pools(entry, {"acme": {}}, swept)
+        fs.file_reserved_classes(entry, {"acme": {}}, swept)
+        self.assertEqual(entry["checks_unevaluated"], [{"check": self.SLUG, "reason": f"{self.POOL_UNREAD_REASON}; {self.CLASS_UNREAD_REASON}"}])
+        self.assertEqual(
+            entry["limitations"],
+            f"{self.SLUG} could not be judged: {self.POOL_UNREAD_REASON}; {self.SLUG} could not be judged: {self.CLASS_UNREAD_REASON}",
+        )
+        self.assertEqual(entry["commands"], [])
+
+    def test_an_unread_pool_list_and_a_class_with_an_unread_owner_are_one_unevaluated_record(self):
+        """The cluster step marked the check when the pool list failed. The
+        class's reason joins that record and does not replace it."""
+        entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("host/r1"))], pools_rc=1)
+        [earlier] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == self.SLUG]
+        fs.file_reserved_pools(entry, {"acme": {}}, frozenset({"acme", "host"}))
+        fs.file_reserved_classes(entry, {"acme": {}}, frozenset({"acme", "host"}))
+        [reason] = [e["reason"] for e in entry["checks_unevaluated"] if e["check"] == self.SLUG]
+        self.assertEqual(reason, f"{earlier}; {self.CLASS_UNREAD_REASON}")
+
+    def test_an_entry_with_no_reserved_class_is_left_as_it_is(self):
+        entry = {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"}
+        fs.file_reserved_classes(entry, {}, frozenset({"acme"}))
+        self.assertEqual(entry, {"name": "acme/us-central1/c1", "project": "acme", "outcome": "gate-failed", "error": "x"})
+
+    def test_collect_cluster_hands_the_reserved_rules_to_the_fleet(self):
+        entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("no-such-reservation")), compute_class("plain", [{"machineFamily": "n4"}])])
+        [reserved] = entry[fs.RESERVED_CLASSES_KEY]
+        self.assertEqual((reserved["class"], reserved["rule"], reserved["reservations"]), ("reserved-ccc", 1, [("acme", "no-such-reservation", [], "")]))
+        self.assertIn("kubectl get", reserved["command"])
+
+    def test_collect_cluster_hands_no_rule_of_a_class_that_it_does_not_compare(self):
+        """§3.10 does not flag non-production. And one fault is one finding: a
+        class whose status names the reservation is filed from the status."""
+        reported = self.reserved_class(self.rule("no-such-reservation"), name="reported-ccc")
+        reported["status"] = {"conditions": [{"type": "CrdMisconfigured", "status": "True", "reason": "ReservationNotFound", "message": "x"}]}
+        entry = CollectClusterTest.run_with(self, dump_items=[self.reserved_class(self.rule("no-such-reservation"), name="dev-ccc"), reported])
+        self.assertNotIn(fs.RESERVED_CLASSES_KEY, entry)
+        self.assertEqual([c["object"] for c in entry["candidates"] if c["check"] == self.SLUG], ["ComputeClass/reported-ccc"])
+
+    def fleet(self, cc, *, reservations=()):
+        """One project, one cluster whose dump carries `cc`."""
+        listing = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "nodePools": []}])
+
+        def run(argv, **kwargs):
+            if argv[:3] == ["gcloud", "container", "clusters"] and "list" in argv:
+                return run_of(0, listing)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(cc)))
+            if argv[:3] == ["gcloud", "compute", "reservations"]:
+                return run_of(0, json.dumps(list(reservations)))
+            if argv[:3] == ["gcloud", "compute", "regions"]:
+                return run_of(0, json.dumps({"quotas": []}))
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp:
+            with patch.object(fs, "KUBECONFIG_DIR", Path(tmp)):
+                manifest = fs.collect_fleet("acme", run=run)
+        self.assertNotIn(fs.RESERVED_CLASSES_KEY, json.dumps(manifest))
+        cluster = next(e for e in manifest["clusters"] if e["name"] == "acme/us-central1/c1")
+        return [(c["check"], c["object"]) for c in cluster["candidates"] if c["check"] in (self.SLUG, "dangling-compute-class")], cluster
+
+    def test_the_fleet_files_a_class_with_auto_creation_off_for_both_faults(self):
+        """Auto-creation off, as GKE reported it: the status names only the
+        missing node pool, and the comparison finds the missing reservation."""
+        cc = self.reserved_class(self.rule("no-such-reservation"))
+        cc["status"] = {"conditions": [
+            {"type": "CrdMisconfigured", "status": "True", "reason": "NapDisabledAndNoMatchingNodegroups", "message": "Crd with NAP disabled should have at least one matching nodepool with autoscaling enabled."},
+            {"type": "Health", "status": "False", "reason": "Health", "message": "Crd is not healthy."},
+        ]}
+        filed, cluster = self.fleet(cc)
+        self.assertEqual(sorted(filed), [("dangling-compute-class", "ComputeClass/reserved-ccc"), (self.SLUG, "ComputeClass/reserved-ccc")])
+        [candidate] = [c for c in cluster["candidates"] if c["check"] == self.SLUG]
+        audit_report.validate_check_command(candidate["command"], cluster["name"], self.SLUG)
+
+    def test_the_fleet_files_nothing_for_a_class_whose_reservation_exists(self):
+        filed, cluster = self.fleet(self.reserved_class(self.rule("r1")), reservations=[listed_reservation("r1", "us-central1-c")])
+        self.assertEqual(filed, [])
+        self.assertIn(self.SLUG, {c["check"] for c in cluster["commands"]})
 
 
 class CrashIsolationTest(unittest.TestCase):
