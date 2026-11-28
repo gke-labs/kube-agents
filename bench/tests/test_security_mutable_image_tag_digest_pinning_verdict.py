@@ -62,3 +62,8 @@ def test_wrong_missing_hedged_or_prose_only_fails():
         "Both semver tags and latest are mutable in container registries; pin both api and proxy by sha256 digest.",
     ):
         assert not _passes(report), report
+
+
+def test_verbatim_prompt_echo_fails():
+    doc = yaml.safe_load(TASK.read_text())
+    assert not _passes(doc["prompt"])
