@@ -64,3 +64,8 @@ def test_wrong_missing_hedged_or_prose_only_fails():
         "The gpu-train pool in us-central1-a and us-central1-b does not match the shared reservation zone in us-central1-c.",
     ):
         assert not _passes(report), report
+
+
+def test_verbatim_prompt_echo_fails():
+    doc = yaml.safe_load(TASK.read_text())
+    assert not _passes(doc["prompt"])

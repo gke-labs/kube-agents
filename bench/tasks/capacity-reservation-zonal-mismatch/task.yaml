@@ -10,7 +10,7 @@ name: Node-pool vs. shared-reservation zonal mismatch diagnosis
 domain: capacity
 tool_calls_optional: true
 
-prompt: |-
+prompt: >-
   A regional Standard GKE cluster in `us-central1` has an autoscaling GPU
   node pool `gpu-train` configured with `--node-locations=us-central1-a,us-central1-b`
   and `--reservation-affinity=specific --reservation=projects/corp-capacity-host/reservations/shared-a100-res`.
