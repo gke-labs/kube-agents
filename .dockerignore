@@ -12,6 +12,10 @@
 .DS_Store
 Thumbs.db
 
+# The credentials file google-github-actions/auth writes into the workspace of
+# a workflow that logs in to Google and then builds from this context.
+gha-creds-*.json
+
 # Build and package caches
 # Docker ignore patterns are not gitignore patterns: a bare `__pycache__/`
 # matches only the context root. Without the `**/` form, a developer who ran

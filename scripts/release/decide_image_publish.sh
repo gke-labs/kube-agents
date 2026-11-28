@@ -20,13 +20,15 @@
 #     line opened at, or fast-forwarded to, a commit `main` already built would
 #     otherwise rebuild it under the same `:<sha>` tags, replacing the manifests
 #     its validation tags were earned against with a build no gate has seen.
-#     The registry is asked per image with registry_image_status; if it
-#     cannot be asked, this script fails rather than guess, so nothing builds.
+#     The registry the images are published to (get_candidate_registry_prefix)
+#     is asked per image with registry_image_status; if it cannot be asked,
+#     this script fails rather than guess, so nothing builds.
 #
 # A push that builds nothing is a green run: the reason is printed, written to
 # the step summary and raised as a workflow notice, so it is not only in the log.
 #
-# Inputs (environment): GITHUB_REF, GITHUB_SHA, GITHUB_ACTOR.
+# Inputs (environment): GITHUB_REF, GITHUB_SHA, GITHUB_ACTOR, and
+# CANDIDATE_REGISTRY_PREFIX, the registry the workflow pushes to.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,7 +58,7 @@ decide() {
     return
   fi
   local registry_prefix img status present=0
-  registry_prefix="$(get_registry_prefix)"
+  registry_prefix="$(get_candidate_registry_prefix)"
   for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
     status="$(registry_image_status "${registry_prefix}/${img}:${SHA}")"
     case "${status}" in

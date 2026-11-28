@@ -1,3 +1,6 @@
+# The name is what autopush-deploy.yml's `workflow_run` trigger matches, so it
+# stays though no image goes to GHCR from here: a release puts its images
+# there, and moves `:latest` there (promote_release_images).
 name: Publish Images to GHCR
 
 on:
@@ -7,8 +10,8 @@ on:
     # the only workflow that publishes them. The pattern admits the line shape
     # alone: not the legacy per-release `release/<X.Y.Z>` branches of 0.1.0–0.7.0,
     # and not a misnamed `release/x`. Which release-branch pushes actually build
-    # is the `decide` job's question. `:latest` still follows `main` alone; see
-    # the `tags:` blocks below.
+    # is the `decide` job's question. No push moves a `:latest`: the `tags:`
+    # blocks below carry the commit tag alone.
     branches: [main, "release/[0-9]+.[0-9]+"]
 
 # Queue rather than cancel: every publish should complete, but not interleave.
@@ -19,45 +22,64 @@ concurrency:
 permissions:
   contents: read
 
+# Every image is pushed to the candidate repository, which an environment and
+# the release read commit images from through their registry variables. The
+# images are there before this workflow completes, which is the event
+# autopush-deploy.yml starts on. Each image is signed there, on the reference
+# it was pushed under; a release signs what it publishes on its own
+# (sign_release_images.sh).
+env:
+  CANDIDATE_REGISTRY_PREFIX: us-docker.pkg.dev/kube-agents-prow/kube-agents-candidates
+  CANDIDATE_REGISTRY_HOST: us-docker.pkg.dev
+
 jobs:
   decide:
     name: Decide whether this push builds
     runs-on: ubuntu-latest
     if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       build: ${{ steps.decide.outputs.build }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The decision asks the candidate repository whether a release-branch
+      # commit already has images, as the identity that writes them there.
+      - name: Authenticate to Google Cloud for the image check
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+          service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
+
+      - name: Set up Google Cloud SDK for the image check
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
       # `main` always builds. A release branch builds only for a merge Tide
       # pushed (which also keeps out the GA tagger's stamped commit, pushed as
       # the release App), and never for a commit whose images already exist:
       # image tags are mutable, and rebuilding a commit `main` already
       # published would replace the manifests its validation was earned
-      # against. The rules and their reasons are the script's.
+      # against. The rules and their reasons are the script's; it reads the
+      # workflow's CANDIDATE_REGISTRY_PREFIX.
       - name: Decide
         id: decide
         run: ./scripts/release/decide_image_publish.sh
 
   publish-operator:
-    name: Publish Controller to GHCR
+    name: Publish Controller
     runs-on: ubuntu-latest
     needs: decide
     if: github.repository == 'gke-labs/kube-agents' && needs.decide.outputs.build == 'true'
     permissions:
       contents: read
-      packages: write
       id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Downcase repository name
-        env:
-          GITHUB_REPO: ${{ github.repository }}
-        run: |
-          echo "IMAGE_REPOSITORY=$(echo "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       # Base images and the builder image through mirror.gcr.io, as in
       # docker-build.yml: Docker Hub's per-IP anonymous limit failed five publishes
@@ -68,14 +90,25 @@ jobs:
           buildkitd-config: .github/buildkitd.toml
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
-      - name: Log in to GitHub Container Registry
+      # The identity copy-candidate-images.yml writes the candidate repository
+      # with. Its credentials file lands in the workspace, which is a build
+      # context below; .dockerignore keeps it out of every image.
+      - name: Authenticate to Google Cloud for the candidate registry
+        id: candidate-registry-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+          service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
+
+      - name: Log in to the candidate registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.CANDIDATE_REGISTRY_HOST }}
+          username: oauth2accesstoken
+          password: ${{ steps.candidate-registry-auth.outputs.access_token }}
 
-      - name: Build and Push Controller (GHCR)
+      - name: Build and Push Controller
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-controller
         with:
@@ -86,8 +119,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/k8s-operator:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/k8s-operator:${{ github.sha }}
           build-args: |
             VERSION=latest
           labels: |
@@ -96,20 +128,19 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
-      - name: Sign Controller Image (GHCR)
+      - name: Sign Controller Image
         env:
           CONTROLLER_DIGEST: ${{ steps.build-controller.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/k8s-operator@$CONTROLLER_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/k8s-operator@$CONTROLLER_DIGEST"
 
   publish-agents:
-    name: Publish Agent Images to GHCR
+    name: Publish Agent Images
     runs-on: ubuntu-latest
     needs: decide
     if: github.repository == 'gke-labs/kube-agents' && needs.decide.outputs.build == 'true'
     permissions:
       contents: read
-      packages: write
       id-token: write
     steps:
       - name: Checkout code
@@ -117,12 +148,6 @@ jobs:
 
       - name: Load tags
         run: cat tags.env >> "$GITHUB_ENV"
-
-      - name: Downcase repository name
-        env:
-          GITHUB_REPO: ${{ github.repository }}
-        run: |
-          echo "IMAGE_REPOSITORY=$(echo "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       # Base images and the builder image through mirror.gcr.io, as in
       # docker-build.yml: Docker Hub's per-IP anonymous limit failed five publishes
@@ -133,14 +158,25 @@ jobs:
           buildkitd-config: .github/buildkitd.toml
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
-      - name: Log in to GitHub Container Registry
+      # The identity copy-candidate-images.yml writes the candidate repository
+      # with. Its credentials file lands in the workspace, which is a build
+      # context below; .dockerignore keeps it out of every image.
+      - name: Authenticate to Google Cloud for the candidate registry
+        id: candidate-registry-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+          service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
+
+      - name: Log in to the candidate registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ${{ env.CANDIDATE_REGISTRY_HOST }}
+          username: oauth2accesstoken
+          password: ${{ steps.candidate-registry-auth.outputs.access_token }}
 
-      - name: Build and Push Platform Agent (GHCR)
+      - name: Build and Push Platform Agent
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-platform
         with:
@@ -152,8 +188,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/platform-agent:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/platform-agent:${{ github.sha }}
           # KUBE_AGENTS_VERSION is the commit SHA the image is tagged with: it
           # becomes the version in the User-Agent the agent's remote MCP calls
           # carry, so a request in a Google API log names the exact image.
@@ -161,17 +196,16 @@ jobs:
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
             KUBE_AGENTS_VERSION=${{ github.sha }}
 
-      - name: Build and Push Replay Proxy (GHCR)
+      - name: Build and Push Replay Proxy
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-replay-proxy
         with:
           context: examples/inference-replay/replay-proxy
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/replay-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/replay-proxy:${{ github.sha }}
 
-      - name: Build and Push Credential Sidecar (GHCR)
+      - name: Build and Push Credential Sidecar
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-credential-proxy
         with:
@@ -181,12 +215,11 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/credential-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/credential-proxy:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/credential-proxy:${{ github.sha }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
-      - name: Build and Push Kube Proxy (GHCR)
+      - name: Build and Push Kube Proxy
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-kube-proxy
         with:
@@ -195,13 +228,12 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/kube-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/kube-proxy:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/kube-proxy:${{ github.sha }}
           # The SHA it is tagged with, for `k8s-api-proxy --version` and the startup log.
           build-args: |
             KUBE_AGENTS_VERSION=${{ github.sha }}
 
-      - name: Build and Push Agent Sandbox (GHCR)
+      - name: Build and Push Agent Sandbox
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-agent-sandbox
         with:
@@ -210,10 +242,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/agent-sandbox:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/agent-sandbox:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/agent-sandbox:${{ github.sha }}
 
-      - name: Build and Push Pubsub Platform Plugin (GHCR)
+      - name: Build and Push Pubsub Platform Plugin
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-pubsub-platform
         with:
@@ -221,10 +252,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/pubsub-platform:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/pubsub-platform:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/pubsub-platform:${{ github.sha }}
 
-      - name: Build and Push GKE Stockout Investigator Plugin (GHCR)
+      - name: Build and Push GKE Stockout Investigator Plugin
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-stockout-investigator
         with:
@@ -232,8 +262,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/gke-stockout-investigator:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/gke-stockout-investigator:${{ github.sha }}
 
       # The A2A next stack: the gateway, the callout, the verifier, the
       # AgentProfile dispatcher, the console and the Teams inbound receiver built from the a2a/ module root, the worker from the repository
@@ -245,7 +274,7 @@ jobs:
       # operator derives the seven it renders from its own image, else from
       # the agent image it resolves (registry and tag), so the tags here are
       # what a next install at this commit pulls.
-      - name: Build and Push A2A Gateway (GHCR)
+      - name: Build and Push A2A Gateway
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-gateway
         with:
@@ -254,10 +283,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-gateway:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-gateway:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-gateway:${{ github.sha }}
 
-      - name: Build and Push A2A Worker (GHCR)
+      - name: Build and Push A2A Worker
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-worker
         with:
@@ -266,13 +294,12 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-worker:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-worker:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-worker:${{ github.sha }}
 
       # The cluster agent's persona image (#3658): the persona directory is
       # the build context, and the image's /files is what a profile worker
       # pod mounts at /persona.
-      - name: Build and Push Cluster Persona (GHCR)
+      - name: Build and Push Cluster Persona
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-persona-cluster
         with:
@@ -281,13 +308,12 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-cluster:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-cluster:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/persona-cluster:${{ github.sha }}
 
       # The GKE Support Agent's persona image: the persona directory is the
       # build context, and the image's /files is what a profile worker pod
       # mounts at /persona.
-      - name: Build and Push TSE Persona (GHCR)
+      - name: Build and Push TSE Persona
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-persona-tse
         with:
@@ -296,12 +322,11 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-tse:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-tse:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/persona-tse:${{ github.sha }}
 
       # The fleet-audit AgentProfile's persona image (#5623), the same shape:
       # text only, since its report scripts are in the worker image.
-      - name: Build and Push Fleet Audit Persona (GHCR)
+      - name: Build and Push Fleet Audit Persona
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-persona-fleet-audit
         with:
@@ -310,10 +335,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-fleet-audit:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-fleet-audit:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/persona-fleet-audit:${{ github.sha }}
 
-      - name: Build and Push A2A Auth Callout (GHCR)
+      - name: Build and Push A2A Auth Callout
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-authcallout
         with:
@@ -322,10 +346,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-authcallout:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-authcallout:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-authcallout:${{ github.sha }}
 
-      - name: Build and Push A2A Console (GHCR)
+      - name: Build and Push A2A Console
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-console
         with:
@@ -334,10 +357,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-console:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-console:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-console:${{ github.sha }}
 
-      - name: Build and Push A2A Teams Inbound Receiver (GHCR)
+      - name: Build and Push A2A Teams Inbound Receiver
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-teams-inbound
         with:
@@ -346,10 +368,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-teams-inbound:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-teams-inbound:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-teams-inbound:${{ github.sha }}
 
-      - name: Build and Push A2A Capability Verifier (GHCR)
+      - name: Build and Push A2A Capability Verifier
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-verifier
         with:
@@ -358,10 +379,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-verifier:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-verifier:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-verifier:${{ github.sha }}
 
-      - name: Build and Push A2A Profile Dispatcher (GHCR)
+      - name: Build and Push A2A Profile Dispatcher
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-dispatcher
         with:
@@ -370,10 +390,9 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-dispatcher:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-dispatcher:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/a2a-dispatcher:${{ github.sha }}
 
-      - name: Build and Push Hermes Bridge (GHCR)
+      - name: Build and Push Hermes Bridge
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-hermes-bridge
         with:
@@ -382,12 +401,11 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/hermes-bridge:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/hermes-bridge:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/hermes-bridge:${{ github.sha }}
           build-args: |
-            PLATFORM_AGENT_IMAGE=ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+            PLATFORM_AGENT_IMAGE=${{ env.CANDIDATE_REGISTRY_PREFIX }}/platform-agent:${{ github.sha }}
 
-      - name: Build and Push Web Console (GHCR)
+      - name: Build and Push Web Console
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-web-console
         with:
@@ -396,13 +414,12 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/web-console:latest', env.IMAGE_REPOSITORY) || '' }}
-            ghcr.io/${{ env.IMAGE_REPOSITORY }}/web-console:${{ github.sha }}
+            ${{ env.CANDIDATE_REGISTRY_PREFIX }}/web-console:${{ github.sha }}
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
-      - name: Sign Agent Images (GHCR)
+      - name: Sign Agent Images
         env:
           PLATFORM_DIGEST: ${{ steps.build-platform.outputs.digest }}
           REPLAY_PROXY_DIGEST: ${{ steps.build-replay-proxy.outputs.digest }}
@@ -424,22 +441,22 @@ jobs:
           HERMES_BRIDGE_DIGEST: ${{ steps.build-hermes-bridge.outputs.digest }}
           WEB_CONSOLE_DIGEST: ${{ steps.build-web-console.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/platform-agent@$PLATFORM_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/replay-proxy@$REPLAY_PROXY_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/kube-proxy@$KUBE_PROXY_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/agent-sandbox@$AGENT_SANDBOX_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-gateway@$A2A_GATEWAY_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-worker@$A2A_WORKER_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/persona-cluster@$PERSONA_CLUSTER_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/persona-tse@$PERSONA_TSE_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/persona-fleet-audit@$PERSONA_FLEET_AUDIT_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-authcallout@$A2A_AUTHCALLOUT_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-console@$A2A_CONSOLE_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-teams-inbound@$A2A_TEAMS_INBOUND_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-verifier@$A2A_VERIFIER_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-dispatcher@$A2A_DISPATCHER_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/hermes-bridge@$HERMES_BRIDGE_DIGEST"
-          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/web-console@$WEB_CONSOLE_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/platform-agent@$PLATFORM_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/replay-proxy@$REPLAY_PROXY_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/kube-proxy@$KUBE_PROXY_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/agent-sandbox@$AGENT_SANDBOX_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-gateway@$A2A_GATEWAY_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-worker@$A2A_WORKER_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/persona-cluster@$PERSONA_CLUSTER_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/persona-tse@$PERSONA_TSE_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/persona-fleet-audit@$PERSONA_FLEET_AUDIT_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-authcallout@$A2A_AUTHCALLOUT_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-console@$A2A_CONSOLE_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-teams-inbound@$A2A_TEAMS_INBOUND_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-verifier@$A2A_VERIFIER_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/a2a-dispatcher@$A2A_DISPATCHER_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/hermes-bridge@$HERMES_BRIDGE_DIGEST"
+          cosign sign --yes "$CANDIDATE_REGISTRY_PREFIX/web-console@$WEB_CONSOLE_DIGEST"

@@ -1,7 +1,7 @@
 """Unit tests for scripts/release/copy_candidate_images.sh.
 
-copy-candidate-images.yml runs it once a commit's images are on GHCR, to copy
-them into a second registry under the same `:<sha>` tags; the second class
+copy-candidate-images.yml runs it on a dispatch, to copy a commit's images
+from GHCR into a second registry under the same `:<sha>` tags; the second class
 holds that workflow's wiring. The registry is a
 mock docker that keeps state: `imagetools create` records the destination at
 the source's digest (or misbehaves, when a case asks it to), and `imagetools
@@ -283,15 +283,13 @@ class CopyCandidateImagesTest(unittest.TestCase):
 class CopyCandidateImagesWorkflowTest(unittest.TestCase):
     """copy-candidate-images.yml: when it runs, as what, and what it runs.
 
-    The copy is its own workflow so that it cannot lengthen a publish run
-    (whose concurrency group keeps one pending run, so a longer run costs
-    commits their images) or change the conclusion autopush-deploy.yml starts
-    on. docker-publish-ghcr.yml therefore carries no part of it.
+    The publish workflow pushes every commit it builds to both registries, so
+    the copy is for the commits that workflow did not push there: a dispatch
+    names one. Nothing starts it on its own.
     """
 
-    _PUBLISH_WORKFLOW_NAME = "Publish Images to GHCR"
     _COPY_COMMAND = './scripts/release/copy_candidate_images.sh "$COMMIT_SHA" "$CANDIDATE_REGISTRY_PREFIX"'
-    _SHA_EXPRESSION = "${{ github.event.workflow_run.head_sha || inputs.commit_sha }}"
+    _SHA_EXPRESSION = "${{ inputs.commit_sha }}"
 
     @classmethod
     def setUpClass(cls):
@@ -303,36 +301,19 @@ class CopyCandidateImagesWorkflowTest(unittest.TestCase):
         cls.job = cls.doc["jobs"]["copy"]
         cls.publish = yaml.safe_load((workflows / "docker-publish-ghcr.yml").read_text())
 
-    def test_it_starts_on_the_publish_workflow_by_its_name_for_main_alone(self):
-        """`workflow_run` matches by name, so a rename of the publish workflow
-        would silently stop every copy. `main` only: a `workflow_run` job that
-        takes a cloud credential runs for the default branch's runs alone
-        (tests/conformance, B4), so a release line's commit is a dispatch."""
-        self.assertEqual(self.publish["name"], self._PUBLISH_WORKFLOW_NAME)
-        trigger = self.on["workflow_run"]
-        self.assertEqual(trigger["workflows"], [self._PUBLISH_WORKFLOW_NAME])
-        self.assertEqual(trigger["types"], ["completed"])
-        self.assertEqual(trigger["branches"], ["main"])
+    def test_only_a_dispatch_starts_it(self):
+        """The publish workflow pushes to the candidate repository itself;
+        nothing else starts a copy."""
+        self.assertEqual(list(self.on), ["workflow_dispatch"])
 
     def test_a_dispatch_names_the_commit(self):
-        """The way to copy a commit a run missed, on any line."""
+        """The way to copy a commit the publish workflow did not push, on any line."""
         commit = self.on["workflow_dispatch"]["inputs"]["commit_sha"]
         self.assertIs(commit["required"], True)
         self.assertEqual(self.job["env"]["COMMIT_SHA"], self._SHA_EXPRESSION)
 
-    def test_only_a_successful_push_publish_from_this_repository_is_copied(self):
-        condition = " ".join(str(self.job["if"]).split())
-        for clause in (
-            "github.repository == 'gke-labs/kube-agents'",
-            "github.event_name == 'workflow_dispatch'",
-            "github.event.workflow_run.conclusion == 'success'",
-            "github.event.workflow_run.head_repository.full_name == github.repository",
-            "github.event.workflow_run.event == 'push'",
-            "github.event.workflow_run.head_branch == 'main'",
-        ):
-            with self.subTest(clause=clause):
-                self.assertIn(clause, condition)
-        self.assertNotIn("always()", condition)
+    def test_it_runs_in_this_repository_alone(self):
+        self.assertEqual(self.job["if"], "github.repository == 'gke-labs/kube-agents'")
 
     def test_each_commit_is_its_own_concurrency_group(self):
         """Keyed by commit and never cancelled, so one commit's copy cannot
@@ -372,7 +353,23 @@ class CopyCandidateImagesWorkflowTest(unittest.TestCase):
         for step in steps:
             self.assertNotIn("${{", str(step.get("run", "")), "event fields reach a run: step through env only")
 
-    def test_the_publish_workflow_does_not_carry_the_copy(self):
+    def test_the_publish_workflow_pushes_where_the_copy_copies_to_as_the_same_identity(self):
+        """One destination and one Google identity, spelled in two files: a
+        typo in the publish workflow's copy would fail every publish. Its
+        decide job signs in as that identity too, to ask the destination."""
+        self.assertEqual(self.publish["env"]["CANDIDATE_REGISTRY_PREFIX"], self.job["env"]["CANDIDATE_REGISTRY_PREFIX"])
+        auth_action = "google-github-actions/auth"
+        (copy_auth,) = [step for step in self.job["steps"] if str(step.get("uses", "")).split("@")[0] == auth_action]
+        publish_auths = [
+            step
+            for job in self.publish["jobs"].values()
+            for step in job["steps"]
+            if str(step.get("uses", "")).split("@")[0] == auth_action
+        ]
+        self.assertEqual(len(publish_auths), len(self.publish["jobs"]))
+        for step in publish_auths:
+            self.assertEqual(step["uses"], copy_auth["uses"])
+            self.assertEqual(step["with"], copy_auth["with"])
         for name, job in self.publish["jobs"].items():
             with self.subTest(job=name):
                 self.assertIsNone(job.get("continue-on-error"))

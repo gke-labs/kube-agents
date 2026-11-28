@@ -41,6 +41,8 @@ jobs:
     # find_latest_built_commit looks for prebuilt images. Reading them from a
     # different scope than the pipeline does would let this job resolve a
     # candidate against one registry and the pipeline install from another.
+    # Also for GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT, the
+    # login that lookup takes when the registry is an Artifact Registry one.
     environment: rc
     timeout-minutes: 15
     permissions:
@@ -49,6 +51,9 @@ jobs:
       # GitHub exempts from the recursion suppression that would otherwise stop
       # the default token starting another run.
       actions: write
+      # For the Google login the image lookup takes when the registry is an
+      # Artifact Registry repository.
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +63,25 @@ jobs:
           # "no such tag" and re-run a candidate every three hours.
           fetch-depth: 0
           persist-credentials: false
+
+      # Only when the environment's registry is an Artifact Registry
+      # repository: the lookup below, the one step here that asks a registry
+      # for a commit's images, then asks
+      # that registry as the environment's deploy identity, which has to
+      # hold read on it (registry_image_exists asks Artifact Registry over
+      # its API with the job's Google credential, before docker). With
+      # REGISTRY_PREFIX unset the check asks GHCR, which answers without a
+      # login, and these two steps are skipped.
+      - name: Authenticate to Google Cloud for the image lookup
+        if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK for the image lookup
+        if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       # The same script, with the same inputs, that rc-create-tag.yml runs. That
       # is the point: the skip decision has one implementation, so the gate that

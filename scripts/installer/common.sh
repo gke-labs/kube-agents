@@ -243,7 +243,7 @@ init_var_image_tag() {
     else
       local default_tag="$IMAGE_TAG_FALLBACK"
       echo -e "  ${C_CYAN}The base image tag is used for all images built from the kube-agents repo.${C_RESET}"
-      echo -ne "  ${C_CYAN}Enter Base Image Tag (a commit SHA; 'latest' = latest commit on main) [${C_WHITE}${default_tag}${C_CYAN}]: ${C_RESET}"
+      echo -ne "  ${C_CYAN}Enter Base Image Tag (a release version or commit SHA; 'latest' = the newest release) [${C_WHITE}${default_tag}${C_CYAN}]: ${C_RESET}"
       read -r input_tag
       export IMAGE_TAG="${input_tag:-$default_tag}"
     fi

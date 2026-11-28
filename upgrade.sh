@@ -1918,7 +1918,7 @@ main() {
   # An UPGRADE can ask for the same thing, but only by saying so:
   # --keep-image-tag means "converge everything except the images". That is
   # what a scheduled reconcile of autopush wants, because autopush tracks
-  # main's tip through GHCR publishes and pinning it to whichever commit the
+  # main's tip through image publishes and pinning it to whichever commit the
   # reconcile ran from would roll its images BACKWARDS to that commit.
   #
   # A flag rather than "empty means keep", because empty already means

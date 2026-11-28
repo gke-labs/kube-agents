@@ -51,6 +51,7 @@ jobs:
     environment: staging
     permissions:
       contents: read
+      id-token: write
     outputs:
       commit_sha: ${{ steps.peel.outputs.commit_sha }}
       lease_policy: ${{ steps.peel.outputs.lease_policy }}
@@ -69,7 +70,25 @@ jobs:
           INPUT_LEASE_POLICY: ${{ inputs.lease_policy }}
         run: ./scripts/release/resolve_deploy.sh
 
-      - name: Verify candidate images exist in GHCR
+      # Only when the environment's registry is an Artifact Registry
+      # repository: the image check below then asks that registry as the
+      # environment's deploy identity, which has to hold read on it
+      # (registry_image_exists asks Artifact Registry over its API with the
+      # job's Google credential, before docker). With
+      # REGISTRY_PREFIX unset the check asks GHCR, which answers without a
+      # login, and these two steps are skipped.
+      - name: Authenticate to Google Cloud for the image check
+        if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK for the image check
+        if: contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Verify candidate images exist in the environment's registry
         env:
           COMMIT_SHA: ${{ steps.peel.outputs.commit_sha }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}

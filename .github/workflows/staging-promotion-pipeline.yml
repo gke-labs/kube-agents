@@ -30,7 +30,7 @@ name: "Staging: Promotion Pipeline"
 # single tag cannot both start an eval and wait for it: staging-deploy.yml would
 # reach the cluster in minutes while the eval was still hours from a verdict.
 # Autopush is separately kept current through atomic deploys in
-# autopush-deploy.yml when images are published to GHCR.
+# autopush-deploy.yml when images are published.
 #
 # Nothing in it touches the RC environment. The four jobs that touch the
 # nightly cluster — deploy, the matrix, the rollback leg, teardown — bind
@@ -100,15 +100,18 @@ jobs:
     # graph is read from, and where the candidate images are looked for. Resolving
     # those from a different scope than the deploy job would verify one registry
     # and install from another. An unbound job resolves every `vars.*` to empty in
-    # silence, and GH_ORG and GH_REPO have no fallback.
+    # silence, and GH_ORG and GH_REPO have no fallback. The image check's
+    # Google login reads GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_SERVICE_ACCOUNT
+    # from the same binding.
     #
-    # REGISTRY_PREFIX is set at no scope, so it arrives empty and
-    # get_registry_prefix falls back to DEFAULT_REGISTRY_PREFIX. Binding is what
-    # lets an environment override that, not what supplies it.
+    # REGISTRY_PREFIX names the registry the environment reads a commit's
+    # images from. Unset, it arrives empty and get_registry_prefix falls back
+    # to DEFAULT_REGISTRY_PREFIX, which holds releases and no commit image.
     environment: nightly
     timeout-minutes: 15
     permissions:
       contents: read
+      id-token: write
     outputs:
       commit_sha: ${{ steps.resolve.outputs.commit_sha }}
       rc_tag: ${{ steps.resolve.outputs.rc_tag }}
@@ -131,10 +134,29 @@ jobs:
           GH_REPO: ${{ vars.GH_REPO }}
         run: ./scripts/release/resolve_promotion_candidate.sh
 
+      # Only when the environment's registry is an Artifact Registry
+      # repository: the image check below then asks that registry as the
+      # environment's deploy identity, which has to hold read on it
+      # (registry_image_exists asks Artifact Registry over its API with the
+      # job's Google credential, before docker). With
+      # REGISTRY_PREFIX unset the check asks GHCR, which answers without a
+      # login, and these two steps are skipped; on a run that skips the check
+      # they are skipped too.
+      - name: Authenticate to Google Cloud for the image check
+        if: steps.resolve.outputs.skip_pipeline != 'true' && contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK for the image check
+        if: steps.resolve.outputs.skip_pipeline != 'true' && contains(vars.REGISTRY_PREFIX, '-docker.pkg.dev/')
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
       # The candidate was validated hours or days ago and its images are what
       # the environment installs. A retention sweep or a registry problem
       # between then and now must fail here, before a cluster is built.
-      - name: Verify candidate images are still in GHCR
+      - name: Verify candidate images are still in the environment's registry
         if: steps.resolve.outputs.skip_pipeline != 'true'
         env:
           COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
@@ -676,7 +698,7 @@ jobs:
     # Steps 4 to 6b are deliberately absent from the list, and step 5 makes that
     # load-bearing rather than merely tidy. Waiting on the eval would hold a GKE
     # cluster for the five and a half hours the poller is allowed, every night,
-    # for a verdict about container images already in GHCR that the cluster has
+    # for a verdict about container images already published that the cluster has
     # no part in producing. The nomination, its withdrawal and the promotion have
     # only credential failure modes — an invalid GitHub App key or ID, a rejected
     # push, a refused workflow dispatch — which leave nothing on the cluster

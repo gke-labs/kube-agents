@@ -419,7 +419,7 @@ class PromotionPipelineWiringTest(unittest.TestCase):
         that leave nothing on the cluster worth looking at. Step 5 is worse than
         that: it succeeds slowly. Depending on it would hold the cluster for the
         five and a half hours the poller is allowed on a perfectly good night,
-        waiting on a verdict about container images already in GHCR that the
+        waiting on a verdict about container images already published that the
         cluster plays no part in producing. The RC pipeline can afford a
         dependency like this because its next scheduled run reclaims the
         environment within three hours; this pipeline's next daily run is the
@@ -708,7 +708,7 @@ class StagingTagContractTest(unittest.TestCase):
         steps = doc["jobs"]["resolve-commit"]["steps"]
         self.assertTrue(
             any("verify_candidate_images.sh" in step.get("run", "") for step in steps),
-            "resolve-commit must verify candidate images in GHCR",
+            "resolve-commit must verify candidate images in the environment's registry",
         )
 
     def test_staging_deploy_workflow_dispatch_defaults_lease_policy_to_fail(self):
@@ -903,16 +903,15 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
     def test_a_release_line_push_builds_sha_tags_but_never_moves_latest(self):
         """A backport merged onto `release/<X.Y>` needs `:<sha>` images, and only those.
 
-        Every rung of the release ladder checks GHCR for the candidate's SHA tag,
-        and this is the only workflow that publishes it, so it has to fire for the
-        release lines. Only for those: the pattern is the line shape, so neither
-        the per-release `release/<X.Y.Z>` branches nor an arbitrary
-        `release/anything` a collaborator pushes can mint signed images, and both
+        Every rung of the release ladder checks its registry for the candidate's
+        SHA tag, and this is the only workflow that publishes it, so it has to fire
+        for the release lines. Only for those: the pattern is the line shape, so
+        neither the per-release `release/<X.Y.Z>` branches nor an arbitrary
+        `release/anything` a collaborator pushes can mint images, and both
         jobs build nothing the GA tagger pushes to a line, since it pushes as the
         release App rather than as Tide.
-        `:latest` is what autopush and the presubmit cache follow and must keep
-        tracking `main` alone: each `:latest` line is guarded by the ref, and
-        `docker/build-push-action` drops the empty line the guard leaves behind.
+        No push moves a `:latest`: a release moves GHCR's, and the candidate
+        repository has none.
         """
         on = self.doc.get("on", self.doc.get(True))
         self.assertEqual(on["push"]["branches"], ["main", self._RELEASE_LINE_PUSH_PATTERN])
@@ -936,19 +935,18 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
             with self.subTest(tags=tag_lines):
                 self.assertTrue(any(":${{ github.sha }}" in line for line in tag_lines))
                 for line in tag_lines:
-                    if ":latest" in line:
-                        self.assertIn("github.ref == 'refs/heads/main'", line)
+                    self.assertNotIn(":latest", line)
 
-    # Both jobs tag through the downcased repository variable, so one shape
-    # reads every step's name. The name classes admit any repository-legal
+    # Both jobs tag through the workflow's candidate registry variable, so one
+    # shape reads every step's name. The name classes admit any repository-legal
     # name (dots and underscores included), so an entry cannot slip out of
     # all three lists at once by its spelling; the array's own entries are
     # counted against the parsed names for the same reason, in
     # parse_required_release_images, the one copy of that parse. common.sh's
     # required_release_images_in_text mirrors it for the release gate, and
     # test_release_common.py pins the two to each other.
-    _SHA_TAG_RE = re.compile(r"ghcr\.io/\$\{\{ env\.IMAGE_REPOSITORY \}\}/([^/:\s]+):\$\{\{ github\.sha \}\}")
-    _COSIGN_RE = re.compile(r"cosign sign --yes \"ghcr\.io/\$IMAGE_REPOSITORY/([^/@\s]+)@\$")
+    _SHA_TAG_RE = re.compile(r"\$\{\{ env\.CANDIDATE_REGISTRY_PREFIX \}\}/([^/:\s]+):\$\{\{ github\.sha \}\}")
+    _COSIGN_RE = re.compile(r"cosign sign --yes \"\$CANDIDATE_REGISTRY_PREFIX/([^/@\s]+)@\$")
 
     def test_the_workflow_builds_and_signs_exactly_the_required_release_images(self):
         """The three lists this workflow and the release ladder share are kept by

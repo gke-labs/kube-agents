@@ -11,7 +11,7 @@
 # source), and the script reads the destination back to check the digest. An
 # image already there at the source's digest is skipped, so a re-run copies
 # nothing. One there at another digest is replaced, and said so: the source
-# tag is what moved (a publish re-run on `main` rebuilds the same `:<sha>`),
+# tag is what moved (a publish re-run rebuilds the same `:<sha>`),
 # and a destination left behind would hold manifests the source no longer
 # serves. A destination that cannot be read is copied to as well, since the
 # copy and the read-back settle it either way.

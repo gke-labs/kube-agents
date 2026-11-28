@@ -626,11 +626,12 @@ get_registry_prefix() {
 }
 
 # Resolves the registry a release reads a commit's built images from:
-# CANDIDATE_REGISTRY_PREFIX when set, else the registry prefix itself, so one
-# registry holds both the commit images and the release, as before the variable
-# existed. Only the release's own reads take it (the eligibility check, the
-# source-commit resolution and the promotion); every other caller of
-# check_commit_images_exist installs from get_registry_prefix and checks there.
+# CANDIDATE_REGISTRY_PREFIX when set, else the registry prefix itself. The
+# release's own reads take it (the eligibility check, the source-commit
+# resolution and the promotion), and so does the publish decision
+# (decide_image_publish.sh), which asks the registry the publish workflow
+# pushes to; every other caller of check_commit_images_exist installs from
+# get_registry_prefix and checks there.
 get_candidate_registry_prefix() {
   if [ -n "${CANDIDATE_REGISTRY_PREFIX:-}" ]; then
     echo "${CANDIDATE_REGISTRY_PREFIX%/}"
@@ -1487,11 +1488,11 @@ find_latest_built_commit() {
       echo "$sha"
       return 0
     else
-      echo "  ⏳ Images not ready yet in GHCR for commit ${sha:0:7}, checking previous commit..." >&2
+      echo "  ⏳ Images not ready yet in ${registry_prefix} for commit ${sha:0:7}, checking previous commit..." >&2
     fi
   done
 
-  echo "❌ ERROR: Could not find any commit in the last 30 commits on main with published images in GHCR (${registry_prefix})!" >&2
+  echo "❌ ERROR: Could not find any commit in the last 30 commits on main with published images in ${registry_prefix}!" >&2
   return 1
 }
 
@@ -2447,6 +2448,17 @@ resolve_source_image_commit() {
   return 1
 }
 
+# Whether a version is the newest GA release the repository's tags know: the
+# highest X.Y.Z tag is the version itself. The GA tag is pushed before the
+# images are promoted, so a release cut from main answers yes and a patch cut
+# from an older release line, with a higher version already tagged, answers no.
+# A version with no tag of its own is not the newest: nothing says it was
+# released.
+release_is_newest_ga() {
+  local version="${1:-}"
+  [ -n "${version}" ] && [ "$(get_latest_ga_tag)" = "${version}" ]
+}
+
 # Gives one image a second tag without rebuilding: target_image names what
 # source_image names, in the same registry or another. A target that already
 # names the source is left alone, so a re-run resumes; one that names anything
@@ -2488,7 +2500,9 @@ promote_image_tag() {
 # whole. When the candidate registry is not the registry prefix it gets the
 # version tag too, before the registry prefix does: rollback_environment.sh
 # looks for the previous release's version in the registry an environment is
-# installed from.
+# installed from. Each release registry's `latest` then moves to the version
+# when it is the newest GA release (release_is_newest_ga); the candidate
+# registry has no `latest`.
 promote_release_images() {
   local commit_sha="${1:-}"
   local release_version="${2:-}"
@@ -2536,6 +2550,11 @@ promote_release_images() {
     return 1
   fi
 
+  local moves_latest="false"
+  if release_is_newest_ga "${release_version}"; then
+    moves_latest="true"
+  fi
+
   local release_prefixes=() release_prefix release_prefix_lines
   release_prefix_lines="$(release_registry_prefixes)" || return 1
   while IFS= read -r release_prefix; do release_prefixes+=("${release_prefix}"); done <<<"${release_prefix_lines}"
@@ -2556,5 +2575,17 @@ promote_release_images() {
         echo "    ✅ Promoted ${img} to ${release_version}"
       fi
     done
+
+    # `latest` in a release registry is the newest release, moved here once
+    # the registry holds every image of the version. A patch from an older
+    # release line leaves it where it is.
+    if [ "${moves_latest}" = "true" ]; then
+      for img in "${images[@]}"; do
+        docker buildx imagetools create --prefer-index=false \
+          --tag "${release_prefix}/${img}:${DEFAULT_IMAGE_REFERENCE}" \
+          "${candidate_prefix}/${img}:${resolved_commit}" || return 1
+      done
+      echo "  • ${release_prefix}: ${DEFAULT_IMAGE_REFERENCE} is ${release_version}"
+    fi
   done
 }

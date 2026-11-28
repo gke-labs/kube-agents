@@ -1860,15 +1860,15 @@ Mutation(
     ),
     Mutation(
         # Originally aimed at chart-release.yml, which main has since deleted;
-        # the ghcr publisher has the identical permissions shape and the same
+        # the image publisher has the same permissions shape and the same
         # story -- an image pusher quietly gaining the credential that can
         # push to this repository.
         "B4-extra-contents-write-holder",
         ".github/workflows/docker-publish-ghcr.yml",
-        ("      contents: read\n      packages: write\n",
-         "      contents: write\n      packages: write\n"),
+        ("      contents: read\n      id-token: write\n",
+         "      contents: write\n      id-token: write\n"),
         "test_B4_contents_write_is_confined_to_the_release_path",
-        "give the ghcr image publisher contents: write so it can cut a GitHub "
+        "give the image publisher contents: write so it can cut a GitHub "
         "release alongside the OCI push -- an extra holder of the credential "
         "that can push to this repository, added in a one-word diff",
     ),
