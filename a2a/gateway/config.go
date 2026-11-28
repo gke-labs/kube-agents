@@ -923,7 +923,7 @@ type Config struct {
 	// task may make (A2A_DELEGATION_ROUNDS_MAX), each minted or refused
 	// using up one; a request past it is refused under delegation.rounds.
 	// With rounds left, a request while the last round's children still run
-	// is no new round and stays a busy ignore; with none left (the default
+	// is no new round and is refused as busy (delegation.busy, using no round); with none left (the default
 	// of one) it is refused like any other. A profile task's delegateTargets part
 	// advertises it when over one.
 	//

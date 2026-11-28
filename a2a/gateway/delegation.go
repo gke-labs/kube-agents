@@ -264,7 +264,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			// A profile parent waits open on the children its request
 			// minted: one past its rounds is refused to it, and ends
 			// nothing. A request with rounds left while those children
-			// run is no new round, and stays the busy ignore below.
+			// run is no new round, and is refused as busy below.
 			if profileParent && roundsUsed(parent) >= g.cfg.DelegationRoundsMax {
 				// Told its children will still report back only while one
 				// of them has an end to send.
@@ -278,7 +278,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 			// Rounds left: the next round waits for this one to settle,
 			// every child's end recorded (a batch) or the child ended and
 			// the conversation back with the parent (a single child). A
-			// request before that is no new round.
+			// request before that is no new round: a session parent's is
+			// ignored, a profile parent's refused as busy.
 			if !profileParent {
 				ignore(ruleDelegationBusy, "child", last)
 				return
