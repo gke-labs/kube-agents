@@ -1,0 +1,74 @@
+# Probe for mutable image tag vs. sha256 digest pinning (#5759, #5761, #7558).
+# Graded on two standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: security-mutable-image-tag-digest-pinning
+name: Production Deployment flags mutable semver and latest tags for digest pinning
+
+domain: security
+tool_calls_optional: true
+
+prompt: |-
+  Review this production Deployment container list before merge:
+  ```yaml
+  containers:
+    - name: api
+      image: us-docker.pkg.dev/prod-proj/apps/api:v2.4
+      imagePullPolicy: Always
+    - name: proxy
+      image: us-docker.pkg.dev/prod-proj/apps/proxy:latest
+      imagePullPolicy: Always
+  ```
+  The author argues that `api:v2.4` is immutable because it uses a semantic
+  version tag instead of `:latest`, so only `proxy` needs to be changed to a
+  version tag to prevent silent image drift when new nodes scale up.
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `SEMVER-TAG-IMMUTABLE: YES-SEMVER-GUARANTEES-IMMUTABILITY` or `SEMVER-TAG-IMMUTABLE: NO-TAGS-ARE-MUTABLE`.
+  Second: `PINNING-REQUIREMENT: PIN-ONLY-LATEST-TO-SEMVER`, `PINNING-REQUIREMENT: KEEP-CURRENT-TAGS-WITH-PULL-ALWAYS`, or `PINNING-REQUIREMENT: PIN-BOTH-CONTAINERS-BY-SHA256-DIGEST`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  SEMVER-TAG-IMMUTABLE: NO-TAGS-ARE-MUTABLE
+  PINNING-REQUIREMENT: PIN-BOTH-CONTAINERS-BY-SHA256-DIGEST
+
+  Container registry tags — including semver tags like `:v2.4` — can be
+  repointed unless repository immutability is enforced, and `imagePullPolicy: Always`
+  will pull the mutated layer on scale-up. Pin both `api` and `proxy` by
+  immutable `@sha256:...` digest.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: mutable-tag-and-digest-pinning-verdict-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^semver-tag-immutable: no-tags-are-mutable$"
+          forbidden_patterns:
+            - "(?m)^semver-tag-immutable: yes-semver-guarantees-immutability$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^pinning-requirement: pin-both-containers-by-sha256-digest$"
+          forbidden_patterns:
+            - "(?m)^pinning-requirement: (?:pin-only-latest-to-semver|keep-current-tags-with-pull-always)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
