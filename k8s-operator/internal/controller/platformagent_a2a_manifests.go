@@ -538,13 +538,13 @@ const (
 	// the gateway under the same name: how many delegate requests one
 	// profile task may make (the gateway's delegation.rounds rule, #6789).
 	// The chart sets it from operator.delegation.roundsMax. Rendered
-	// explicitly at 1, the only value supported until a profile task's later
-	// rounds land: the operator refuses any other value, logging why at
+	// explicitly at 1, the only value supported for now (lifting it is a
+	// later change): the operator refuses any other value, logging why at
 	// startup (ValidateA2ADelegationRoundsMax) and rendering 1, and the
 	// gateway clamps one over 1 the same way.
 	a2aDelegationRoundsMaxEnvVar = "A2A_DELEGATION_ROUNDS_MAX"
 	// a2aDelegationRoundsSupported is the one value a2aDelegationRoundsMax
-	// renders until rounds past the first are supported.
+	// renders for now.
 	a2aDelegationRoundsSupported = 1
 	// a2aCardStopTimeout is the gateway's default wait for a card-stop
 	// control, rendered explicitly: above the bridge's worst case for one

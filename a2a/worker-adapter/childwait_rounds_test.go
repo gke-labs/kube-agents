@@ -234,3 +234,266 @@ func TestACallBeforeAHeldDeliveryReachesTheModelStartsNoRound(t *testing.T) {
 		t.Fatalf("%d delegate artifacts, want the first round's only", n)
 	}
 }
+
+// roundsRig starts a dispatched run of a parent stub that delegates once per
+// round for stubRounds rounds, with advertised rounds, the given driver and
+// deadline, and waits until the stub has its opening turn.
+func roundsRig(t *testing.T, name string, advertised, stubRounds int, drv Driver, deadline time.Duration) (cfg Config, dir, url, addressee, taskID string, done <-chan runOutcome) {
+	t.Helper()
+	url = startServer(t)
+	c := testClient(t, url)
+	addressee, taskID = "auditor-"+name, "task-"+name
+	submitWithParts(t, c, addressee, taskID, "audit prod", roundsPart(t, advertised))
+	dir, err := os.MkdirTemp("", "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	cfg = adapterConfig(url, taskID, addressee, roundsParentStub(t, dir, stubRounds))
+	cfg.DelegateSocket = filepath.Join(dir, "d.sock")
+	cfg.TaskDeadline = deadline
+	cfg.Driver = drv
+	done = runDispatched(context.Background(), cfg)
+	waitPath(t, filepath.Join(dir, "armed"), "the parent stub never started")
+	return cfg, dir, url, addressee, taskID, done
+}
+
+// Under a driver that doesn't hold steers, a round's ends that settle
+// mid-turn are written onto stdin at once, but the harness reads them only
+// at the turn's end: until then the model hasn't seen them, so a call in that
+// turn is still waiting on them, not the start of the next round. Once the
+// turn ends and the delivery is read, a call starts round two.
+func TestACallBeforeAQueuedDeliveryReachesTheModelStartsNoRound(t *testing.T) {
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-queued", 2, 2, &toyDriver{}, 2*time.Minute)
+	c := testClient(t, url)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("round one's delegate reply = %+v", reply)
+	}
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes.", Round: 1}))
+	time.Sleep(childWaitPause)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "again"}); reply.OK || reply.Message != refuseWhileWaiting {
+		t.Fatalf("a call while the delivery waits on stdin = %+v, want refused with %q", reply, refuseWhileWaiting)
+	}
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	if got, want := readClose(t, dir, 1), fmt.Sprintf(childDeliveryCloseRoundsLeft, 1, "round"); got != want {
+		t.Fatalf("round one's delivery closes %q, want %q", got, want)
+	}
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "which node is unhealthy?"}); !reply.OK {
+		t.Fatalf("round two's delegate reply, once the delivery was read = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.2"))
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-2", Addressee: "cluster", State: lib.StateCompleted, Text: "node-2 is NotReady.", Round: 2}))
+	if got := readClose(t, dir, 2); got != childDeliveryClose {
+		t.Fatalf("round two's delivery closes %q, want %q", got, childDeliveryClose)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	if n := delegateArtifacts(t, url, addressee, taskID); n != 2 {
+		t.Fatalf("%d delegate artifacts, want one per round", n)
+	}
+}
+
+// Each round arms its own reserve: a round two whose children never report
+// is delivered by the reserve ahead of the deadline, as round one would be,
+// rather than left open until the deadline ends the task.
+func TestASecondRoundsWaitIsDeliveredByTheReserve(t *testing.T) {
+	// The reserve is half of a short budget: it delivers 4s in. Round one
+	// settles well before it, so round two starts with time left.
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-reserve2", 3, 2, &toyDriver{}, 8*time.Second)
+	c := testClient(t, url)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("round one's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes.", Round: 1}))
+	readClose(t, dir, 1)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "which node is unhealthy?"}); !reply.OK {
+		t.Fatalf("round two's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.2"))
+	if got := readClose(t, dir, 2); got != childDeliveryClose {
+		t.Fatalf("the reserve's delivery of round two closes %q, want %q", got, childDeliveryClose)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+}
+
+// With its rounds used and the last round's delivery held for the turn's
+// result, a call is refused as having delegated, with its results still to
+// come: the model hasn't seen them, so it isn't told they were delivered.
+func TestARoundsUsedRefusalBeforeTheDeliveryIsReadSaysTheResultsAreComing(t *testing.T) {
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-used-held", 1, 1, &toyDriver{hold: true}, 2*time.Minute)
+	c := testClient(t, url)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("delegate reply = %+v", reply)
+	}
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes.", Round: 1}))
+	time.Sleep(childWaitPause)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "again"}); reply.OK || reply.Message != refuseSecondDelegation {
+		t.Fatalf("a call while the delivery is held = %+v, want refused with %q", reply, refuseSecondDelegation)
+	}
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	readClose(t, dir, 1)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "and again"}); reply.OK || reply.Message != refuseAfterDelivery {
+		t.Fatalf("a call after the delivery was read = %+v, want refused with %q", reply, refuseAfterDelivery)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+}
+
+// A held delivery's close is written for when the model reads it: settled
+// with a round left but written after the reserve's time, it offers none,
+// since a call then would be refused.
+func TestAHeldDeliveryWrittenAfterTheReserveOffersNoRound(t *testing.T) {
+	// The reserve's time is half of a short budget: 4s in.
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-held-late", 2, 1, &toyDriver{hold: true}, 8*time.Second)
+	start := time.Now()
+	c := testClient(t, url)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("delegate reply = %+v", reply)
+	}
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes.", Round: 1}))
+	// Settled at once, held; the turn ends after the reserve's time.
+	time.Sleep(time.Until(start.Add(4*time.Second + childWaitPause)))
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	if got := readClose(t, dir, 1); got != childDeliveryClose {
+		t.Fatalf("the held delivery, written after the reserve's time, closes %q, want %q", got, childDeliveryClose)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+}
+
+// A round-two request the gateway refuses because its round one hasn't
+// settled (#7547) comes back as a busy delegationRefused tagged round 2: it
+// ends round two's wait at once, and since the gateway didn't count it as a
+// round, neither does the worker. The delivery offers the round again, a
+// call after it is round two once more (as the gateway numbers it), and that
+// round's ends settle it. A round-one end that arrives late is dropped, since
+// round one's delivery is already the model's.
+func TestABusyRefusalEndsItsRoundsWaitAndUsesNoRound(t *testing.T) {
+	// A long budget puts the reserve minutes out, so only the refusal can
+	// deliver round two within readClose's wait.
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-busy-refused", 2, 3, &toyDriver{}, 20*time.Minute)
+	c := testClient(t, url)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("round one's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateFailed, Text: "withdrawn"}))
+	readClose(t, dir, 1)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "again"}); !reply.OK {
+		t.Fatalf("round two's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.2"))
+	busy, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: "⚠️ delegation refused: this task's last round of delegated tasks hasn't finished on the gateway, so another round can't start yet", Round: 2, Busy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendChildEnd(t, c, addressee, taskID, busy)
+	if got, want := readClose(t, dir, 2), fmt.Sprintf(childDeliveryCloseRoundsLeft, 1, "round"); got != want {
+		t.Fatalf("the busy refusal's delivery closes %q, want %q (the round wasn't used)", got, want)
+	}
+	// Round one's child, still running when it was withdrawn, reports late.
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes."}))
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "again, now it has settled"}); !reply.OK {
+		t.Fatalf("the retried round two's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.3"))
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-2", Addressee: "cluster", State: lib.StateCompleted, Text: "node-2 is NotReady.", Round: 2}))
+	if got := readClose(t, dir, 3); got != childDeliveryClose {
+		t.Fatalf("the retried round two's delivery closes %q, want %q", got, childDeliveryClose)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	if r := artifactText(foldTask(t, c, addressee, taskID), lib.ArtifactResult); r != "the report" {
+		t.Fatalf("result %q, want the answer after the last delivery", r)
+	}
+}
+
+// A refusal for the round the wait is on that isn't busy (the request was
+// refused on its merits) used its round, as the gateway counts it: the
+// delivery offers no more than the rounds left after it.
+func TestANonBusyRefusalOfALaterRoundUsesItsRound(t *testing.T) {
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-refused2", 2, 2, &toyDriver{}, 20*time.Minute)
+	c := testClient(t, url)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("round one's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes."}))
+	readClose(t, dir, 1)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit staging"}); !reply.OK {
+		t.Fatalf("round two's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.2"))
+	refused, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: "⚠️ delegation refused: cluster staging is outside this install's scope", Round: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendChildEnd(t, c, addressee, taskID, refused)
+	if got := readClose(t, dir, 2); got != childDeliveryClose {
+		t.Fatalf("a refused round two's delivery closes %q, want %q", got, childDeliveryClose)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+}
+
+// The gateway's side of #7547 numbers the request after a busy refusal as
+// the same round: one refused on its merits then comes back tagged round 2,
+// which ends the worker's retried round-two wait rather than leaving it to
+// wait on a round the gateway never started.
+func TestAfterABusyRefusalANormalRefusalOfTheSameRoundEndsTheWait(t *testing.T) {
+	cfg, dir, url, addressee, taskID, done := roundsRig(t, "rounds-busy-then-refused", 3, 3, &toyDriver{}, 20*time.Minute)
+	c := testClient(t, url)
+	refusal := func(text string, round int, busy bool) lib.Part {
+		t.Helper()
+		p, err := lib.DelegationRefusalPart(lib.DelegationRefusal{Text: text, Round: round, Busy: busy})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "audit prod"}); !reply.OK {
+		t.Fatalf("round one's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.1"))
+	sendChildEnd(t, c, addressee, taskID, childPart(t, lib.ChildResult{ChildTaskID: "child-1", Addressee: "cluster", State: lib.StateCompleted, Text: "prod has 3 nodes."}))
+	readClose(t, dir, 1)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "again"}); !reply.OK {
+		t.Fatalf("round two's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.2"))
+	sendChildEnd(t, c, addressee, taskID, refusal("⚠️ delegation refused: this task's last round of delegated tasks hasn't finished on the gateway, so another round can't start yet", 2, true))
+	readClose(t, dir, 2)
+	if reply := askDelegate(t, cfg.DelegateSocket, lib.DelegateRequest{Addressee: "cluster", Text: "two clusters, too wide"}); !reply.OK {
+		t.Fatalf("the retried round two's delegate reply = %+v", reply)
+	}
+	touchFile(t, filepath.Join(dir, "asked.3"))
+	sendChildEnd(t, c, addressee, taskID, refusal("⚠️ delegation refused: too many tasks in one request", 2, false))
+	if got, want := readClose(t, dir, 3), fmt.Sprintf(childDeliveryCloseRoundsLeft, 1, "round"); got != want {
+		t.Fatalf("the refused retried round two's delivery closes %q, want %q", got, want)
+	}
+	touchFile(t, filepath.Join(dir, "go"))
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+}

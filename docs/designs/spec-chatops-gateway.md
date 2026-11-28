@@ -982,11 +982,11 @@ The tool's reply tells the model its children's results arrive as its next turn.
 saying how many delegated tasks it waits on. A delegate call past the rounds the submission's
 `delegateTargets` part advertises (`roundsMax`, one when absent) is refused at the tool, so at one
 a second call is refused. With rounds left, a call while the last round's children run is refused
-(their results come first), and so is one while a delivery is held for the turn's result, which the model hasn't seen yet, or once the deadline reserve's time has come (a new round's children couldn't report). A call after the delivery starts the next round: a new wait on that round's entries, whose result is held like the first's, and the delivery's closing line offers the rounds left, or says to answer when none is. Once the results are delivered and no round is left, every refusal says so instead of promising them as the next turn. The worker reads each `childResult` on
+(their results come first), and so is one while the model hasn't read the delivery yet: held for the turn's result under a driver that holds steers, or written onto stdin behind the running turn under one that doesn't. A later round's call is refused, too, once the deadline reserve's time has come (a new round's children couldn't report). A call after the model has the delivery starts the next round: a new wait on that round's entries, with its own reserve, whose result is held like the first's. The delivery's closing line, built when it is written, offers the rounds left then, or says to answer when none is. Once the results are delivered, read and no round is left, every refusal says so instead of promising them as the next turn. The worker reads each `childResult` on
 the task's `.in`, deduping on `round` and `entry` when `entry` is set and on `childTaskId` otherwise
 (an absent `round` reads as one, and an older gateway's ends carry no `entry` and read as a single
 delegation's), and counts its own round's ends to the entries it asked for: an end for another round isn't counted, so it can't complete the wait or hide a missing entry. When every entry has its end, or a
-`delegationRefused` for the round the wait is on arrives, it writes them to the same harness as one user turn. Under a driver that holds steers, ends that arrive mid-turn are held for that turn's result; if a cancel or the deadline comes first, the delivery isn't written, and the stop decides the task's end. A refusal for a lower round (stale) or a higher one (a later request's) is logged and
+`delegationRefused` for the round the wait is on arrives, it writes them to the same harness as one user turn. A refusal marked `busy` (the gateway refused only because the last round hadn't settled, #7547) uses no round, as the gateway counts none, so the delivery offers the round again. Under a driver that holds steers, ends that arrive mid-turn are held for that turn's result; if a cancel or the deadline comes first, the delivery isn't written, and the stop decides the task's end. A refusal for a lower round (stale) or a higher one (a later request's) is logged and
 dropped: the wait goes on for the children already running. At the task's
 deadline less a reserve, the larger of two minutes and 15% of the task's budget but at most half of
 it, it delivers what has arrived and names the entries that sent nothing, so the parent still
@@ -995,7 +995,7 @@ tasks and not instructions, and quotes each end line by line under a line giving
 task, addressee and state. Each end is cut to 64 KiB and scrubbed with the task's seen secret values
 and the shape rules, and none of its text is added to the seen set. The scrub redacts secrets; the
 framing is the defence against an instruction in a child's text, and one that gets through can do
-at most what the parent's own grant allows. The harness's next result is the task's deliverable,
+at most what the parent's own grant allows. The harness's next result after the last delivery (one whose turn starts no new round) is the task's deliverable,
 held to the same checks as any other answer (one that opens with unstructured reasoning is
 withheld), and the task's final status is what cancels any child still running. An open parent
 holds its worker pod, its task consumer and its dispatch lease for the whole fan-out. A delegating

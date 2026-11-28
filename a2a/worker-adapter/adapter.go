@@ -1256,10 +1256,16 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		// halted is every stop recorded for the task (halt). A respawn
 		// needs it empty.
 		halted []supervisorStop
-		// heldDelivery is a settled wait's delivery turn under a driver
-		// that holds steers, when it settled mid-turn: written at that
-		// turn's result, after PrepareTurn.
-		heldDelivery string
+		// heldWhy is why a settled wait settled, while its delivery turn is
+		// held under a driver that holds steers because it settled mid-turn:
+		// the delivery is built and written at that turn's result, after
+		// PrepareTurn, so its close counts the rounds left then.
+		heldWhy string
+		// deliveryAhead is how many turns run before a written delivery's
+		// own: one written mid-turn under a driver that doesn't hold steers
+		// waits on stdin until the running turn (and any steer queued before
+		// it) ends. Until then, as while it is held, the model hasn't read it.
+		deliveryAhead int
 	)
 
 	// halt records a stop. Every place below that stops the task calls it.
@@ -1352,6 +1358,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			log.Warn("delivering the delegated tasks' results failed", "task", a.taskID, "err", err)
 			return
 		}
+		deliveryAhead = pendingTurns
 		pendingTurns++
 		log.Info("delegated tasks' results delivered as one turn", "task", a.taskID)
 	}
@@ -1361,7 +1368,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 	// which reads the seen-values set and never feeds it). Written at once
 	// when the harness is between turns or queues a mid-turn message; a
 	// driver that holds steers gets it at the running turn's result
-	// (heldDelivery).
+	// (heldWhy).
 	// reserveAt is when the deadline reserve fires (childWaitReserve). A
 	// round may start only before it: a later one's children couldn't
 	// report before the reserve delivers.
@@ -1375,6 +1382,20 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		return max(max(a.delegateRounds, 1)-roundsUsed, 0)
 	}
+	// deliveryText is the settled wait's delivery, built when it is
+	// written: its close offers the rounds left then, and none after the
+	// reserve delivered it.
+	deliveryText := func(why string) string {
+		left := 0
+		if why != "deadline-reserve" {
+			left = roundsLeft()
+		}
+		return wait.childDelivery(a.scrub, left)
+	}
+	// deliveryUnread is whether the settled wait's delivery has yet to reach
+	// the model: held for the turn's result, or written and queued behind
+	// the running turn.
+	deliveryUnread := func() bool { return heldWhy != "" || deliveryAhead > 0 }
 	deliver := func(why string) {
 		if wait == nil || wait.delivered {
 			return
@@ -1386,17 +1407,12 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 		}
 		log.Info("delegated tasks' wait settled", "task", a.taskID, "why", why,
 			"results", len(wait.got), "asked", len(wait.asked), "refused", wait.refusal != nil)
-		left := 0
-		if why != "deadline-reserve" {
-			left = roundsLeft()
-		}
-		text := wait.childDelivery(a.scrub, left)
 		if holdSteers && pendingTurns > 0 {
-			heldDelivery = text
+			heldWhy = why
 			log.Info("delivery held until the turn boundary", "task", a.taskID)
 			return
 		}
-		writeDelivery(text)
+		writeDelivery(deliveryText(why))
 	}
 	defer func() {
 		if reserve != nil {
@@ -1516,6 +1532,9 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 							}
 						}
 						pendingTurns--
+						if deliveryAhead > 0 {
+							deliveryAhead--
+						}
 						// Another turn follows when a steer is held and the turn
 						// neither failed nor was ended by cancel or the deadline,
 						// whose kill is already on its way. One steer per
@@ -1571,20 +1590,21 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 								a.publishWorkingNote(waitingText(wait.outstanding()))
 							}
 							continue
-						} else if pendingTurns <= 0 && heldDelivery != "" && !canceled && !deadlineHit {
+						} else if pendingTurns <= 0 && heldWhy != "" && !canceled && !deadlineHit {
 							// The children's ends arrived mid-turn under a driver
 							// that holds steers: this boundary is the delivery
-							// turn's, and its result is the deliverable.
-							text := heldDelivery
-							heldDelivery = ""
-							writeDelivery(text)
+							// turn's, and its result is the deliverable unless
+							// that turn starts another round.
+							why := heldWhy
+							heldWhy = ""
+							writeDelivery(deliveryText(why))
 							continue
-						} else if pendingTurns <= 0 && heldDelivery != "" {
+						} else if pendingTurns <= 0 && heldWhy != "" {
 							// Cancel or the deadline came while the children's
 							// ends were held: the delivery turn won't run, and
 							// this result was written before they reported, so
 							// it isn't the deliverable. The stop decides the end.
-							heldDelivery = ""
+							heldWhy = ""
 							log.Info("held delivery dropped: the task was stopped first", "task", a.taskID,
 								"canceled", canceled, "deadline", deadlineHit)
 							proc.closeStdin()
@@ -1660,7 +1680,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					if a.delegateRounds > 1 {
 						msg = fmt.Sprintf(refuseRoundsUsed, a.delegateRounds)
 					}
-					if wait != nil && wait.delivered {
+					if wait != nil && wait.delivered && !deliveryUnread() {
 						msg = refuseAfterDelivery
 					}
 					ask.reply <- delegateReply{Message: msg}
@@ -1668,7 +1688,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				}
 				// A delivery held for the turn boundary hasn't reached the model
 				// yet: the round it settled is still the one being waited on.
-				if wait != nil && (!wait.delivered || heldDelivery != "") {
+				if wait != nil && (!wait.delivered || deliveryUnread()) {
 					ask.reply <- delegateReply{Message: refuseWhileWaiting}
 					continue
 				}
@@ -1747,8 +1767,15 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 					continue
 				}
 				if end.refusal != nil {
-					// Nothing was minted: the whole wait ends.
+					// Nothing was minted: the whole wait ends. A busy
+					// refusal (the last round hadn't settled on the gateway,
+					// #7547) used no round there, so it uses none here: the
+					// delivery offers the round again, and the next request
+					// is numbered as the gateway numbers it.
 					wait.refusal = end.refusal
+					if end.refusal.Busy && roundsUsed > 0 {
+						roundsUsed--
+					}
 					deliver("refused")
 					continue
 				}
