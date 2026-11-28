@@ -1566,6 +1566,11 @@
 # characters. deployer: noop, read-only on the project.
 ./tasks/networking-declared-intent-no-finding/task.yaml
 
+# Probe for Shared VPC host-project firewall rule correlation with exposed
+# GKE LoadBalancer Services (#2591, #2587, #7552). Structured two-line
+# declaration check; deployer: noop, read-only.
+./tasks/networking-shared-vpc-firewall-service/task.yaml
+
 # The networking audit's firewall-world-open-ingress check over a standing
 # plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
 # the internet on one VM with an external IP. deployer: noop, read-only on the
