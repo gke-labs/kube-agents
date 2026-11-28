@@ -706,6 +706,21 @@ FIXTURE_NOT_READY = {
         "snapshots date from 2026-11-18, so the compute audit first sees them on "
         "2027-02-17 and the case cannot be red or green before then"
     ),
+    # Needs a node pool made with `--reservation-affinity any` and one
+    # reservation of the pool's machine type in a zone where the pool makes
+    # no node. The pool costs nothing with zero nodes, but a reservation is
+    # billed while it exists, in each pool project. The stockout collector's
+    # 3.10(e) is graded by its unit tests on shapes read from a throwaway
+    # cluster, and by runs on a dev install that plant the pair for the run.
+    # The case's second pair, for the machine type arm of 3.10(d), is a pool
+    # that names a reservation of another machine type in the pool's zone; it
+    # needs a standing reservation in the same way.
+    "stockout-any-reservation-other-zone": (
+        "#6954: needs a zero-node pool with ANY_RESERVATION and a standing one-VM reservation of "
+        "its machine type in another zone, and a zero-node pool that names a standing one-VM "
+        "reservation of another machine type in its zone; a reservation is billed while it exists, "
+        "and no pool project carries one"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
