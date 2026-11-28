@@ -102,6 +102,7 @@ func renderTeamsChat(m *chatmsg.Message) (teamsChatLayout, error) {
 	}
 	add(teamsChatHead(m))
 	add(teamsChatFlat(m.Detail))
+	beforeRows := strings.Join(sections, teamsChatSectionGap)
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(teamsChatPlan(m.Plan))
 	} else {
@@ -117,7 +118,7 @@ func renderTeamsChat(m *chatmsg.Message) (teamsChatLayout, error) {
 		Links:   teamsLinkActions(m.Links),
 	}
 	if m.Plan == nil || len(m.Plan.Items) == 0 {
-		layout.Rows = teamsBoardRowSets(m.Rows)
+		layout.Rows = teamsBoardRowSets(m.Rows, beforeRows)
 	}
 	if layout.Text == "" && len(layout.Choices) == 0 && len(layout.Links) == 0 {
 		return teamsChatLayout{}, errTeamsChatEmpty

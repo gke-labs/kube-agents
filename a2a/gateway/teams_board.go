@@ -65,6 +65,12 @@ const (
 	// on its own: the row's text, then the line.
 	teamsBoardLabelRunes = 120
 	teamsBoardLabelCut   = "…"
+	// teamsBoardEmphasis is the markdown emphasis mark a label drops.
+	teamsBoardEmphasis = "*"
+	// teamsBoardRowSkip is how many blocks with the row's text come before
+	// the row's own in the card: a row with no buttons, or a bullet above
+	// the rows, that reads the same.
+	teamsBoardRowSkip    = "skip"
 	teamsBoardPostedLine = "%s: %s"
 
 	// The reasons a board press is not a turn, for the pull loop's log.
@@ -101,9 +107,13 @@ func (a *TeamsAdapter) SetBoardAdmits(admits BoardAdmits) {
 
 // teamsBoardLabel is the row's text as its buttons carry it, on one line and
 // cut at teamsBoardLabelRunes: what names the task in a press's line that
-// is posted on its own.
+// is posted on its own. It is plain words: the emphasis marks are dropped,
+// so a cut never leaves one open, and a markdown link is taken apart
+// (teamsLinkApart, as teamsLineWords does), so the posted line draws no
+// link a press's sender, or a task's title, chose.
 func teamsBoardLabel(text string) string {
-	label := []rune(strings.TrimSpace(strings.TrimPrefix(gchatOneLine(text), teamsChatRowBullet)))
+	plain := strings.ReplaceAll(strings.TrimPrefix(gchatOneLine(text), teamsChatRowBullet), teamsBoardEmphasis, "")
+	label := []rune(strings.TrimSpace(strings.ReplaceAll(plain, teamsLinkJoin, teamsLinkApart)))
 	if len(label) > teamsBoardLabelRunes {
 		return string(label[:teamsBoardLabelRunes-len([]rune(teamsBoardLabelCut))]) + teamsBoardLabelCut
 	}
@@ -111,13 +121,26 @@ func teamsBoardLabel(text string) string {
 }
 
 // teamsBoardRowSets is one set per row that asks for buttons, in the rows'
-// order: the row's block as the card builder writes it, and a button per
-// action the adapter draws.
-func teamsBoardRowSets(rows []chatmsg.Row) []map[string]any {
+// order: the row's block as the card builder writes it, how many blocks
+// that read the same come before it (in before, the card's text ahead of
+// the rows, or among the rows), and a button per action the adapter draws.
+func teamsBoardRowSets(rows []chatmsg.Row, before string) []map[string]any {
+	seen := map[string]int{}
+	for _, line := range strings.Split(before, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), teamsBulletDash) {
+			seen[teamsBoardBlockText(line)]++
+		}
+	}
 	var sets []map[string]any
 	for i, r := range rows {
 		line, ok := teamsChatRowLine(r)
-		if !ok || len(r.Tasks) == 0 {
+		if !ok {
+			continue
+		}
+		block := teamsBoardBlockText(line)
+		skip := seen[block]
+		seen[block]++
+		if len(r.Tasks) == 0 {
 			continue
 		}
 		tasks := strings.Join(r.Tasks, teamsBoardTaskSeparator)
@@ -144,7 +167,8 @@ func teamsBoardRowSets(rows []chatmsg.Row) []map[string]any {
 		}
 		sets = append(sets, map[string]any{
 			"type":               teamsBoardRowType,
-			teamsBoardRowBlock:   teamsBoardBlockText(line),
+			teamsBoardRowBlock:   block,
+			teamsBoardRowSkip:    skip,
 			teamsBoardRowNumber:  i,
 			teamsBoardRowActions: buttons,
 		})
@@ -160,9 +184,11 @@ func teamsBoardBlockText(line string) string {
 
 // teamsPlaceBoardRows takes the rows' sets out of actions and puts each in
 // card's body under its row's block: the line a press left, then the row's
-// buttons. Sets are matched to blocks in order, so two rows with the same
-// text each get their own; a set whose block is not in the body goes at the
-// body's end rather than being lost. It returns the buttons left.
+// buttons. A set goes under the block with its row's text that has as many
+// same-text blocks before it as the set says (teamsBoardRowSkip), so a
+// bullet or a row without buttons that reads the same never takes another
+// row's; a set whose block is not in the body goes at the body's end rather
+// than being lost. It returns the buttons left.
 func teamsPlaceBoardRows(card map[string]any, actions []map[string]any) []map[string]any {
 	var rest, sets []map[string]any
 	for _, action := range actions {
@@ -176,14 +202,22 @@ func teamsPlaceBoardRows(card map[string]any, actions []map[string]any) []map[st
 		return actions
 	}
 	body, _ := card["body"].([]map[string]any)
-	out := make([]map[string]any, 0, len(body)+2*len(sets))
+	var out []map[string]any
 	next := 0
+	seen := map[string]int{}
 	for _, block := range body {
 		out = append(out, block)
-		if next < len(sets) && block["type"] == teamsCardTextBlock && block["text"] == sets[next][teamsBoardRowBlock] {
-			out = append(out, teamsBoardRowBlocks(sets[next])...)
-			next++
+		text, isText := block["text"].(string)
+		if !isText || block["type"] != teamsCardTextBlock {
+			continue
 		}
+		if next < len(sets) && text == sets[next][teamsBoardRowBlock] {
+			if skip, _ := sets[next][teamsBoardRowSkip].(int); seen[text] == skip {
+				out = append(out, teamsBoardRowBlocks(sets[next])...)
+				next++
+			}
+		}
+		seen[text]++
 	}
 	for ; next < len(sets); next++ {
 		out = append(out, teamsBoardRowBlocks(sets[next])...)
@@ -340,6 +374,7 @@ func teamsBoardRowDrawn(card teamsChatCard, row int, line string, settled bool) 
 		set := map[string]any{
 			"type":              teamsBoardRowType,
 			teamsBoardRowBlock:  action[teamsBoardRowBlock],
+			teamsBoardRowSkip:   action[teamsBoardRowSkip],
 			teamsBoardRowNumber: row,
 			teamsBoardRowNote:   line,
 		}

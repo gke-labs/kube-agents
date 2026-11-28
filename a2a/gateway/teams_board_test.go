@@ -321,7 +321,7 @@ func TestTeamsPlaceBoardRowsMatchesInOrder(t *testing.T) {
 	rest := teamsPlaceBoardRows(card, []map[string]any{
 		{"type": teamsActionOpenURL, "title": "a link"},
 		{"type": teamsBoardRowType, teamsBoardRowBlock: "• same", teamsBoardRowNumber: 0, teamsBoardRowActions: button("first")},
-		{"type": teamsBoardRowType, teamsBoardRowBlock: "• same", teamsBoardRowNumber: 1, teamsBoardRowActions: button("second")},
+		{"type": teamsBoardRowType, teamsBoardRowBlock: "• same", teamsBoardRowSkip: 1, teamsBoardRowNumber: 1, teamsBoardRowActions: button("second")},
 		{"type": teamsBoardRowType, teamsBoardRowBlock: "• gone", teamsBoardRowNumber: 2, teamsBoardRowActions: button("third")},
 	})
 	if len(rest) != 1 || rest[0]["title"] != "a link" {
@@ -348,7 +348,7 @@ func TestTeamsBoardButtonsCarryTheRowsText(t *testing.T) {
 	sets := teamsBoardRowSets([]chatmsg.Row{
 		{Text: "Roll out\ncheckout", Tasks: []string{"t_1"}, Actions: []string{chatmsg.RowActionRetry}},
 		{Text: long, Tasks: []string{"t_2"}, Actions: []string{chatmsg.RowActionDrop}},
-	})
+	}, "")
 	if len(sets) != 2 {
 		t.Fatalf("%d sets, want 2", len(sets))
 	}
@@ -401,5 +401,46 @@ func TestTeamsBoardRowTakesOnePressAndNoneOnceSettled(t *testing.T) {
 	relay.mu.Unlock()
 	if n != 2 {
 		t.Fatalf("%d calls, want the post and one redraw", n)
+	}
+}
+
+// A label is plain words: a bold title cut short leaves no emphasis mark
+// open, and a markdown link, in a title or in a press's own payload, is
+// taken apart, so the line the bot posts draws no link of another's making.
+func TestTeamsBoardLabelIsPlainWords(t *testing.T) {
+	bold := "**" + strings.Repeat("a long title ", 12) + "**"
+	for _, c := range []struct{ in, want string }{
+		{"**Roll out checkout** (2 tasks)", "Roll out checkout (2 tasks)"},
+		{"[see this](https://example.com/x)", "[see this] (https://example.com/x)"},
+		{"- **a row's line**", "a row's line"},
+	} {
+		if got := teamsBoardLabel(c.in); got != c.want {
+			t.Errorf("label of %q is %q, want %q", c.in, got, c.want)
+		}
+	}
+	if got := teamsBoardLabel(bold); strings.Contains(got, teamsBoardEmphasis) || len([]rune(got)) > teamsBoardLabelRunes {
+		t.Errorf("cut label %q", got)
+	}
+}
+
+// A row's buttons go under that row and no other block that reads the same:
+// not a bullet above the rows, and not an earlier row that has no buttons.
+func TestTeamsBoardButtonsSkipBlocksThatReadTheSame(t *testing.T) {
+	a, relay := testTeamsBoardAdapter(t, &fakeTeamsBoardActor{})
+	m := &chatmsg.Message{
+		Schema:   chatmsg.Schema,
+		Headline: "Stuck.",
+		Detail:   "- same task",
+		Rows: []chatmsg.Row{
+			{Text: "same task"},
+			{Text: "same task", Tasks: []string{"t_1"}, Actions: []string{chatmsg.RowActionRetry}},
+		},
+	}
+	if _, _, err := a.PostNotifyMessage(testTeamsChannel, "", OutMessage{Text: "Stuck.", Chat: m}); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := teamsCallBody(t, relay, 0)
+	if got, want := strings.Join(body, "\n"), "**Stuck.**\n• same task\n• same task\n• same task\n[Retry]"; got != want {
+		t.Fatalf("card body\n%s\nwant\n%s", got, want)
 	}
 }
