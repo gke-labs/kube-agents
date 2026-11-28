@@ -64,3 +64,8 @@ def test_wrong_missing_hedged_or_prose_only_fails():
         "Use --internal-ip so kubectl talks to 192.0.2.10 inside 192.0.2.0/24 instead of hitting the public endpoint through Cloud NAT.",
     ):
         assert not _passes(report), report
+
+
+def test_verbatim_prompt_echo_fails():
+    doc = yaml.safe_load(TASK.read_text())
+    assert not _passes(doc["prompt"])
