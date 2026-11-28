@@ -977,6 +977,11 @@
 # deployer: noop, no fixture.
 ./tasks/capacity-multipool-ca-scan-delay-capacitybuffer/task.yaml
 
+# Probe for node-pool vs. shared-reservation zonal mismatch and
+# reservation-not-found scale-up failures (#2900, #3006, #6954, #7299,
+# #7550). Structured two-line declaration check; deployer: noop, read-only.
+./tasks/capacity-reservation-zonal-mismatch/task.yaml
+
 # chat-answer-writes-a-table: a direct answer asked for as a table is a
 # markdown pipe table, not "Label: value | Label: value" lines. Red on the
 # api_server prompt hint that told the model to assume plain text (the Teams
