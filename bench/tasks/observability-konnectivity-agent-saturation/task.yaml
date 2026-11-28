@@ -1,0 +1,80 @@
+# Probe for Konnectivity agent saturation (#2596, #2581, #7556).
+# Graded on two standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: observability-konnectivity-agent-saturation
+name: Diagnose Konnectivity agent saturation vs. etcd or CNI outage
+
+domain: observability
+tool_calls_optional: true
+
+prompt: |-
+  On a 1,200-node Standard GKE cluster, application HTTP traffic through
+  Ingress and east-west pod-to-pod traffic are healthy, `kubectl get pods`
+  returns in under 200ms, and `metrics-server` continues scraping kubelets
+  over the VPC without errors. However, `kubectl logs`, `kubectl exec`,
+  `kubectl top` (`metrics.k8s.io` aggregated API requests from the control
+  plane), and ValidatingAdmissionWebhook calls fail intermittently with
+  `context deadline exceeded` and `dial tcp ... i/o timeout`.
+  A snapshot of `kube-system` shows:
+  - `anetd`: 1200/1200 Ready, normal CPU/memory, 0 datapath drops
+  - `kube-dns`: 14/14 Ready, 28% CPU, 1 restart in 30d
+  - `metrics-server`: 2/2 Ready, 35% CPU, internal kubelet scrapes succeeding
+  - `konnectivity-agent`: 2/2 Running, 99% of CPU limit, periodic proxy stream drops
+  An on-call engineer suspects etcd storage corruption or a CNI outage.
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `CAUSE: ETCD-STORAGE-CORRUPTION`,
+  `CAUSE: CNI-POD-TO-POD-FAILURE`,
+  `CAUSE: CONTROL-PLANE-EGRESS-TUNNEL-SATURATION`, or
+  `CAUSE: WORKLOAD-OOM-CASCADE`.
+  Second: `COMPONENT: KUBE-DNS`, `COMPONENT: METRICS-SERVER-ONLY`,
+  `COMPONENT: ETCD`, or `COMPONENT: KONNECTIVITY-AGENT`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  CAUSE: CONTROL-PLANE-EGRESS-TUNNEL-SATURATION
+  COMPONENT: KONNECTIVITY-AGENT
+
+  Control-plane reads (`kubectl get`), pod-to-pod VPC traffic, and internal
+  `metrics-server` kubelet scrapes are healthy, ruling out etcd corruption
+  and CNI failure. The failing paths (`kubectl logs`, `kubectl exec`,
+  aggregated API calls like `metrics.k8s.io`, and admission webhooks) all
+  traverse the control-plane-to-cluster egress tunnel served by
+  `konnectivity-agent`, which is saturated at 2 replicas on 1,200 nodes.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: konnectivity-saturation-cause-and-component-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^cause: control-plane-egress-tunnel-saturation$"
+          forbidden_patterns:
+            - "(?m)^cause: (?:etcd-storage-corruption|cni-pod-to-pod-failure|workload-oom-cascade)$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^component: konnectivity-agent$"
+          forbidden_patterns:
+            - "(?m)^component: (?:kube-dns|metrics-server-only|etcd)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
