@@ -1685,6 +1685,11 @@
 # seeded fleet.
 ./tasks/scope-held-cluster-is-reported/task.yaml
 
+# Probe for corporate egress proxy custom CA bundle and NO_PROXY handling
+# (#7244, #7242, #7561): reject insecureSkipVerify, mount corporate CA, and
+# bypass proxy for in-cluster endpoints. Structured check; deployer: noop.
+./tasks/security-corporate-proxy-custom-ca-bundle-tls/task.yaml
+
 # #1983: compliance-audit's ServiceEntry host collision check (2.19). A tofu
 # stack plants two namespaces exporting one host everywhere and two exporting
 # another to themselves only, on the host cluster, installing a minimal
