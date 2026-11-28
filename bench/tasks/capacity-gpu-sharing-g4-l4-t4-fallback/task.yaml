@@ -1,0 +1,92 @@
+# Probe for GPU sharing and G4/L4/T4 ComputeClass fallback (#7351, #2900, #7555).
+# Graded on two standalone declaration lines with fold_decoration: true.
+# deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: capacity-gpu-sharing-g4-l4-t4-fallback
+name: GPU time-sharing nodeSelector blocks ComputeClass fallback across G4, L4, and T4
+
+domain: capacity
+tool_calls_optional: true
+
+prompt: |-
+  Review this inference workload and its `ComputeClass` (`inference-gpu`)
+  before deployment. The `ComputeClass` defines four priority rules in order:
+  1. `pool-g4-shared` (`g4-standard-48`, `nvidia-rtx-pro-6000`, GPU
+     time-sharing `maxSharedClientsPerGpu: 4`).
+  2. `pool-l4-shared` (`g2-standard-8`, `nvidia-l4`, GPU time-sharing
+     `maxSharedClientsPerGpu: 4`).
+  3. `pool-t4-dedicated` (`n1-standard-8`, `nvidia-tesla-t4`, dedicated
+     GPUs only — GPU sharing disabled).
+  4. `pool-cpu` (`e2-standard-8`, no GPUs).
+  The Deployment pod template sets:
+  ```yaml
+  containers:
+    - name: infer
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+  nodeSelector:
+    cloud.google.com/compute-class: inference-gpu
+    cloud.google.com/gke-gpu-sharing-strategy: time-sharing
+    cloud.google.com/gke-max-shared-clients-per-gpu: "4"
+  ```
+  If both the G4 and L4 pools hit a zonal stockout while `pool-t4-dedicated`
+  and `pool-cpu` have available capacity and quota, what happens to new pods
+  of this Deployment, and what manifest/pool fix enables fallback?
+  Start your answer with exactly two lines, with nothing else on either line.
+  If you hand this question to another agent, pass these instructions word for
+  word, and keep its two lines at the start of your reply.
+  First: `FALLBACK-STATUS: AUTOMATIC-TO-T4-DEDICATED`,
+  `FALLBACK-STATUS: AUTOMATIC-TO-CPU-POOL`,
+  `FALLBACK-STATUS: BLOCKED-BY-SHARING-NODESELECTOR`, or
+  `FALLBACK-STATUS: BLOCKED-BY-QUOTA-ONLY`.
+  Second: `FIX: INCREASE-L4-MAX-NODES-ONLY`,
+  `FIX: ALIGN-SHARING-CONFIG-ACROSS-FALLBACK-POOLS`, or
+  `FIX: REMOVE-COMPUTECLASS-LABEL`.
+  Then briefly explain why. Do not change anything.
+expected_output: |-
+  FALLBACK-STATUS: BLOCKED-BY-SHARING-NODESELECTOR
+  FIX: ALIGN-SHARING-CONFIG-ACROSS-FALLBACK-POOLS
+
+  The pod's hard `nodeSelector` requires `cloud.google.com/gke-gpu-sharing-strategy: time-sharing`
+  and `max-shared-clients-per-gpu: 4`, labels present only on `pool-g4-shared`
+  and `pool-l4-shared`. Because `pool-t4-dedicated` has GPU sharing disabled
+  (and `pool-cpu` has no GPUs), fallback cannot match their nodes. Configure
+  matching GPU sharing on the T4 fallback pool (or drop the hard sharing
+  selector if dedicated GPUs are acceptable).
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: gpu-sharing-fallback-blocker-and-fix-stated
+    role: objective
+    mode: assert
+    check:
+      type: all
+      checks:
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^fallback-status: blocked-by-sharing-nodeselector$"
+          forbidden_patterns:
+            - "(?m)^fallback-status: (?:automatic-to-t4-dedicated|automatic-to-cpu-pool|blocked-by-quota-only)$"
+          fold_decoration: true
+        - type: report_contains
+          any_of_patterns:
+            - "(?m)^fix: align-sharing-config-across-fallback-pools$"
+          forbidden_patterns:
+            - "(?m)^fix: (?:increase-l4-max-nodes-only|remove-computeclass-label)$"
+          fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names:
+            - "kanban_complete"
+            - "kanban_block"
+            - "kanban_heartbeat"
