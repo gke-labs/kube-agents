@@ -16,5 +16,5 @@ The report scripts aren't in the persona: `audit_report.py` alone is over the pe
 
 - A finish that writes the shadow run's own report and nothing else. Until it exists, a shadow run finishes with `--dry-run`, which writes nothing.
 - The profile's opt-in to delegation, which delegation from a profile task requires.
-- The report store switch and a writable scratch directory on profile workers.
+- The report store switch on profile workers (#6110).
 - A live finish, and `start`'s run record. Without `start`, `finish` treats every repository as unsearched for declared intent and says so as a coverage gap.
