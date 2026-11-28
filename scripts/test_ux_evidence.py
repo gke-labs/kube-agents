@@ -1,5 +1,6 @@
 """Tests for ux_evidence.py: which paths are user-facing, and what counts as evidence."""
 
+import json
 import os
 import pathlib
 import sys
@@ -12,6 +13,30 @@ import ux_evidence as ux
 
 CHAT = ("agents/*/SOUL.md", "agents/chat/defaults/**", "a2a/lib/chatmsg/**", "a2a/gateway/slack_*.go")
 SHOT = "![slack-plan-row](https://raw.githubusercontent.com/me/kube-agents/pr-evidence/a.png)"
+
+
+def _cron_delivers_to_chat(job: dict) -> bool:
+    """Return whether a cron job specification delivers output anywhere outside 'local'.
+
+    Normalizes deliver shapes the way check_cron_delivery() in scripts/check_prompt_assets.py
+    does: handles null/absent as local, joins lists, splits comma-separated targets,
+    strips whitespace, strips channel/thread suffixes, and lower-cases targets.
+    """
+    deliver = job.get("deliver") or "local"
+    joined = (
+        ",".join(str(entry) for entry in deliver)
+        if isinstance(deliver, (list, tuple))
+        else str(deliver)
+    )
+    targets = set()
+    for part in joined.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        target = part.split(":", 1)[0].strip().lower()
+        if target:
+            targets.add(target)
+    return any(t != "local" for t in targets)
 
 
 class GlobTest(unittest.TestCase):
@@ -59,6 +84,52 @@ class ChatGlobsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ux.chat_globs(rules)
 
+    def test_cron_delivers_to_chat_normalization(self):
+        self.assertFalse(_cron_delivers_to_chat({}))
+        self.assertFalse(_cron_delivers_to_chat({"deliver": None}))
+        self.assertFalse(_cron_delivers_to_chat({"deliver": ""}))
+        self.assertFalse(_cron_delivers_to_chat({"deliver": "local"}))
+        self.assertFalse(_cron_delivers_to_chat({"deliver": "LOCAL"}))
+        self.assertFalse(_cron_delivers_to_chat({"deliver": ["local"]}))
+        self.assertFalse(_cron_delivers_to_chat({"deliver": "local,, "}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "chat"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "Chat"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": ["chat"]}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "chat,slack"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "slack"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "slack:C123"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "slack:D0BKGRBM6RH:17"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "google_chat"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": "all"}))
+        self.assertTrue(_cron_delivers_to_chat({"deliver": ["local", "chat"]}))
+
+    def test_cron_scripts_posting_to_chat_are_covered(self):
+        """Every no_agent script that jobs.json runs with deliver outside local is in chat_ux.md."""
+        chat_paths = ux.chat_globs()
+        rosters = sorted((ux.REPO_ROOT / "agents").glob("**/cron/jobs.json"))
+        self.assertTrue(rosters, "no cron rosters found under agents/")
+        checked = 0
+        for roster_path in rosters:
+            profile = roster_path.relative_to(ux.REPO_ROOT).parts[1]
+            data = json.loads(roster_path.read_text(encoding="utf-8"))
+            jobs = data.get("jobs", []) if isinstance(data, dict) else data
+            for job in jobs:
+                if not job.get("no_agent") or not _cron_delivers_to_chat(job):
+                    continue
+                script = job.get("script")
+                self.assertTrue(script, f"{roster_path.relative_to(ux.REPO_ROOT)}:{job.get('id')}: no script named")
+                script_path = f"agents/{profile}/scripts/{script}"
+                if not (ux.REPO_ROOT / script_path).is_file() and (ux.REPO_ROOT / script).is_file():
+                    script_path = script
+                self.assertTrue((ux.REPO_ROOT / script_path).is_file(), f"{script_path} does not exist on disk")
+                self.assertTrue(
+                    ux._matches(script_path, chat_paths),
+                    f"{script_path} (run by {job.get('id')} with no_agent: true and deliver: {job.get('deliver')!r}) "
+                    f"is not covered by .agents/rules/chat_ux.md paths",
+                )
+                checked += 1
+        self.assertGreaterEqual(checked, 14)
+
 
 class ClassifyTest(unittest.TestCase):
     def test_splits_chat_from_other_surfaces(self):
@@ -79,6 +150,11 @@ class ClassifyTest(unittest.TestCase):
     def test_real_rules_cover_a_soul(self):
         chat, _ = ux.classify(["agents/chat/SOUL.md"])
         self.assertEqual(chat, ["agents/chat/SOUL.md"])
+
+    def test_real_rules_cover_cron_chat_scripts(self):
+        chat, other = ux.classify(["agents/platform/scripts/leeway_watch.py"])
+        self.assertEqual(chat, ["agents/platform/scripts/leeway_watch.py"])
+        self.assertEqual(other, [])
 
     def test_tests_and_docs_prose_are_not_seen(self):
         chat, other = ux.classify(
