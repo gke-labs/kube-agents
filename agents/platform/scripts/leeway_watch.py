@@ -175,7 +175,8 @@ placement problems, on which cluster or how many, and how many are new,
 changed or still open), then names up to three of them, most severe and most
 concentrated first, each as its workload, zone, compute class or node pool
 (named as one), its cluster, leeway's suspected cause in plain words
-(`CAUSE_PHRASES`), and a share where it has one (a workload's pods or a node
+(`CAUSE_PHRASES`; a workload leeway marks `platform_managed` says the
+addon manager can undo edits to it), and a share where it has one (a workload's pods or a node
 pool's nodes in one zone; a compute class's time on its last machine choice),
 with "and N more" past that. It closes by pointing at the
 agent for fixes, and with the date its findings are next posted if still
@@ -441,6 +442,7 @@ SUBJECT_NAME_FIELD = "subject_name"
 SEVERITY_FIELD = "severity"
 TIER_FIELD = "tier"
 SUSPECTED_CAUSE_FIELD = "suspected_cause"
+REMEDIATION_FIELD = "remediation"
 OBSERVED_SKEW_FIELD = "observed_skew"
 EXCESS_OVER_FLOOR_KEY = "excess_over_floor"
 DRIFT_KEY = "drift"
@@ -679,6 +681,14 @@ CAUSE_PHRASES: dict[str, str] = {
     "rank-baseline": "running on lower machine choices than usual",
 }
 CAUSE_PHRASE_FALLBACK = "cause not identified"
+# leeway (v0.1.7+) sets remediation.kind platform_managed where it would
+# otherwise offer a manifest patch on a workload labelled
+# addonmanager.kubernetes.io/mode: Reconcile, which the cluster's addon manager
+# can revert; saying so tells the reader not to patch it. It replaces the
+# no-cause phrase and follows a cause leeway did name.
+REMEDIATION_KIND_PLATFORM_MANAGED = "platform_managed"
+PLATFORM_MANAGED_PHRASE = "the addon manager can undo edits to it"
+PLATFORM_MANAGED_WITH_CAUSE = "{cause}; " + PLATFORM_MANAGED_PHRASE
 # On a zone finding the cause is about the zone itself (pkg/leeway/domain.go);
 # leeway's consolidation there only means the zone has no nodes, a guess at why.
 ZONE_CAUSE_PHRASES: dict[str, str] = {
@@ -1429,11 +1439,22 @@ def short_finding_label(item: dict[str, Any]) -> str:
     return SUBJECT_CLUSTER_WIDE.format(name=name, cluster=cluster)
 
 
+def is_platform_managed(item: dict[str, Any]) -> bool:
+    """Whether leeway marked the finding's workload as one the cluster platform
+    reconciles (remediation.kind platform_managed)."""
+    remediation = item.get(REMEDIATION_FIELD)
+    return isinstance(remediation, dict) and remediation.get(KIND_FIELD) == REMEDIATION_KIND_PLATFORM_MANAGED
+
+
 def due_chat_item(item: dict[str, Any]) -> str:
     """One due finding as a chat item: what it is about, how concentrated, and why."""
     subject = short_finding_label(item)
     is_zone = str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE
     cause = cause_phrase(item.get(SUSPECTED_CAUSE_FIELD), zone=is_zone)
+    if is_platform_managed(item):
+        code = str(item.get(SUSPECTED_CAUSE_FIELD) or DEFAULT_UNKNOWN)
+        known = code != DEFAULT_UNKNOWN and code in CAUSE_PHRASES
+        cause = PLATFORM_MANAGED_WITH_CAUSE.format(cause=cause) if known else PLATFORM_MANAGED_PHRASE
     pct = round(_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT) * PERCENT_SCALE)
     ns = str(item.get(NAMESPACE_FIELD) or "")
     if is_zone:
