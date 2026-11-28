@@ -1274,6 +1274,11 @@
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml
 
+# Regression probe for #2584 (#2591, #7559): diagnose public control-plane
+# timeouts under Master Authorized Networks and choose internal IP endpoint.
+# Structured two-line declaration check; deployer: noop, read-only.
+./tasks/discovery-internal-ip-authorized-networks/task.yaml
+
 # A fan-out's polling sleep and every worker command finish inside the terminal
 # limit rather than being cut at the 60 s Hermes' seeded .env set (#5423).
 # Worker-scope check, so it grades on an inject record
