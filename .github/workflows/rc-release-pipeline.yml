@@ -99,7 +99,7 @@ jobs:
       # suite's wait. SiblingGatewayRolloutGatesTest holds the floor.
       timeout_minutes: 130
       # The Chat gate blocks the candidate; the cluster and fleet-audit suite is
-      # coverage that must not. Their scenario and stream filters are declared in
+      # coverage that must not. Its scenario filter is declared in
       # the `rc` suite's `env_vars` in e2e_config.yaml. `slack` is optional too: it
       # skips until the Slack test account exists, then reports.
       blocking_suite: "gchat"

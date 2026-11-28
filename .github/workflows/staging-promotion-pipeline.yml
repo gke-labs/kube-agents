@@ -188,7 +188,7 @@ jobs:
       github_environment: "nightly"
       commit_sha: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
       # The gate is only what has already passed on a real cluster. `rc` — Agent
-      # API health, the fleet-audit ledger across all streams, and stockout
+      # API health, the fleet-audit GitHub access checks, and stockout
       # scenario 04 — runs on every RC pipeline and passes there. Gating on a
       # suite with no green run behind it means the first red night says nothing
       # about whether the candidate or the suite is bad, and staging stops moving

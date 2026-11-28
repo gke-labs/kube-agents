@@ -76,11 +76,6 @@ on:
         required: false
         default: "04-missing-zone-fallback"
         type: string
-      fleet_audit_streams:
-        description: "Fleet audit stream filter ('all', 'stockout-prevention', or specific stream)"
-        required: false
-        default: "all"
-        type: string
       rebuild_operator:
         description: "Rebuild operator from source (true / false)"
         required: false
@@ -196,7 +191,6 @@ jobs:
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
           TEST_SUITE: ${{ inputs.test_suite }}
           STOCKOUT_SCENARIOS: ${{ inputs.stockout_scenarios }}
-          FLEET_AUDIT_STREAMS: ${{ inputs.fleet_audit_streams }}
           REBUILD_OPERATOR: ${{ inputs.rebuild_operator }}
           TEST_DESTRUCTIVE_CRD: ${{ inputs.test_destructive_crd }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
