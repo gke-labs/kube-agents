@@ -3130,6 +3130,7 @@ func TestStartTaskWithCarriesTheChain(t *testing.T) {
 		Role:          taskRoleChild,
 		ParentTaskID:  "task-parent",
 		Depth:         1,
+		LineNote:      "(delegated to platform)",
 	})
 	if !ok || taskID == "" {
 		t.Fatalf("startTaskWith = (%q, %v), want a task id and true", taskID, ok)
@@ -3141,9 +3142,13 @@ func TestStartTaskWithCarriesTheChain(t *testing.T) {
 	if rec.ActiveTask == nil || rec.ActiveTask.CorrelationID != "corr-parent" {
 		t.Fatalf("active task = %+v, want correlationId corr-parent", rec.ActiveTask)
 	}
+	if rec.ActiveTask.LineNote != "(delegated to platform)" {
+		t.Fatalf("active task line note = %q, want (delegated to platform)", rec.ActiveTask.LineNote)
+	}
 	ref := rec.Tasks[len(rec.Tasks)-1]
 	if ref.ID != taskID || ref.CorrelationID != "corr-parent" || ref.Role != taskRoleChild ||
-		ref.ParentTaskID != "task-parent" || ref.Depth != 1 || ref.Children != nil {
+		ref.ParentTaskID != "task-parent" || ref.Depth != 1 || ref.Children != nil ||
+		ref.LineNote != "(delegated to platform)" {
 		t.Fatalf("history entry = %+v", ref)
 	}
 	if ref.Requester == nil || *ref.Requester != req {
